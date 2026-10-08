@@ -129,6 +129,30 @@ std::optional<ModelConfig> find_preset(std::string_view name) {
     return std::nullopt;
 }
 
+ModelConfig tiny_test_config() {
+    ModelConfig c;
+    c.name = "tiny";
+    c.num_layers = 8;
+    c.full_attention_interval = 4;
+    c.hidden_size = 24;
+    c.intermediate_size = 40;
+    c.attn_heads = 4;
+    c.attn_kv_heads = 2;
+    c.attn_head_dim = 16;
+    c.dn_key_heads = 2;
+    c.dn_value_heads = 4;
+    c.dn_key_head_dim = 6;
+    c.dn_value_head_dim = 5;
+    c.conv_kernel = 4;
+    c.vocab_size = 64;
+    c.rms_norm_eps = 1e-6;
+    c.rope_theta = 1e7;
+    c.partial_rotary_factor = 0.25;
+    c.pointer_dim = 12;
+    c.lm_head_tied = true;
+    return c;
+}
+
 ParamCounts count_params(const ModelConfig& cfg) {
     require_valid(cfg);
     const std::uint64_t h = cfg.hidden_size;
@@ -138,7 +162,7 @@ ParamCounts count_params(const ModelConfig& cfg) {
     ParamCounts p;
     p.embedding = cfg.vocab_size * h;
     p.separate_lm_head = cfg.lm_head_tied ? 0 : cfg.vocab_size * h;
-    p.pointer_head = 2 * h * cfg.pointer_dim;
+    p.pointer_head = 2 * (cfg.pointer_dim * h + cfg.pointer_dim); // q and k: a weight [P, H] and a bias [P] each
 
     // Every layer: two RMSNorm weights, and the bias-free MLP (gate and up: 2 x [I, H]; down: [H, I]).
     p.mlp = cfg.num_layers * 3 * h * cfg.intermediate_size;

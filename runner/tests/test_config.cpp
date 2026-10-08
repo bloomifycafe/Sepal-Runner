@@ -126,7 +126,7 @@ SEPAL_TEST(config, param_count_by_hand_on_a_tiny_geometry) {
     CHECK_EQ(p.small, 221u);        // layer norms 64 + q/k norms 8 + 3 x (40 + 4 + 3) + final norm 8
     CHECK_EQ(p.non_embedding(), 2637u);
     CHECK_EQ(p.embedding, 80u);
-    CHECK_EQ(p.pointer_head, 64u);
+    CHECK_EQ(p.pointer_head, 72u);  // q and k: a 4 x 8 weight and a bias of 4 each
     CHECK_EQ(p.separate_lm_head, 0u);
     CHECK_EQ(flops_per_token(c), 5274u);
     CHECK_EQ(kv_bytes_per_token(c, DType::F16), 16u);     // 1 layer x (K + V) x 4 x 2 bytes
