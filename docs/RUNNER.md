@@ -1,11 +1,19 @@
 # Sepal runner
 
-Design document for the inference runner that serves the Sepal decision models. Status: design only; the repository
-holds no runner code yet. **Nothing in this document was measured by this project.** Every number carries a marker:
+Design document for the inference runner that serves the Sepal decision models. **Status (2026-10-09).** Two
+pieces of this design exist as code: the first C++ slice of stage R1 in `runner/` (build, model geometry as data, a
+reference matrix-multiply provider, basic operations, a refusing memory planner; listed in `runner/README.md`), and a
+NumPy float64 reference implementation of the model and of the request semantics in `sepal/refengine/`. Neither has
+loaded a model file. The runner has no DeltaNet step, no attention, no weight loader, no executor and no server, and
+has been built with MSVC on Windows only. Stage R0 has not started. **Nothing in this document was measured by this
+project**: no throughput, latency, memory or accuracy figure here comes from running our code on a model. Every
+number carries a marker:
 
 - **measured elsewhere**: published or committed by another project; the source is named.
 - **derived**: computed from a named anchor by scaling or arithmetic. A target that R0 or R2 replaces, not a result.
 - **unverified**: an assumption, or a reported fact that nobody on this project has checked.
+- **computed by this project's code**: arithmetic that code in this repository performs on the geometry of section
+  3; the computing file is named. These are sizes and counts, not measurements of a running engine.
 
 Reference code is cited as `repo@commit:path:lines`; short names and commits are listed in
 [REFERENCES.md](REFERENCES.md). Related documents: [../README.md](../README.md), [MODEL.md](MODEL.md),
@@ -19,7 +27,7 @@ Reference code is cited as `repo@commit:path:lines`; short names and commits are
 | Role of llama.cpp / ggml | Oracle, throughput baseline and kernel donor. Not the engine | Decided |
 | What can still flip | The weak-machine tiers move onto a pinned llama.cpp fork only if the R0 settling experiment meets every threshold in section 5 | Open until the end of R0 |
 | First publishable number | Stage R2: the `gpu-f16` profile on one RTX 3060, passing its accuracy gate | Planned |
-| Build first | Stage R0 (section 17): reference runner, golden set, settling experiment, geometry confirmation, substrate memo | Next |
+| Build first | Stage R0 (section 17): reference runner, golden set, settling experiment, geometry confirmation, substrate memo | Not started. A first slice of R1 was written ahead of it (section 16) |
 
 The engine exists for one operation that neither llama.cpp nor the reference server provides: many ragged question
 branches, from many requests, continuing one immutable snapshot of a state, in a single pass over the weights. The
@@ -59,7 +67,17 @@ parameter counts summed from the safetensors headers). R0 confirms it by loading
 | DeltaNet key / value heads; key / value head dim; conv taps | 16 / 16; 128 / 128; 4 | 16 / 16; 128 / 128; 4 | 16 / 32; 128 / 128; 4 | 16 / 32; 128 / 128; 4 |
 | LM head tied to the embedding | yes | yes | yes | no (separate 1.02B-parameter head) |
 | Non-embedding parameters | 498M | 1.37B | 3.57B | 6.92B |
-| Body weights on device, fp16 / int8 (derived: 2 or 1 byte per parameter) | 1.0 / 0.5 GB | 2.7 / 1.4 GB | 7.1 / 3.6 GB | 13.8 / 6.9 GB |
+| Body weights on device with every weight at one width, fp16 / int8 (derived: 2 or 1 byte per parameter; the planner's uniform profiles `w16` / `w8`) | 1.0 / 0.5 GB | 2.7 / 1.4 GB | 7.1 / 3.6 GB | 13.8 / 6.9 GB |
+| Body weights under the quantised profiles `gpu-q8w` and `cpu-q8` of section 11 (computed by this project's code: `runner/src/plan/planner.cpp`) | 0.54 GB | 1.45 GB | 3.83 GB | 7.33 GB |
+
+The int8 figure in the first of these two rows is not the size of any profile this design serves. The quantised
+profiles keep the DeltaNet out-projection and the two small in-projections `in_proj_a / b` at 16 bits and the norms,
+convolution and gate parameters at 32 bits (section 11), so their body is larger: 7.33 GB at 9B against 6.92 GB.
+The `gpu-f16` profile is the fp16 figure. GB here is 10^9 bytes.
+
+The parameter counts are reproduced by `count_params` in `runner/src/core/config.cpp` from the geometry alone
+(498,113,344; 1,373,265,728; 3,570,052,096; 6,919,565,824), and its tests hold them to this table. That agreement
+checks the arithmetic, not the geometry: both still rest on the published configs until R0 loads the files.
 
 Layer `i` is full attention iff `(i + 1) % 4 == 0`; all others are Gated DeltaNet. Common to all sizes: vocabulary
 248,320; `rms_norm_eps` 1e-6; `rope_theta` 10,000,000 with `partial_rotary_factor` 0.25, so only 64 of the 256 head
@@ -120,6 +138,12 @@ decide(state_segments, pack, adapter, profile):
   z_jk = dot(k(H[</opt>_k]), q(H[<decide>])) / sqrt(256) / T             # pointer head, fp32
   p_j  = softmax over k of z_jk
 ```
+
+`k` and `q` are the pointer head's two projections. Each is a plain linear layer with a bias term:
+`k(h) = W_k h + b_k` and `q(h) = W_q h + b_q`, with `W` of shape `[256, hidden_size]` and `b` of length 256
+([MODEL.md](MODEL.md), section 3). Unlike the trunk's projections they are not bias-free, and the reference
+implementation defines them so (`sepal/refengine/readout.py`, `sepal/refengine/weights.py`). The head therefore has
+`2 x (256 x hidden_size + 256)` parameters.
 
 `user_tokens` rewrites `<|name|>` so caller text cannot produce a delimiter token (`kev@5e42a7a:kev/model.py:78-81`).
 Sepal tokenises state segments independently, which Kev does not; training must do the same ([DATA.md](DATA.md)).
@@ -269,7 +293,7 @@ layer on 4B at 32k tokens (derived by Kev, `kev@5e42a7a:kev/predictors.py:38-48`
 
 | Readout | Gather | Logits |
 |---|---|---|
-| Pointer head | `H` at each `</opt>` and at `<decide>` | `z_j = k(h_opt_j) . q(h_decide) / sqrt(256) / T`, fp32 |
+| Pointer head | `H` at each `</opt>` and at `<decide>` | `z_j = k(h_opt_j) . q(h_decide) / sqrt(256) / T`, fp32; `k` and `q` are linear layers with bias (section 3) |
 | Label-row slots | `H` at each answer slot | `h` times the LM-head rows of the question's label tokens (<= 255 rows), divided by `T`, fp32 (label-token pattern: `AnyJev@d458d13:anyjev/readout.py:24-48`) |
 
 | Layout | Rows | What is cacheable |
@@ -323,6 +347,14 @@ overcommitting, following `Strata@fb58e0d:include/strata/plan/plan.hpp:1-12`. A 
 and names the profile that would fit; a request that cannot fit is rejected at admission. This matters most on
 Windows, where an oversubscribed GPU allocation does not fail but pages to system memory (measured elsewhere,
 `Strata@fb58e0d:src/program/generate.cpp:4309`). Target (derived, R3): 64 questions on a 4.8k state in weights + 1.5 GB.
+
+A first version of the planner exists (`runner/include/sepal/planner.hpp`, `runner/src/plan/planner.cpp`, tool
+`sepal-info`). It computes weights per profile, a working-buffer figure, and a snapshot arena from what remains, and
+on a shortfall it returns a refusal that names the missing bytes and the knob to reduce (weight precision, model
+size, token budget or snapshot budget), never a smaller plan. Its weight and snapshot figures are exact arithmetic
+on the geometry. Its working-buffer figure is an estimate from a formula documented in the header, not an
+allocation count; R3 replaces it with the executor's real allocations. Its head size counts the two weight matrices
+without their bias vectors (512 values, 2 kB at fp32), which changes no figure quoted in this document.
 
 ## 9. Request lifecycle
 
@@ -392,6 +424,39 @@ POST /v1/systemone
 | K/V | fp16 | fp16; int8 opt-in | fp16 |
 | Head | fp32 | fp32 | fp32 |
 
+**Weight size per profile.** Computed by this project's code: `trunk_weight_bytes` in `runner/src/plan/planner.cpp`,
+from the geometry of section 3 and the table above, printed by `sepal-info`. Body weights only, in GB of 10^9 bytes;
+the embedding table is separate and stays in host memory on the GPU profiles. Per-channel quantisation scales are
+not counted (below 0.1% of an 8-bit matrix, per the planner's header).
+
+| Profile | 0.8B | 2B | 4B | 9B |
+|---|---|---|---|---|
+| `w16`: every weight at 16 bits (arithmetic only, not a served profile) | 1.00 | 2.75 | 7.14 | 13.84 |
+| `gpu-f16` | 1.00 | 2.75 | 7.14 | 13.84 |
+| `gpu-q8w`, `cpu-q8` | 0.54 | 1.45 | 3.83 | 7.33 |
+| `w8`: every weight at 8 bits (arithmetic only, not a served profile) | 0.50 | 1.37 | 3.57 | 6.92 |
+
+The gap between the last two rows is the DeltaNet `out_proj` and `in_proj_a / b` kept at 16 bits and the small
+tensors kept at 32. Nothing in the design shrinks a quantised 9B to 6.92 GB: that figure describes only the
+all-8-bit arithmetic. The size can grow instead: if the per-tensor ablation of section 18 goes badly, the attention
+projections and the DeltaNet `in_proj_qkv / z`, which the table quantises "pending ablation", also stay at 16 bits.
+
+**What the planner says about the 9B on an 8 GB card** (computed by this project's code, same file; the card is
+taken as 8 GiB = 8.59 GB, the embedding is on the host, and the working-buffer part is the planner's estimate, so
+these are plans, not runs):
+
+| Request | Reserve held back for driver and display | `gpu-q8w` (7.34 GB with the head) | `w8` (6.93 GB with the head) |
+|---|---|---|---|
+| Pass of 4,096 tokens in 32 rows, one 2,000-token snapshot | none | granted; room for 1 snapshot; largest pass 4,318 tokens | granted; room for 4 snapshots; largest pass 5,995 tokens |
+| Same | 0.5 GiB | refused: pass must be 2,134 tokens or fewer | refused: no room for the snapshot |
+| Pass of 1,000 tokens in 9 rows, one 600-token snapshot (the reference alert of section 12) | 0.5 GiB | granted; room for 6 snapshots | granted; room for 11 snapshots |
+| Same | 1 GiB | refused: pass must be 341 tokens or fewer | granted; room for 4 snapshots |
+
+So the weights of a quantised 9B do fit in 8 GiB, and what remains is 1.25 GB for everything else. Whether that is
+usable depends on how much of the card the driver, the display and the CUDA context take, which nobody on this
+project has measured: the 9B on an 8 GB card stays **unverified**, and the first real load in R4 settles it. On a
+12 GiB card the same default request is granted under `gpu-q8w` with room for 37 snapshots (same code).
+
 **Evidence** (all measured elsewhere, on larger siblings; none on our sizes):
 
 - No 4-bit profile. Reported on a larger sibling: KLD at the 99.9th percentile about 0.10 at Q8 and 0.41 at Q4;
@@ -423,13 +488,15 @@ Every figure in this section is **derived** unless marked otherwise. None is mea
   1,000 tokens without a cache, 600 with the prefix cache. Branches are 40-67% of the tokens.
 
 Alerts per second, no cache / prefix cache. The second figure is the first, before rounding, times 1,000 / 600. On a
-12 GB card the 9B with 8-bit weights is derived at about 1.9-2.4 alerts/s without cache.
+12 GB card the 9B with 8-bit weights is derived at about 1.9-2.4 alerts/s without cache. That figure is a rate
+scaled by FLOPs per token and does not depend on the weight size; the weights it would run on are the 7.33 GB of
+`gpu-q8w` (section 11), which the planner grants on 12 GiB.
 
 | Hardware | 0.8B | 2B | 4B | 9B | Marker |
 |---|---|---|---|---|---|
 | 4-core laptop CPU | 0.15-0.28 / 0.25-0.47 | 0.06-0.10 / 0.09-0.18 | 0.02-0.04 / 0.035-0.065 | 0.011-0.020 / 0.018-0.034 | derived; nearest anchor: LiteRT dynamic-int8 CPU prefill |
 | 8-core desktop CPU | 0.4-0.7 / 0.7-1.2 | 0.15-0.26 / 0.25-0.43 | 0.06-0.10 / 0.09-0.17 | 0.029-0.051 / 0.048-0.084 | derived; same anchor |
-| 8 GB GPU | 10-20 / 17-33 | 4-8 / 7-13 | 3.2-4.3 / 5.3-7.2 | tight: about 6.9 GB of 8-bit weights before any working memory; unverified whether it fits | derived; nearest anchor: llama.cpp CUDA prefill on an RTX 3060 |
+| 8 GB GPU | 10-20 / 17-33 | 4-8 / 7-13 | 3.2-4.3 / 5.3-7.2 | tight: 7.33 GB of weights under `gpu-q8w` before any working memory (6.92 GB only if every weight were 8-bit; section 11); unverified whether it fits, so no rate is given | derived; nearest anchor: llama.cpp CUDA prefill on an RTX 3060. The two weight sizes are computed by `runner/src/plan/planner.cpp` |
 | 24 GB GPU | 30-100 / 50-167 | 12-40 / 20-67 | 11-29 / 18-48 | 5.6-15 / 9.4-25 | derived; anchor: llama.cpp CUDA prefill on RTX 3090 and 4090, scaled by FLOPs per token |
 | 4 x 24 GB | 114-380 / 190-630 | 46-152 / 76-253 | 42-110 / 70-184 | 21-57 / 36-95 | derived; the 24 GB row times about 3.8 |
 
@@ -472,6 +539,24 @@ What moves these figures:
 ## 14. Verification and reproducibility
 
 **Oracles.** O1: Kev's PyTorch path in fp32 on CPU. O2: our own scalar FP64 forward. O3: llama.cpp F32 (non-gating).
+
+**State of O2.** It exists as `sepal/refengine/`: a NumPy float64 forward pass driven by a geometry object, with
+the snapshot contents of section 3, a row executor in which a row's result depends on its own chain only, and both
+readouts. Its tests run on random weights and small test geometries and check its own invariants (a row continued
+from a stored snapshot equals the same row computed in one go; branches do not see each other; left-padding with
+zero input is exact). It has not been compared with O1 or with any real checkpoint, so it is not yet an oracle for
+the model, only a definition of the request semantics. Twelve arithmetic details that Kev's reference hands to
+library kernels were written out from their description and are listed in `sepal/refengine/__init__.py`
+(`UNVERIFIED`) until a real model confirms them:
+
+- DeltaNet: the convolution's tap order and absence of bias; the L2 normalisation's epsilon placement; how value
+  heads share key heads; the operand order of the delta-rule update; whether a token's output reads the state after
+  its own update; the `1/sqrt(dk)` output scale; whether the gated norm multiplies by `w` or by `1 + w`; the gated
+  norm's gate activation (SiLU, not sigmoid).
+- Attention: the RoPE frequencies for text positions; the half-split pairing of rotated dimensions; the
+  `1/sqrt(head_dim)` score scale; how query heads share key-value heads.
+
+These overlap the rival formulas of tier 1 below, and R1 settles each against O1.
 
 | Tier | What | Pass condition |
 |---|---|---|
@@ -528,6 +613,14 @@ reference/                               R0: Kev serve fork and oracle scripts
 golden/                                  golden requests and reference outputs
 ```
 
+The tree above is the plan. What exists today under `runner/`: `include/sepal/{config, dtype, tensor, gemm, ops,
+planner}.hpp` (C++ headers; the C ABI is not written), `src/{core, model, plan, provider}`, `tools/sepal_info.cpp`,
+`tests/` and CMake presets `release` and `asan`, with no third-party dependency. `reference/` and `golden/` do not
+exist. The slice was built and tested with MSVC 19.44 on Windows 11 (as `runner/README.md` records; the Release
+configuration was rebuilt and its 8 test entries passed on 2026-10-09). It has not been compiled with GCC or Clang,
+so Linux, which this section names as first-class, is untested. The FP64 reference path is in Python
+(`sepal/refengine/`), not in this tree.
+
 ## 16. Stages R0-R6
 
 | Stage | Scope | Exit criterion (derived thresholds are targets) | Person-weeks (estimate) |
@@ -540,6 +633,19 @@ golden/                                  golden requests and reference outputs
 | R5 | HIP via shim + hipBLAS; Vulkan only if an iGPU measures >= 2x its CPU | Gates on one Radeon; >= 0.6x same-class CUDA | 3-4 |
 | R6 | Router, supervisor, manifests | 4 GPUs >= 3.6x; prefix hit >= 70% on a trace; worker kill recovered < 2 s | 3 |
 
+**Status on 2026-10-09.** No stage has met its exit criterion and the estimates above are unchanged.
+
+- **R0: not started.** No Kev baseline, golden set, settling experiment or substrate memo exists.
+- **R1: started.** Written and unit-tested: the build, the geometry presets with validation and derived sizes, the
+  element types, the reference provider for `gemm_f`, RMSNorm, SiLU, the SwiGLU MLP, softmax, the causal convolution
+  with a carried tail, and the planner. Not written: the GGUF loader, the encoder, the DeltaNet recurrence,
+  attention, the fp32 executor, the oneDNN provider, the C ABI and the Python wheel. None of R1's three exit
+  conditions can be tested yet, because nothing loads a model.
+- **Outside the stage list.** The FP64 reference of R1's scope was written in Python (`sepal/refengine/`, section
+  14), and the token layouts and readout positions as `sepal/model/layouts.py`; the C++ encoder must reproduce the
+  latter token for token.
+- **R3's planner** has a first version (section 8), ahead of the executor whose allocations it must describe.
+
 ## 17. First two weeks
 
 1. Under WSL2, serve the released Kev-0.8B through Kev's own server on the RTX 3060 and measure baseline alerts/s on
@@ -549,7 +655,7 @@ golden/                                  golden requests and reference outputs
 3. Run the settling experiment of section 5 against a pinned llama.cpp build on the laptop CPU and the 3060.
 4. Confirm the geometry of section 3 by loading the four base model files. Write the `sepal.*` GGUF key specification.
 5. Write the substrate memo: the decision, the measured numbers, and revised throughput targets that replace the
-   derived figures of section 12. These five items are the R0 checklist.
+   derived figures of section 12. These five items are the R0 checklist. None is done (section 16).
 
 ## 18. Risks and the experiments that resolve them
 
