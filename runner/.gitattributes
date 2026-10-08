@@ -1,0 +1,2 @@
+# Golden-vector files are binary: never convert line endings, never diff as text.
+*.sgv binary

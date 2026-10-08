@@ -139,3 +139,68 @@ SEPAL_TEST(gemm, rejects_bad_shapes_and_types) {
     gemm->gemm_f(no_rows.mat(), w.mat(), no_out.mat(), 0.0f);
     CHECK_EQ(no_out.size(), 0u);
 }
+
+// ---- gemm_f64: the float64 reference path ----
+
+SEPAL_TEST(gemm, f64_hand_computed_and_beta) {
+    const auto gemm = make_reference_gemm();
+    const TensorD x({2, 3}, {1, 2, 3, 4, 5, 6});
+    const TensorD w({2, 3}, {1, 0, -1, 2, 1, 0});
+    TensorD y({2, 2}, {10, 20, 30, 40});
+    gemm->gemm_f64(x.mat(), w.mat(), y.mat(), 0.0); // beta 0: y is written without being read
+    CHECK_EQ(y[0], -2.0);
+    CHECK_EQ(y[1], 4.0);
+    CHECK_EQ(y[2], -2.0);
+    CHECK_EQ(y[3], 13.0);
+    gemm->gemm_f64(x.mat(), w.mat(), y.mat(), 0.5);
+    CHECK_EQ(y[0], -3.0);
+    CHECK_EQ(y[3], 19.5);
+}
+
+SEPAL_TEST(gemm, f64_keeps_what_float32_rounds_away) {
+    // 1 + 2^-40 is a float64 value that float32 cannot hold: the float64 product must keep it.
+    const auto gemm = make_reference_gemm();
+    const double tiny = 1.0 / 1099511627776.0;
+    const TensorD x({1, 2}, {1.0 + tiny, 1.0});
+    const TensorD w({1, 2}, {1.0, -1.0});
+    TensorD y({1, 1});
+    gemm->gemm_f64(x.mat(), w.mat(), y.mat(), 0.0);
+    CHECK_EQ(y[0], tiny);
+}
+
+SEPAL_TEST(gemm, f64_row_is_independent_of_its_batch) {
+    const auto gemm = make_reference_gemm();
+    Tensor seed_x({5, 7});
+    Tensor seed_w({4, 7});
+    fill(seed_x, 11);
+    fill(seed_w, 12);
+    TensorD x_values({5, 7});
+    TensorD w_values({4, 7});
+    for (std::size_t i = 0; i < x_values.size(); ++i) x_values[i] = static_cast<double>(seed_x[i]) / 3.0;
+    for (std::size_t i = 0; i < w_values.size(); ++i) w_values[i] = static_cast<double>(seed_w[i]) / 7.0;
+    const TensorD& x = x_values;
+    const TensorD& w = w_values;
+    TensorD batch({5, 4});
+    gemm->gemm_f64(x.mat(), w.mat(), batch.mat(), 0.0);
+    for (std::size_t t = 0; t < 5; ++t) {
+        TensorD alone({1, 4});
+        gemm->gemm_f64(x.mat().slice_rows(t, 1), w.mat(), alone.mat(), 0.0);
+        for (std::size_t n = 0; n < 4; ++n) CHECK_EQ(alone[n], batch[t * 4 + n]);
+    }
+    // The entry point that code written for both precisions uses reaches the same kernel.
+    TensorD through_helper({5, 4});
+    sepal::gemm(*gemm, x.mat(), w.mat(), through_helper.mat());
+    for (std::size_t i = 0; i < batch.size(); ++i) CHECK_EQ(through_helper[i], batch[i]);
+}
+
+SEPAL_TEST(gemm, f64_shape_errors_throw) {
+    const auto gemm = make_reference_gemm();
+    const TensorD x({2, 3});
+    const TensorD w_bad({2, 4});
+    const TensorD w({2, 3});
+    TensorD y({2, 2});
+    TensorD y_bad({3, 2});
+    CHECK_THROWS(gemm->gemm_f64(x.mat(), w_bad.mat(), y.mat(), 0.0), std::invalid_argument);
+    CHECK_THROWS(gemm->gemm_f64(x.mat(), w.mat(), y_bad.mat(), 0.0), std::invalid_argument);
+    CHECK_THROWS(gemm->gemm_f64(ConstMatViewD(nullptr, 2, 3), w.mat(), y.mat(), 0.0), std::invalid_argument);
+}

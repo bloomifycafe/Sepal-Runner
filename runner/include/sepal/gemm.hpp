@@ -53,10 +53,23 @@ public:
     /// With beta == 0, Y is written without being read. Y must not overlap X or W.
     /// Throws std::invalid_argument on a shape mismatch or an unsupported element type.
     virtual void gemm_f(MatRef x, MatRef w, MatView y, float beta) const = 0;
+
+    /// The same product with X, W and Y all float64: the reference path the float32 engine is compared with.
+    /// Shapes, beta and errors as gemm_f.
+    virtual void gemm_f64(ConstMatViewD x, ConstMatViewD w, MatViewD y, double beta) const = 0;
 };
 
+/// Y = X W^T in the element type of the arguments, so that code written once for both precisions reaches the
+/// provider through one name.
+inline void gemm(const GemmProvider& provider, ConstMatView x, ConstMatView w, MatView y) {
+    provider.gemm_f(x, w, y, 0.0f);
+}
+inline void gemm(const GemmProvider& provider, ConstMatViewD x, ConstMatViewD w, MatViewD y) {
+    provider.gemm_f64(x, w, y, 0.0);
+}
+
 /// Plain single-threaded provider. Each output is accumulated in float64 over k = 0, 1, ..., K-1 in that order
-/// and rounded to float32 once, so its result is a fixed function of the row and the weights.
+/// and (in gemm_f) rounded to float32 once, so its result is a fixed function of the row and the weights.
 std::unique_ptr<GemmProvider> make_reference_gemm();
 
 } // namespace sepal

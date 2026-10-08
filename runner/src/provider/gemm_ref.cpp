@@ -56,19 +56,7 @@ public:
     }
 
     void gemm_f(MatRef x, MatRef w, MatView y, float beta) const override {
-        if (x.cols != w.cols) {
-            throw std::invalid_argument("gemm_f: X has " + std::to_string(x.cols) + " columns but W has " +
-                                        std::to_string(w.cols));
-        }
-        if (y.rows != x.rows || y.cols != w.rows) {
-            throw std::invalid_argument("gemm_f: Y must be [" + std::to_string(x.rows) + ", " +
-                                        std::to_string(w.rows) + "] but is [" + std::to_string(y.rows) + ", " +
-                                        std::to_string(y.cols) + "]");
-        }
-        if ((x.data == nullptr && x.rows * x.cols != 0) || (w.data == nullptr && w.rows * w.cols != 0) ||
-            (y.data == nullptr && y.size() != 0)) {
-            throw std::invalid_argument("gemm_f: null data pointer");
-        }
+        check_shapes("gemm_f", x.data, x.rows, x.cols, w.data, w.rows, w.cols, y.data, y.rows, y.cols);
 
         const F32Matrix xf(x, "X");
         const F32Matrix wf(w, "W");
@@ -86,6 +74,42 @@ public:
                 if (beta != 0.0f) acc += static_cast<double>(beta) * static_cast<double>(out);
                 out = static_cast<float>(acc);
             }
+        }
+    }
+
+    void gemm_f64(ConstMatViewD x, ConstMatViewD w, MatViewD y, double beta) const override {
+        check_shapes("gemm_f64", x.data, x.rows, x.cols, w.data, w.rows, w.cols, y.data, y.rows, y.cols);
+        const std::size_t width = x.cols;
+        for (std::size_t t = 0; t < x.rows; ++t) {
+            const double* x_row = x.data + t * width;
+            for (std::size_t n = 0; n < w.rows; ++n) {
+                const double* w_row = w.data + n * width;
+                double acc = 0.0;
+                for (std::size_t k = 0; k < width; ++k) acc += x_row[k] * w_row[k];
+                double& out = y(t, n);
+                if (beta != 0.0) acc += beta * out;
+                out = acc;
+            }
+        }
+    }
+
+private:
+    static void check_shapes(const char* who, const void* x, std::size_t x_rows, std::size_t x_cols, const void* w,
+                             std::size_t w_rows, std::size_t w_cols, const void* y, std::size_t y_rows,
+                             std::size_t y_cols) {
+        const std::string name(who);
+        if (x_cols != w_cols) {
+            throw std::invalid_argument(name + ": X has " + std::to_string(x_cols) + " columns but W has " +
+                                        std::to_string(w_cols));
+        }
+        if (y_rows != x_rows || y_cols != w_rows) {
+            throw std::invalid_argument(name + ": Y must be [" + std::to_string(x_rows) + ", " +
+                                        std::to_string(w_rows) + "] but is [" + std::to_string(y_rows) + ", " +
+                                        std::to_string(y_cols) + "]");
+        }
+        if ((x == nullptr && x_rows * x_cols != 0) || (w == nullptr && w_rows * w_cols != 0) ||
+            (y == nullptr && y_rows * y_cols != 0)) {
+            throw std::invalid_argument(name + ": null data pointer");
         }
     }
 };

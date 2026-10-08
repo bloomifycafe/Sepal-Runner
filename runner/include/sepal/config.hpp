@@ -66,7 +66,7 @@ struct ParamCounts {
     std::uint64_t mixer_proj = 0;      // attention q/k/v/o; DeltaNet in_proj_qkv and in_proj_z
     std::uint64_t dn_sensitive = 0;    // DeltaNet out_proj, in_proj_a, in_proj_b
     std::uint64_t small = 0;           // norms, conv, A_log, dt_bias
-    std::uint64_t pointer_head = 0;    // key and query projections, bias-free (adapter, not base)
+    std::uint64_t pointer_head = 0;    // key and query projections, a weight and a bias each (adapter, not base)
     std::uint64_t separate_lm_head = 0; // vocab x hidden when the head is not tied; never loaded
 
     /// The trunk: everything a pass reads on the device. Excludes the embedding, the pointer head and the LM head.
@@ -82,6 +82,10 @@ void require_valid(const ModelConfig& cfg);
 /// The four Qwen3.5 base geometries: "0.8b", "2b", "4b", "9b".
 const std::vector<ModelConfig>& presets();
 std::optional<ModelConfig> find_preset(std::string_view name);
+
+/// The test geometry of the reference engine (`sepal.refengine.PRESETS["tiny"]`): sizes that coincide in the
+/// real models differ here, so a transposed or mis-sized tensor fails loudly. Not a model anyone trained.
+ModelConfig tiny_test_config();
 
 // ---- derived quantities (all require a valid configuration) ----
 

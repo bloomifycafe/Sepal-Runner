@@ -1,29 +1,188 @@
 # Sepal runner
 
 The C++20 inference engine for the Sepal decision models. The design is [../docs/RUNNER.md](../docs/RUNNER.md).
-This directory holds the first slice of stage R1: a tested CPU foundation with no third-party dependencies.
+This directory holds the first two slices of stage R1, with no third-party dependencies: a tested CPU foundation,
+and on it a complete forward pass (the reference path) that is compared with the NumPy oracle `sepal/refengine`.
 
 ## What is here
 
 | Part | Files | What it does |
 |---|---|---|
-| Geometry | `include/sepal/config.hpp`, `src/core/config.cpp` | The model geometry as data, the four presets (0.8B, 2B, 4B, 9B), validation, and derived quantities: parameter counts, K/V bytes per state token, recurrent-state bytes, FLOPs per token |
+| Geometry | `include/sepal/config.hpp`, `src/core/config.cpp` | The model geometry as data, the four presets (0.8B, 2B, 4B, 9B) and the oracle's `tiny` test geometry, validation, and derived quantities: parameter counts, K/V bytes per state token, recurrent-state bytes, FLOPs per token |
 | Element types | `include/sepal/dtype.hpp` | `f32`, `f16`, `bf16`, `i8`; exact decoding of the 16-bit float formats |
-| Tensor | `include/sepal/tensor.hpp` | An owning float32 buffer with a shape, and non-owning matrix views |
-| GEMM provider | `include/sepal/gemm.hpp`, `src/provider/gemm_ref.cpp` | The provider interface (`gemm_f`) and the reference provider that later providers are tested against |
-| Operations | `include/sepal/ops.hpp`, `src/model/ops.cpp` | RMSNorm applied as `1 + w`, SiLU, the bias-free SwiGLU MLP, softmax, depthwise causal convolution with a carried tail |
+| Tensor | `include/sepal/tensor.hpp` | An owning buffer with a shape and non-owning matrix views, as templates over the element type: `Tensor` / `MatView` are float32, `TensorD` / `MatViewD` float64 |
+| GEMM provider | `include/sepal/gemm.hpp`, `src/provider/gemm_ref.cpp` | The provider interface (`gemm_f`, and `gemm_f64` for the float64 reference path) and the reference provider that later providers are tested against |
+| Operations | `include/sepal/ops.hpp`, `src/model/ops.cpp` | The first slice's float32 kernels: RMSNorm applied as `1 + w`, SiLU, the bias-free SwiGLU MLP, softmax, depthwise causal convolution with a carried tail |
 | Planner | `include/sepal/planner.hpp`, `src/plan/planner.cpp` | A memory plan (weights, working buffers, snapshot arena), or a refusal that names the shortfall and the knob to reduce |
-| Tool | `tools/sepal_info.cpp` | `sepal-info`: a preset's derived quantities and a memory plan for a budget |
-| Tests | `tests/` | A small self-registering harness (`tests/test.hpp`) and one suite per part |
+| Weights | `include/sepal/weights.hpp`, `src/core/weights.cpp` | The tensor names and shapes a geometry implies, a read-only container keyed by tensor name with `scope("layers.3")`, a strict loader from any name-to-array map, and seeded random weights for benchmarks |
+| Golden file | `include/sepal/golden.hpp`, `src/io/golden.cpp`, `include/sepal/json.hpp`, `src/io/json.cpp` | The reader of the golden-vector format and the small JSON reader its header needs |
+| Reference path | `include/sepal/ref/*.hpp` | The whole forward pass and the request semantics, ported function for function from `sepal/refengine`: see "The reference path" below |
+| Tools | `tools/sepal_info.cpp`, `tools/sepal_bench.cpp`, `tools/export_golden.py` | `sepal-info`: a preset's derived quantities and a memory plan for a budget. `sepal-bench`: tokens per second of the reference path. `export_golden.py`: writes the golden file from the oracle |
+| Tests | `tests/` | A small self-registering harness (`tests/test.hpp`) and one suite per part; `tests/golden/tiny.sgv` is the golden file |
 
 No size is hard-wired outside the preset table in `src/core/config.cpp`.
 
 ## Not here yet
 
-The DeltaNet recurrence, attention (RoPE, grouped-query attention, K/V cache), the weight loader (GGUF), the
-tokenizer and encoder, the FP64 reference path, the pass executor, snapshots and caches, the C ABI and the
-server come next. Of the provider interface, only `gemm_f` exists; `gemm_qd8` and `gemm_dq` come with the
-quantised profiles.
+The weight loader (GGUF), the tokenizer and encoder, the optimised layer-interleaved pass executor, the snapshot
+store and caches, the C ABI and the server come next. Of the provider interface, `gemm_f` and `gemm_f64` exist;
+`gemm_qd8` and `gemm_dq` come with the quantised profiles. Nothing has been run on real model weights yet: every
+number below comes from the `tiny` test geometry or from random weights.
+
+## The reference path
+
+`include/sepal/ref/` is a readable port of the oracle, one header per oracle module and one function per oracle
+function, with the same names, so a disagreement can be found by comparing function with function:
+
+| Header | Oracle module | Holds |
+|---|---|---|
+| `ref/primitives.hpp` | `primitives.py` | `sigmoid`, `silu`, `softplus`, softmax, `rms_norm`, `project`, `swiglu_mlp` |
+| `ref/deltanet.hpp` | `deltanet.py` | `causal_conv`, `l2_normalise`, `share_key_heads`, `split_heads`, `decay_gate`, `delta_rule_update`, `delta_rule_scan`, `gated_rms_norm`, `deltanet_mixer` |
+| `ref/attention.hpp` | `attention.py` | `unpack_query_and_gate`, `rope_angles`, `apply_rope`, `grouped_query_attention`, `attention_mixer` |
+| `ref/snapshot.hpp` | `snapshot.py` | `DeltaNetState`, `AttentionState`, `Snapshot`, `empty_snapshot` |
+| `ref/executor.hpp` | `executor.py` | `Row`, `RowResult`, `decoder_layer`, `continue_snapshot`, `check_row`, `execution_order`, `run_rows` |
+| `ref/readout.hpp` | `readout.py` | `pointer_logits`, `pointer_probabilities`, `label_rows`, `label_row_logits`, `label_row_probabilities` |
+
+Everything in `sepal::ref` is a template over the element type. With `double` it is the FP64 reference forward
+pass (oracle O2 of the design); with `float` the same code is the unoptimised float32 path. It is single-threaded
+and nothing in it is tuned.
+
+Where the port differs from the oracle in form, and why:
+
+- **Matrix multiplies** all go through the GEMM provider: the in-projections, the out-projections, the MLP, the
+  attention scores (Q K^T per head) and the weighted sum of values, the pointer head and the label rows. The
+  oracle's `project` concatenates the weights of several projections and computes one product; the port computes
+  one product per weight, which under the provider contract (an output depends on its input row and its weight
+  row only) gives the same values without copying weights. Packing them into one GEMM is for the optimised path.
+- **Snapshots** are immutable values behind `std::shared_ptr<const ...>`. The oracle concatenates a parent's keys
+  and values with a row's own into a new array per row; the port's `AttentionState` instead holds a link to its
+  parent's state and only its own tokens, so children share a parent's keys and values by reference and none copies
+  them. A DeltaNet child starts its own recurrence from a copy of the parent's recurrent state, which it must
+  (the recurrence rewrites it); the parent's is never written.
+- **A parent row** is named by its index in the request (`ParentRow{index}`), where the oracle holds the Python
+  object. A chain of parents that returns to itself can therefore be written, and is refused.
+- **The kernels of `ops.hpp`** (float32 only, with a combined gate-and-up weight) are not used by the reference
+  path, which has its own templated `rms_norm`, `silu`, `swiglu_mlp`, softmax and `causal_conv` so that one text
+  serves both element types. The two sets compute the same functions and should be merged when the optimised
+  executor is written.
+- **RoPE angles** are float64 in both element types, so a large position is not rounded before its cosine.
+- **The delta rule** updates the row's own working state in place, one token after another, where the oracle
+  returns a new array per token.
+
+### Oracle details ported as unverified
+
+The oracle lists, in `sepal.refengine.UNVERIFIED`, the details the Kev reference files do not settle. Each is
+ported as it stands and lives in exactly ONE function, marked `UNVERIFIED` in its comment with the oracle's name
+for it. When one changes in the oracle, change that one function and regenerate the golden file.
+
+| Oracle entry | C++ function (`sepal::ref`) | What is assumed |
+|---|---|---|
+| `deltanet.causal_conv` | `causal_conv` | The last kernel tap multiplies the current token (cross-correlation); the tail is oldest first; no bias |
+| `deltanet.l2_normalise` | `l2_normalise` | q and k are divided by `sqrt(sum(x^2) + 1e-6)`: eps inside the root, not `max(norm, eps)` |
+| `deltanet.share_key_heads` | `share_key_heads` | Value head h reads key head `h / (value heads / key heads)`: repeat-interleave, not tiling |
+| `deltanet.delta_rule_update` | `delta_rule_update` | The old state is decayed before the update, the write itself is not decayed; state axes are [key dim, value dim] |
+| `deltanet.delta_rule_scan` | `delta_rule_scan` | A token's output reads the state after its own update, not before |
+| `deltanet.delta_rule_output_scale` | `delta_rule_output_scale` | The read is scaled by `1 / sqrt(key head dim)` |
+| `deltanet.gated_norm_scale` | `gated_norm_scale` | The gated norm multiplies by its stored weight `w`, not by `1 + w` like the other norms |
+| `deltanet.gated_norm_gate` | `gated_norm_gate` | The gated norm's gate is `silu(z)`, not `sigmoid(z)` |
+| `attention.rope_angles` | `rope_angles` | One position axis with frequencies `theta ** (-2i / rotary_dim)` |
+| `attention.apply_rope` | `apply_rope` | The first `rotary_dim` dims of a head rotate, dim i paired with dim `i + rotary_dim / 2` (half-split) |
+| `attention.attention_scale` | `attention_scale` | Scores are scaled by `1 / sqrt(head_dim)` |
+| `attention.grouped_query_attention` | `grouped_query_attention` | Query head h reads kv head `h / (heads / kv heads)`: repeat-interleave, not tiling |
+
+The golden file records the list as it stood when the file was written (header key `unverified`), and a test
+checks that it has twelve entries, so a regenerated file with a changed list is noticed.
+
+## Measured against the oracle
+
+Measured on the `tiny` geometry (8 layers, hidden 24) with the golden file's seeded random weights, MSVC 19.44,
+Release. Nothing here was measured on real weights or a real geometry. Largest absolute difference from the
+NumPy float64 oracle; the float64 checks are asserted at 1e-9.
+
+| Check | float64 | float32 |
+|---|---|---|
+| Per-layer hidden states, 13 tokens: worst of the 8 layer outputs (and layer 0 alone) | 5.6e-14 (1.7e-14) | 4.0e-5 (6.0e-6) |
+| Final hidden states at the readout positions, 5 rows with parents | 4.0e-14 | 5.8e-6 |
+| Snapshot contents after the state row, all layers | 2.0e-14 | 7.7e-6 |
+| One pass over state + branch + leaf (31 tokens) | 8.2e-15 | not compared |
+| Branches continued from the oracle's snapshot, loaded as a stored snapshot | 8.9e-15 | not compared |
+| Each DeltaNet mixer alone, from the oracle's input and state (output, state, tail) | 2.0e-15 | not compared |
+| Every intermediate inside one DeltaNet mixer (15 arrays) | 2.8e-15 | not compared |
+| Each attention mixer alone (output, keys, values) | 8.9e-16 | not compared |
+| Every intermediate inside one attention mixer (10 arrays) | 8.9e-16 | not compared |
+| Each decoder layer alone, all 8 | 2.6e-15 | not compared |
+| Both readouts from the oracle's hidden states (logits and probabilities) | 3.6e-15 | not compared |
+| Both readouts end to end | 9.2e-14 | 8.3e-6 |
+
+The layer outputs are residual-stream values before the final norm and grow through the stack, which is why the
+per-layer figures exceed the final-hidden-state figures. The float32 suite asserts only a sanity limit of 1e-2,
+some 250 times the largest value above: no float32 accuracy bound is claimed from a 24-wide test geometry.
+
+Request invariants, compared C++ against C++ and found EXACTLY equal (difference 0):
+
+- one row over state + branch + leaf against the same tokens as three chained rows: hidden states in float64
+  and in float32, and the snapshot afterwards in float64;
+- each branch run alone from the state's snapshot against the same branch inside the request, and the request
+  with its rows reversed (float64);
+- a snapshot's contents before and after four children ran from it twice, and the two runs of the children
+  against each other (float64).
+
+## sepal-bench
+
+```
+sepal-bench [--preset tiny|0.8b|2b|4b|9b]... [--state 512] [--branches 8] [--branch-tokens 50] [--vocab 4096] [--seed 1]
+```
+
+One state row and `--branches` rows that continue it, float32, seeded random weights, one thread. It measures the
+reference path: scalar kernels and the scalar reference GEMM, deliberately unoptimised. The figure is a baseline
+to improve on, not a statement about the engine. For a real geometry only `--vocab` embedding rows are allocated
+(the embedding is looked up, never multiplied, so its size does not change the timing).
+
+Measured on an AMD Ryzen 5 7600X, Windows 11, MSVC 19.44 Release, one thread, 512-token state and 8 branches of 50
+tokens (912 tokens):
+
+| Geometry | State row | Branches | Total |
+|---|---|---|---|
+| `tiny` (50,182 non-embedding parameters) | 10,028 tokens/s | 8,999 tokens/s | 9,549 tokens/s (0.096 s) |
+| 0.8B (498,113,344 non-embedding parameters) | 3.35 tokens/s | 3.29 tokens/s | 3.32 tokens/s (274.8 s) |
+
+One run each. The `tiny` run lasts a tenth of a second and an earlier run of it gave 8,019 tokens/s, so read
+that row to one significant figure; a 16-token run of 0.8B gave 3.40 tokens/s.
+
+## Golden vectors
+
+`tools/export_golden.py` imports `sepal.refengine`, builds the `tiny` preset with seeded random weights, runs a
+fixed set of requests through the oracle and writes `tests/golden/tiny.sgv` (671 kB, committed). The C++ tests take
+the weights, the requests and the expected results from that file only. To regenerate it, from the repository root:
+
+```
+uv run python runner/tools/export_golden.py
+```
+
+Format `SEPALGV1`; every integer and float is little-endian:
+
+```
+8 bytes   magic, the ASCII text "SEPALGV1"
+u32       H, the length of the header in bytes
+H bytes   the header: one UTF-8 JSON object
+u32       N, the number of arrays
+N times:  u32 name length, the name (UTF-8), u32 rank R, R x u64 shape,
+          prod(shape) x f64 values in row-major order
+```
+
+The header holds the geometry (`config`), the seed, the oracle's `UNVERIFIED` list and `cases`: every test request
+(token ids, start positions, parents, readout offsets) and the name of each array that holds an expected result.
+Array names are paths: `weights/<tensor name>`, then one prefix per case.
+
+| Case | Contents |
+|---|---|
+| `ladder` | One 13-token sequence from nothing: the embedding, the output of every decoder layer for every token, and the hidden states after the final norm |
+| `request` | Five rows: a 20-token state row, three branches of it, and a branch of a branch; a child is listed before its parent on purpose. The final hidden states at each row's readout offsets |
+| `snapshot` | Every layer's state after the state row: recurrent state and conv tail per DeltaNet layer, keys and values per attention layer |
+| `steps` | One branch continued from that snapshot, layer by layer: each layer's input, normed input, mixer output, output and state afterwards, so each layer can be tested alone |
+| `deltanet_detail`, `attention_detail` | Every intermediate value inside one DeltaNet mixer and one attention mixer of `steps` |
+| `one_pass` | The state row, a branch and its child as ONE row, read out at the same tokens |
+| `pointer`, `label` | Questions for the two readouts: logits and probabilities, at several temperatures |
 
 ## Build and test
 
@@ -68,14 +227,17 @@ Options: `-DSEPAL_ASAN=ON` enables AddressSanitizer; `-DSEPAL_BUILD_TESTS=OFF` s
 
 ### Status of the two platforms
 
-This slice was built and tested with MSVC 19.44 on Windows 11, in both presets. It is written to the C++20
+Everything here was built and tested with MSVC 19.44 on Windows 11, in both presets. It is written to the C++20
 standard with compiler extensions off and no platform headers, but it has not yet been compiled with GCC or
 Clang; the first Linux build may meet warnings that MSVC does not raise.
 
 ## Running one suite
 
 `sepal_tests` runs everything; `sepal_tests <suite>` runs one of `config`, `dtype`, `tensor`, `gemm`, `ops`,
-`planner`, and fails if the name matches no test case.
+`planner`, `golden`, `deltanet`, `attention`, `executor`, `readout`, `float32`, and fails if the name matches no
+test case. The last five print the largest difference from the oracle that each comparison saw; CTest shows a
+test's output only when it fails, so run the suite directly to read them, for example
+`build/release/sepal_tests executor`.
 
 ## sepal-info
 
@@ -92,11 +254,16 @@ It exits with 0 when a plan is granted, 2 when the planner refuses and 1 on a us
 - **GEMM.** `Y[t, n] = beta * Y[t, n] + sum over k of X[t, k] * W[n, k]`, with `W` stored one output feature per
   row. Output row `t` depends on input row `t` and the weights only. The reference provider accumulates each
   output in float64 over `k = 0 .. K-1` and rounds to float32 once.
-- **RMSNorm.** `y = x / sqrt(mean(x^2) + eps) * (1 + w)`: the stored weight is centred on zero.
+  `gemm_f64` is the same sum with float64 inputs and outputs.
+- **RMSNorm.** `y = x / sqrt(mean(x^2) + eps) * (1 + w)`: the stored weight is centred on zero. The DeltaNet
+  gated norm is the exception the oracle assumes: it scales by `w` itself.
 - **Convolution.** Filter `[C, K]`; tap `K-1` multiplies the current input and tap 0 the oldest, which is the
   layout of a PyTorch `Conv1d` weight with left padding `K-1`. The tail is the last `K-1` inputs, oldest first.
-  The convolution is bias-free. Both points are to be confirmed against the base model files when the loader
-  exists.
+  The convolution is bias-free. Both points are among the oracle's unverified details (`deltanet.causal_conv`).
+- **Pointer head.** Two linear maps WITH bias, `q` and `k`, from the hidden size to the pointer dim, as the oracle
+  and the reference model define them: `2 * (P * H + P)` parameters, which is what `count_params` reports.
+- **Float32 in the reference path.** Each kernel computes in float32, except the reference GEMM, which
+  accumulates in float64 and rounds once, and the RoPE angles, which are float64.
 - **Floating point.** No fast-math and no fused multiply-add contraction (`/fp:precise`, `-ffp-contract=off`).
 
 ## Numbers this code derives
