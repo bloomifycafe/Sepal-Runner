@@ -1,0 +1,14 @@
+; Module definition for the cuBLAS entry points the provider calls. The NVIDIA wheel ships cublas64_13.dll and its
+; headers but no cublas.lib, so CMakeLists.txt builds the import library from this file with `lib /def`.
+; Add a line here when the provider starts calling another cuBLAS function.
+LIBRARY cublas64_13.dll
+EXPORTS
+    cublasCreate_v2
+    cublasDestroy_v2
+    cublasGetVersion_v2
+    cublasSetStream_v2
+    cublasSetWorkspace_v2
+    cublasSetMathMode
+    cublasGetStatusString
+    cublasSgemm_v2
+    cublasGemmEx

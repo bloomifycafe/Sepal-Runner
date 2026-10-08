@@ -1,0 +1,14 @@
+# The CUDA 13.1 Update 1 toolkit components, as NVIDIA publishes them on PyPI (Windows x86-64 and Linux wheels).
+# Installed by setup_toolchain.ps1 into runner/cuda/.toolchain; they unpack into one toolkit tree at
+# .toolchain/Lib/site-packages/nvidia/cu13/{bin,include,lib,nvvm}.
+#
+# Do not replace these with the "-cu12" packages: on Windows nvidia-cuda-nvcc-cu12 (12.1.105 and 12.9.86 were
+# inspected on 2026-10-09) holds ptxas.exe, nvvm64_40_0.dll and libdevice, but no nvcc.exe, cudafe++.exe or cicc.exe,
+# so it cannot compile CUDA C++. The unsuffixed CUDA 13 packages below hold the whole compiler.
+nvidia-cuda-nvcc==13.1.115      # nvcc.exe, cudafe++.exe, ptxas.exe, nvlink.exe, fatbinary.exe, bin2c.exe
+nvidia-nvvm==13.1.115           # nvvm/bin/cicc.exe, nvvm64_40_0.dll, libdevice
+nvidia-cuda-crt==13.1.115       # include/crt: the device-side C runtime headers nvcc needs
+nvidia-cuda-runtime==13.1.80    # cuda_runtime.h and friends, cudart.lib, cudart_static.lib, cudadevrt.lib, cudart64_13.dll
+nvidia-cuda-cccl==13.1.115      # include/cccl: Thrust, CUB, libcu++ (not used yet; kept so kernels may use them)
+nvidia-cuda-nvrtc==13.1.115     # nvrtc.h, nvrtc64_130_0.dll: run-time kernel compilation (not used yet)
+nvidia-cublas==13.2.1.1         # cublas_v2.h, cublas64_13.dll, cublasLt64_13.dll; NO import library (see README)
