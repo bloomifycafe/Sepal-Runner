@@ -10,24 +10,30 @@ from .readout import label_row_probabilities, label_rows, pointer_probabilities
 from .snapshot import AttentionState, DeltaNetState, Snapshot, empty_snapshot
 from .weights import ParameterCounts, Weights, parameter_counts, random_weights, weight_shapes
 
-# Details the Kev reference files do not settle, because Kev calls a library kernel there (flash-linear-attention,
-# transformers) whose body is not among them. Each is the reading the reference supports best, isolated in the one
-# function named, as (module.function, what was assumed). To flip one, change that function only; the request
-# invariants (continuation, isolation, hit = miss) hold for either reading. Check each against the upstream Qwen3.5
-# model code.
+# Details of the arithmetic that are assumed and not checked against the upstream model, as (module.function, what
+# is assumed). Empty: the twelve that the Kev reference files left open (Kev calls library kernels there) were each
+# read in the upstream source and confirmed numerically, and none needed a change. Evidence, method and measured
+# differences: docs/REFENGINE-VERIFICATION.md; the tests are tests/refengine/test_refengine_upstream.py.
+# Lines are of transformers 5.19.0, transformers/models/qwen3_5/modeling_qwen3_5.py.
 UNVERIFIED: tuple[tuple[str, str], ...] = (
-    ("deltanet.causal_conv", "tap order: the last kernel tap multiplies the current token (cross-correlation), the tail is oldest first, no bias"),
-    ("deltanet.l2_normalise", "q and k are divided by sqrt(sum(x^2) + 1e-6): eps inside the root, not max(norm, eps)"),
-    ("deltanet.share_key_heads", "value head h reads key head h // (value heads / key heads): repeat-interleave, not tiling"),
-    ("deltanet.delta_rule_update", "operand order: the old state is decayed before the update, the write itself is not decayed; state axes are [key dim, value dim]"),
-    ("deltanet.delta_rule_scan", "a token's output reads the state after its own update, not before"),
-    ("deltanet.delta_rule_output_scale", "the read is scaled by 1 / sqrt(key head dim)"),
-    ("deltanet.gated_norm_scale", "the gated norm multiplies by its stored weight w, not by 1 + w like the other norms"),
-    ("deltanet.gated_norm_gate", "the gated norm's gate activation is silu(z) ('swish' in the Kev call), not sigmoid(z)"),
-    ("attention.rope_angles", "one position axis with frequencies theta ** (-2i / rotary_dim): the sectioned three-axis RoPE reduces to this for text"),
-    ("attention.apply_rope", "the first rotary_dim dims of a head rotate, dim i paired with dim i + rotary_dim / 2 (half-split, not interleaved)"),
-    ("attention.attention_scale", "scores are scaled by 1 / sqrt(head_dim)"),
-    ("attention.grouped_query_attention", "query head h reads kv head h // (heads / kv heads): repeat-interleave, not tiling"),
+    # deltanet.causal_conv: F.conv1d (cross-correlation) left-padded by K-1 and cut to the sequence, so the last tap
+    #   multiplies the current token; conv1d has bias=False. L260-279 (cached: L240-256), L512-519.
+    # deltanet.l2_normalise: x * rsqrt(sum(x^2) + 1e-6), eps inside the root. L284-287, called at L334-335, L454-455.
+    # deltanet.share_key_heads: repeat_interleave(value heads // key heads) over the head axis. L610-612.
+    # deltanet.delta_rule_update: the state is decayed, then read with k and written; the write is not decayed; the
+    #   state is [value heads, key dim, value dim]. L470-479 (token by token), L402-415 (chunked, same result).
+    # deltanet.delta_rule_scan: a token's output reads the state after its own update. L481.
+    # deltanet.delta_rule_output_scale: the query is scaled by key head dim ** -0.5. L337-338, L458.
+    # deltanet.gated_norm_scale: the gated norm multiplies by its weight itself, initialised to one. L211, L221.
+    # deltanet.gated_norm_gate: the gate is silu(z). L213, L222.
+    # attention.rope_angles: inv_freq = 1 / theta ** (arange(0, dim, 2) / dim), dim = int(head_dim * partial rotary
+    #   factor); the three position axes carry the same value for text, so the sectioned table reduces to one axis.
+    #   L170-177, L185-203, L1250-1259.
+    # attention.apply_rope: the first rotary_dim dims rotate, paired half-split: x * cos + cat(-x2, x1) * sin with
+    #   cos and sin each cat(f, f). L656-660, L688-698, L203.
+    # attention.attention_scale: head_dim ** -0.5. L748, L727.
+    # attention.grouped_query_attention: each kv head is repeated in place for its group of query heads
+    #   (repeat_interleave). L702-711, L724-725.
 )
 
 __all__ = [
