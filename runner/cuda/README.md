@@ -284,6 +284,98 @@ attention geometry, 8 heads over 2 KV heads of 256, and measured alike), `sepal-
 | (b) 1 row x 4096 | 135.3 | 107.3 | 3.73 (0.28 + 3.45) |
 | (c) 8 states x 640 + 64 branches x 27 | 47.3 | 39.2 | 2.34 (0.46 + 1.87) |
 
+## DeltaNet kernels
+
+`src/kernels_deltanet.hpp`, `src/kernels_deltanet.cu`: the Gated DeltaNet mixer's work between the four input
+multiplies and the `out_proj` multiply. Library `sepal_cuda_deltanet_kernels`, tests `sepal_cuda_kernel_deltanet_tests`
+(CTest `cuda_deltanet_*`), benchmark `sepal-cuda-deltanet-bench`. The contract (rows, slots, waves, taps for tests) is
+in the header and unchanged by the rewrite described here; the engine calls `launch_deltanet_wave` as before.
+
+**What one launch does.** One block per (row, value head). The block holds two kinds of warps that work at the same time:
+
+- *scan warps* (128 threads for dv = 128) keep the head's 128 x 128 state in registers. A thread owns a tile of four
+  adjacent columns and a quarter of the keys; the four lanes of a column quad meet only to complete a dot product (two
+  shuffles). The recurrence is all they do.
+- *input warps* (128 threads) run one chunk of 16 tokens ahead of the scan: the causal convolution and SiLU of the
+  q, k, v channels, the per-token decay and beta, the L2 normalisation of q and k. Their global loads are issued a step
+  ahead; the scan finds each chunk finished in one of two shared-memory stage buffers. The gated RMSNorm of the scan's
+  reads, written in the `out_proj` operand type, is done by the same warps, one chunk behind the scan.
+
+Named barriers (full/empty pairs for the stage buffers and for the read buffers) pass the buffers back and forth, so
+the global-memory latency and the arithmetic of the convolution, the norms and the SiLU overlap the recurrence instead
+of stopping it. The last token of a chunk takes the first token of the next chunk in the same pass over the registers.
+
+**Why this shape (measured, RTX 3060).** Phase by phase, the earlier one-column-per-thread kernel spent 4.3 ms of its
+7.0 ms (16 rows x 640) in the staging phases (convolution, normalisations, gated norm), which ran while the recurrence
+waited, and 3.5 ms in the recurrence; the recurrence alone was limited by shared-memory reads of the k and q vectors
+(a broadcast 128-bit read costs the SM about 4 cycles whatever the lanes read), not by the multiply-adds. Giving every
+thread four columns divides those reads by four, and running the staging in its own warps hides it. A microbenchmark of
+the recurrence alone, cycles per (token, head) per SM: 926 with one column per thread, 704 with four columns, 595 with
+four columns and no per-element decay multiply.
+
+**The decay without a multiply per state element.** The state is kept as `tile = S / g` with a scalar `g` (the product
+of the decays since the last fold). A token's decay multiplies `g`; `recalled = g (k.tile)`, the correction is
+`beta (v - g (k.tile))`, `tile += k (correction / g)`, `read = scale * g (q.tile)`. The first token of every chunk (and
+any later token that would take `g` below 2^-40, flagged per chunk) folds the accumulated decay into the tile with one
+multiply per element; at the end of a row `tile * g` is stored. That is three operations per state element per token
+instead of four. The scalars come from the input warps as a short sequential walk over the chunk, a function of the
+row's own tokens.
+
+**What stays and what changes in the numbers.** Unchanged: a token's bits depend only on its own row and parent chain
+(not on the other rows, their number, the wave, or the row's place), one fixed reduction order per output element, no
+float atomics, `--fmad=false`, every multiply-add an explicit round-to-nearest intrinsic; the divisions are correctly
+rounded (the reciprocal refined by two fused steps, the fast path of `__fdiv_rn` without its branch). Changed: the
+results differ from the previous kernel in the last bits (the reduction tree and the scaled state are different), and a
+row cut in two and continued from the first part's stored state now agrees with the uncut row to rounding
+(1e-6 of the rms of the output) instead of bit for bit, because the decay scale restarts at the cut. Cuts happen
+at the same places in every call the engine makes, and the engine's strict-mode suites (a branch from a snapshot against
+the same branch in one call, row permutations, rows among other rows) are bit-identical. `lanes_per_column` is accepted
+and ignored (one thread mapping); more than 4 conv taps use a run-time tap count.
+
+Accuracy against the float64 reference (`growth` suite, 0.8B geometry, one row, nonzero start; max |difference| over the
+rms of the reference): after 4096 tokens the output is 9.1e-6 off (before: 9.8e-6) and the state 4.0e-6 (before 3.9e-6);
+after 1024 tokens 5.7e-6 (before 6.8e-6) and 4.4e-6 (4.5e-6). The float32 CPU reference is 1.3e-5 off at 4096 tokens.
+
+Time per layer in ms, `sepal-cuda-deltanet-bench --presets 0.8b` (minimum of 30 repetitions, the earlier kernel and the
+new one run alternately in one session on the otherwise idle card; the 1 x 600 and 1 x 2048 rows from a paired run of
+both kernels in one process):
+
+| Request | before | after | speed-up |
+|---|---|---|---|
+| (a) 16 rows x 640 | 7.05 | 4.27 | 1.65x |
+| (b) 1 row x 4096 | 5.72 | 2.66 | 2.15x |
+| (c) 8 states x 640 + 64 branches x 27 | 5.49 | 3.86 | 1.42x |
+| (d) 1 row x 600 | 0.85 | 0.43 | 1.99x |
+| (e) 1 row x 2048 | 2.85 | 1.35 | 2.11x |
+
+DeltaNet time per engine call in ms (`sepal-cuda-engine-bench --sections profile`, float16, natural batching, 18
+DeltaNet layers, median of 3 runs of each build run alternately; the profile mode synchronises after each phase):
+
+| Call | before | after | speed-up | wall before -> after |
+|---|---|---|---|---|
+| 1 row x 64 | 1.77 | 1.18 | 1.5x | 10.4 -> 9.6 |
+| 1 row x 600 | 15.27 | 7.50 | 2.04x | 49.5 -> 41.2 |
+| 1 row x 2048 | 51.67 | 24.23 | 2.13x | 151.1 -> 124.1 |
+| 16 rows x 640 | 126.14 | 75.17 | 1.68x | 577.9 -> 529.3 |
+| 1 alert per call | 19.94 | 10.88 | 1.8x | 64.4 -> 55.8 |
+| 16 alerts per call | 171.46 | 117.76 | 1.46x | 780.7 -> 731.1 |
+| 16 alerts, states cached | 43.23 | 39.47 | 1.10x | 207.0 -> 205.3 |
+
+The long single rows improved by a factor of two; the batched calls by less. In a 16 x 640 call the recurrence is no
+longer what limits a block: a chunk of 16 tokens takes the scan about 16.6k cycles when it never waits and the input
+warps about 18k for their convolution, normalisation and output work, so the two roughly balance and the card is run
+at one block per SM (255 registers per thread, 66 KB of shared memory). The short branch rows of the alert workload
+(26 tokens) pay a pipeline fill (the first chunk's convolution before the recurrence can start) that is about half of
+their block time. Ideas not done: a cheaper convolution/SiLU stage (it is the largest part of the input warps' time),
+a separate pair of warps for the output stage (needs fewer registers in the input warps to fit), a smaller first chunk,
+and a chunked formulation of the recurrence on tensor cores (not attempted: in float32 it does the same multiply-adds
+and a half-precision form would not meet the accuracy bars).
+
+Tests added: strong decays (down to exactly zero) at every position of a chunk against the float64 reference, and the
+same row among other rows bit for bit; conv tap counts 1, 2, 3, 5 and 8; chunk-boundary lengths at the real size; the
+continuation test now checks agreement to rounding. The tests were checked by breaking the kernel on purpose (dropping
+the fold of the decay scale, and dropping the final multiply by `g`): 10 and 14 of the 20 cases failed.
+
 ## The GPU engine
 
 `include/sepal/cuda/cuda_engine.hpp`, `src/cuda_engine.cpp`, `src/engine_kernels.{hpp,cu}`: `CudaEngine` runs a Qwen3.5
@@ -371,8 +463,10 @@ Where a call's time goes (synchronised profiling mode, so each total is longer t
 
 The multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's float16-with-float32-accumulation tensor peak (28 SMs x
 512 FLOPs per clock x about 1.78 GHz = 25.5 TFLOP/s): on the 2B model they are 81% of a call, so raw tokens per second
-there (83% of a 16 x 640 call) cannot move far from llama.cpp's. What is left is the DeltaNet scan (one block per row and value head: a single
-long row uses 16 blocks of 28 SMs) and the memory-bound elementwise kernels.
+there (83% of a 16 x 640 call) cannot move far from llama.cpp's. What is left is the DeltaNet scan and the
+memory-bound elementwise kernels. (The table above and the throughput tables are from before the DeltaNet kernel was
+rewritten; its effect on the profile is in the "DeltaNet kernels" section: 1 x 600 15.3 -> 7.5 ms, 16 x 640 126 -> 75 ms,
+16 alerts 171 -> 118 ms of DeltaNet time per call.)
 
 Peak device memory (0.8B and 2B, float16, the bench's default budget of 85% of the free memory): the engine reserves
 9,557 MiB at creation (0.8B: weights 1,436, call buffers 962, 148 state slots of 19.3 MiB 2,851, key/value heap 4,307;
