@@ -56,6 +56,7 @@ struct Options {
     bool fp16_gate_up = true;
     sepal::cuda::Fp16Accumulate fp16_accumulate;
     sepal::cuda::MultiplyPath multiply_path = sepal::cuda::MultiplyPath::Cublas;
+    sepal::cuda::Int8Multiply int8_multiply;
     bool prefill = true, alerts = true, cached = true, profile = true;
 };
 
@@ -107,6 +108,18 @@ Options parse(int argc, char** argv) {
             o.multiply_path = value == "invariant" ? sepal::cuda::MultiplyPath::Invariant : sepal::cuda::MultiplyPath::Cublas;
         } else if (flag == "--fp16-flush-k") {
             o.fp16_accumulate.flush_k = static_cast<unsigned>(std::stoul(value));
+        } else if (flag == "--int8") { // w8a8:<groups> or w8a16:<groups>, groups joined by '+' (gate_up, down, mixer_in, mixer_out, mlp, noout, all); none
+            if (value != "none") {
+                const std::size_t colon = value.find(':');
+                const std::string kind = value.substr(0, colon), groups = colon == std::string::npos ? "all" : value.substr(colon + 1);
+                if (kind != "w8a8" && kind != "w8a16") usage("--int8 takes w8a8:<groups>, w8a16:<groups> or none");
+                const auto has = [&](const char* g) { return groups.find(g) != std::string::npos; };
+                o.int8_multiply.int8_activations = kind == "w8a8";
+                o.int8_multiply.gate_up = has("gate_up") || has("mlp") || has("noout") || has("all");
+                o.int8_multiply.down = has("down") || has("mlp") || has("noout") || has("all");
+                o.int8_multiply.mixer_in = has("mixer_in") || has("noout") || has("all");
+                o.int8_multiply.mixer_out = has("mixer_out") || has("all");
+            }
         } else if (flag == "--fp16-accumulate") { // comma list of gate_up,down,mixer_in,mixer_out, or all, or none
             o.fp16_accumulate.gate_up = value.find("gate_up") != std::string::npos || value == "all";
             o.fp16_accumulate.down = value.find("down") != std::string::npos || value == "all";
@@ -293,6 +306,7 @@ int main(int argc, char** argv) {
         eo.fp16_gate_up = opt.fp16_gate_up;
         eo.fp16_accumulate = opt.fp16_accumulate;
         eo.multiply_path = opt.multiply_path;
+        eo.int8_multiply = opt.int8_multiply;
         const auto created = std::chrono::steady_clock::now();
         CudaEngine engine(model, eo);
         const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count();
@@ -315,6 +329,10 @@ int main(int argc, char** argv) {
         std::printf("  gate and up of the MLP written as binary16 by the multiply: %s\n", opt.precision == Precision::F16 && opt.fp16_gate_up ? "yes" : "no");
         std::printf("  multiplies by %s", opt.multiply_path == sepal::cuda::MultiplyPath::Invariant ? "the engine's own batch-invariant kernel" : "cuBLAS");
         if (opt.multiply_path == sepal::cuda::MultiplyPath::Invariant) std::printf(" (binary16 flush every %u)", opt.fp16_accumulate.flush_k);
+        if (opt.int8_multiply.any())
+            std::printf("\n  int8 weights (%s): gate_up %s, down %s, mixer_in %s, mixer_out %s", opt.int8_multiply.int8_activations ? "int8 activations" : "binary16 activations",
+                        opt.int8_multiply.gate_up ? "yes" : "no", opt.int8_multiply.down ? "yes" : "no", opt.int8_multiply.mixer_in ? "yes" : "no",
+                        opt.int8_multiply.mixer_out ? "yes" : "no");
         std::printf("\n  multiplies accumulating in binary16: gate_up %s, down %s, mixer_in %s, mixer_out %s\n", opt.fp16_accumulate.gate_up ? "yes" : "no",
                     opt.fp16_accumulate.down ? "yes" : "no", opt.fp16_accumulate.mixer_in ? "yes" : "no", opt.fp16_accumulate.mixer_out ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",

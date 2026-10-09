@@ -40,7 +40,7 @@ void launch_gemm_s8(const void* xq, std::size_t ld_x, const float* sx, const voi
 
 /// Y[t, n] = sw[n] * sum over k of x[t, k] * wq[n, k]: x [T, K] binary16 (row stride ld_x), wq [N, K] int8 in layout Fp16Pairs
 /// (row stride ld_w). The weights are widened to binary16 in registers (exact) and multiplied on the tensor cores with float32
-/// accumulators, so a weight byte is the only thing that is read at a quarter of the cost of the binary16 multiply's; the
+/// accumulators, so the weights cost half the memory traffic of the binary16 multiply's and the arithmetic is the same; the
 /// result is scaled by the channel's scale afterwards. Requires K a multiple of 16, ld_x a multiple of 8, ld_w a multiple of 16,
 /// N and ld_y even, 16-byte aligned x and wq.
 void launch_gemm_w8a16(const void* x, std::size_t ld_x, const void* wq, std::size_t ld_w, const float* sw, void* y, std::size_t ld_y, bool y_half,

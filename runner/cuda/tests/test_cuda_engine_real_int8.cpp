@@ -434,15 +434,17 @@ SEPAL_TEST(real_int8_2b, int8_variants_against_the_float32_engine_on_the_second_
     {
         EngineOptions f32 = base_options(9000, 40);
         f32.precision = Precision::F32;
+        f32.max_call_tokens = 4096;
         CudaEngine engine(model, f32);
-        want = run_batched(engine, alerts, 8, hidden);
+        want = run_batched(engine, alerts, 4, hidden);
     }
     const auto specs = environment("SEPAL_INT8_VARIANTS") ? variant_specs()
                                                           : std::vector<std::string>{"base", "acc16", "w8a16:all", "w8a8:gate_up", "w8a8:down", "w8a8:mixer_in", "w8a8:mixer_out", "w8a8:mlp", "w8a8:noout", "w8a8:all"};
     for (const std::string& spec : specs) {
-        const Variant v = parse_variant(spec, 6000, 40);
+        Variant v = parse_variant(spec, 6000, 40);
+        v.options.max_call_tokens = 4096;
         CudaEngine engine(model, v.options);
-        const Hidden got = run_batched(engine, alerts, 8, hidden);
+        const Hidden got = run_batched(engine, alerts, 4, hidden);
         CHECK(all_finite(got));
         double sum = 0, worst = 0, rel_sum = 0;
         std::size_t count = 0, rows = got.size() / hidden;

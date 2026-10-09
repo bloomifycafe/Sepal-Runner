@@ -89,6 +89,16 @@ EngineOptions make_options(const std::string& name, std::size_t gemm_rows) {
         o.multiply_path = MultiplyPath::Invariant;
         o.fp16_accumulate.flush_k = static_cast<unsigned>(std::stoul(name.substr(6)));
         flags(true, true, true, true);
+    } else if (name.rfind("w8a8-", 0) == 0 || name.rfind("w8a16-", 0) == 0) {
+        // w8a8-<groups> | w8a16-<groups>, groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp, noout, all
+        const bool a8 = name.rfind("w8a8-", 0) == 0;
+        const std::string groups = name.substr(a8 ? 5 : 6);
+        const auto has = [&](const char* g) { return groups.find(g) != std::string::npos; };
+        o.int8_multiply.int8_activations = a8;
+        o.int8_multiply.gate_up = has("gate_up") || has("mlp") || has("noout") || has("all");
+        o.int8_multiply.down = has("down") || has("mlp") || has("noout") || has("all");
+        o.int8_multiply.mixer_in = has("mixer_in") || has("noout") || has("all");
+        o.int8_multiply.mixer_out = has("mixer_out") || has("all");
     } else {
         std::fprintf(stderr, "unknown option set %s\n", name.c_str());
         std::exit(1);
@@ -169,6 +179,7 @@ int main(int argc, char** argv) {
         // rate[row label][option] = best rate over the rounds
         std::vector<std::string> labels;
         std::map<std::string, std::map<std::string, double>> rate;
+        std::map<std::string, std::size_t> weights_mib;
         const auto note = [&](const std::string& label, const std::string& name, double r) {
             if (std::find(labels.begin(), labels.end(), label) == labels.end()) labels.push_back(label);
             double& slot = rate[label][name];
@@ -177,6 +188,7 @@ int main(int argc, char** argv) {
         for (int round = 0; round < rounds; ++round) {
             for (const std::string& name : names) {
                 CudaEngine engine(loaded, make_options(name, gemm_rows));
+                weights_mib[name] = engine.memory().weights_bytes / (1 << 20);
                 for (const std::size_t len : sizes) {
                     const double ms = best_ms(engine, reps, [&](std::size_t rep) { return std::vector<EngineRow>{plain_row(pool, (rep * 37) % 64, len)}; });
                     note("1 row x " + std::to_string(len), name, static_cast<double>(len) / (ms / 1000.0));
