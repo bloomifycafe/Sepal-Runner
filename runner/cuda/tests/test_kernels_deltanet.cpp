@@ -260,6 +260,8 @@ struct RunOptions {
     std::vector<std::vector<std::size_t>> waves; // job indices per launch; empty = one wave of all jobs in order
     int lanes = 0;
     bool half = false;
+    bool round_in = false; // the four projections rounded to binary16 and back, still passed as float32
+    bool half_in = false;  // the same values passed as binary16 (needs `half`: the output type); implies round_in
 };
 
 struct JobResult {
@@ -367,7 +369,16 @@ public:
                           r.a.begin() + static_cast<std::ptrdiff_t>((t + 1) * hv), row + a_off);
             }
         }
-        const DeviceBuffer<float> d_proj(proj);
+        if (options.round_in || options.half_in) {
+            for (float& v : proj) v = __half2float(__float2half_rn(v));
+        }
+        const DeviceBuffer<float> d_proj(options.half_in ? std::vector<float>(1) : proj);
+        DeviceBuffer<__half> d_proj_h;
+        if (options.half_in) {
+            std::vector<__half> bits(proj.size());
+            for (std::size_t i = 0; i < proj.size(); ++i) bits[i] = __float2half_rn(proj[i]);
+            d_proj_h = DeviceBuffer<__half>(bits);
+        }
 
         std::vector<std::uint32_t> in_slots, out_slots;
         for (const Job& job : jobs) {
@@ -402,6 +413,10 @@ public:
                               {d_proj.data() + z_off, stride},
                               {d_proj.data() + b_off, stride},
                               {d_proj.data() + a_off, stride}};
+        sepal::cuda::DeltaNetInputsHalf inputs_h{{d_proj_h.data(), stride},
+                                                 {d_proj_h.data() + z_off, stride},
+                                                 {d_proj_h.data() + b_off, stride},
+                                                 {d_proj_h.data() + a_off, stride}};
         DeltaNetStates states{tails_.data(), states_.data()};
         if (half_storage_) states = DeltaNetStates{tails_h_.data(), states_h_.data(), true, saturations_.data()};
         DeltaNetOptions launch;
@@ -418,7 +433,10 @@ public:
             wave_buffers.emplace_back(ids.empty() ? std::vector<std::uint32_t>(1) : ids);
             DeltaNetRows rows{d_rows.data(), d_in.data(), d_out.data(), wave_buffers.back().data(),
                               static_cast<std::uint32_t>(wave.size())};
-            if (options.half) {
+            if (options.half_in) {
+                sepal::cuda::launch_deltanet_wave(p_.g, weights, inputs_h, rows, states, d_out_h.data(), out_stride,
+                                                  nullptr, launch);
+            } else if (options.half) {
                 sepal::cuda::launch_deltanet_wave(p_.g, weights, inputs, rows, states, d_out_h.data(), out_stride,
                                                   nullptr, launch);
             } else {
@@ -576,6 +594,34 @@ SEPAL_TEST(stages, chain_against_reference) {
         }
         CHECK(rounded);
         CHECK(same_bits(run_h.state, run.state));
+    }
+}
+
+// Projections left in binary16 by the multiply (the engine's cuBLAS binary16 accumulation) are widened as the scan and the conv
+// tail read them: the result is bit for bit that of the same values passed as float32.
+SEPAL_TEST(stages, binary16_inputs_give_the_bits_of_the_same_values_as_float32) {
+    const std::vector<Named> configs = {{"tiny", sepal::tiny_test_config()}, {"0.8b", preset("0.8b")}};
+    for (const Named& named : configs) {
+        const Problem p = make_problem(named.cfg, 12);
+        for (const std::size_t len : {std::size_t{1}, std::size_t{17}, std::size_t{75}, std::size_t{200}}) {
+            const RowData row = make_row(p, len, 22);
+            RunOptions as_float;
+            as_float.half = true;
+            as_float.round_in = true;
+            RunOptions as_half = as_float;
+            as_half.half_in = true;
+            const SingleRun a = run_single(p, row, as_float);
+            const SingleRun b = run_single(p, row, as_half);
+            CHECK(same_bits(a.result.out, b.result.out));
+            CHECK(same_bits(a.result.conv_act, b.result.conv_act));
+            CHECK(same_bits(a.result.reads, b.result.reads));
+            CHECK(same_bits(a.tail, b.tail));
+            CHECK(same_bits(a.state, b.state));
+            // and the rounding of the inputs is not a no-op, so the test can tell the two apart from the unrounded run
+            RunOptions plain;
+            plain.half = true;
+            CHECK(!same_bits(run_single(p, row, plain).result.out, a.result.out) || len == 1);
+        }
     }
 }
 

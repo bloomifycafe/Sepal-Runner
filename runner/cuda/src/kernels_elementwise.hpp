@@ -55,9 +55,20 @@ void launch_add_rms_norm(const float* x, std::size_t x_stride, const float* m, s
                          std::size_t r_stride, const float* weight, std::size_t n, std::size_t width, float eps,
                          void* norm_out, Elem out_type, std::size_t norm_stride, cudaStream_t stream);
 
+/// launch_add_rms_norm with m given as binary16 (`m` is a `const __half*`: the result of a multiply that was left in
+/// binary16, which saves the pass that widens it and half of the bytes this launch reads). The widening is exact, so the
+/// result is bit for bit that of launch_add_rms_norm on the widened matrix. r_out may be x, not m.
+void launch_add_rms_norm_half_m(const float* x, std::size_t x_stride, const void* m, std::size_t m_stride, float* r_out,
+                                std::size_t r_stride, const float* weight, std::size_t n, std::size_t width, float eps,
+                                void* norm_out, Elem out_type, std::size_t norm_stride, cudaStream_t stream);
+
 /// Plain residual addition: out[t, i] = x[t, i] + m[t, i], float32 throughout. out may be x or m.
 void launch_add(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* out,
                 std::size_t out_stride, std::size_t n, std::size_t width, cudaStream_t stream);
+
+/// launch_add with m given as binary16 (`const __half*`), widened exactly. out may be x, not m.
+void launch_add_half_m(const float* x, std::size_t x_stride, const void* m, std::size_t m_stride, float* out,
+                       std::size_t out_stride, std::size_t n, std::size_t width, cudaStream_t stream);
 
 /// SwiGLU combine: out[t, i] = silu(gate[t, i]) * up[t, i], the input of the down projection.
 /// gate and up are float32 column bands of one multiply output (each a pointer and a row stride), `width` columns

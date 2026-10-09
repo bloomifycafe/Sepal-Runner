@@ -773,6 +773,89 @@ SEPAL_TEST(add, parity_with_reference) {
     print_worst("add", f32, Worst{});
 }
 
+// ---- binary16 m: the multiply result that was left in binary16 ----
+
+namespace {
+
+/// Values rounded to binary16 and back, and the same as binary16 bit patterns laid out with a row stride and a first element
+/// `offset` elements into the allocation (so an odd offset is a pointer aligned to two bytes only).
+struct HalfRows {
+    Rows widened;
+    DeviceBuffer<std::uint16_t> buf;
+    std::size_t stride = 0, offset = 0;
+    const void* ptr() const { return buf.data() + offset; }
+};
+
+HalfRows make_half_rows(const Rows& values, std::size_t pad, std::size_t offset) {
+    HalfRows h;
+    const std::size_t n = values.size(), width = values.empty() ? 0 : values[0].size();
+    h.widened = values;
+    h.stride = width + pad;
+    h.offset = offset;
+    std::vector<std::uint16_t> bits(offset + (n == 0 ? 0 : (n - 1) * h.stride + width), 0x3C00u);
+    for (std::size_t r = 0; r < n; ++r) {
+        for (std::size_t i = 0; i < width; ++i) {
+            const std::uint16_t b = float_to_half(values[r][i]);
+            bits[offset + r * h.stride + i] = b;
+            h.widened[r][i] = half_to_float(b);
+        }
+    }
+    h.buf = DeviceBuffer<std::uint16_t>(bits);
+    return h;
+}
+
+} // namespace
+
+SEPAL_TEST(add_rms_norm, binary16_m_gives_the_bits_of_the_widened_m) {
+    Rng rng(311);
+    const Place places[] = {{0, 0}, {1, 1}, {4, 0}, {3, 3}, {64, 2}};
+    std::size_t k = 0;
+    for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{33}, std::size_t{1000}, std::size_t{1024}, std::size_t{4099}}) {
+        for (const std::size_t n : {std::size_t{1}, std::size_t{9}, std::size_t{300}}) {
+            const Rows x = random_rows(n, width, rng, -2.0, 2.0);
+            const HalfRows m = make_half_rows(random_rows(n, width, rng, -2.0, 2.0), places[k % 5].pad, places[k % 5].offset);
+            const std::vector<float> w = random_weight(width, rng);
+            const bool in_place = k % 2 == 0;
+            const std::array<Place, 4> layout = {places[(k + 1) % 5], places[(k + 2) % 5], places[(k + 3) % 5], places[(k + 4) % 5]};
+            ++k;
+            for (const Elem type : {Elem::F32, Elem::F16}) {
+                const AddNormResult want = run_add_norm(x, m.widened, w, type, layout, in_place);
+                FloatMat xm(n, width, layout[0], &x);
+                BitsMat32 rm(in_place ? 0 : n, width, layout[2], nullptr);
+                AnyOut out(type, n, width, layout[3]);
+                float* r_ptr = in_place ? xm.ptr() : as_float(rm.ptr());
+                const DeviceBuffer<float> wd = upload_vector(w);
+                sepal::cuda::launch_add_rms_norm_half_m(xm.ptr(), xm.stride(), m.ptr(), m.stride, r_ptr, in_place ? xm.stride() : rm.stride(), wd.data(), n,
+                                                        width, kEps, out.ptr(), type, out.stride(), stream());
+                const Bits r = in_place ? xm.download_bits(false) : rm.download_bits();
+                CHECK(same_bits(r, want.r));
+                CHECK(same_bits(out.download(), want.norm));
+            }
+        }
+    }
+}
+
+SEPAL_TEST(add, binary16_m_gives_the_bits_of_the_widened_m) {
+    Rng rng(411);
+    const Place places[] = {{0, 0}, {1, 1}, {4, 0}, {3, 3}, {64, 2}};
+    std::size_t k = 0;
+    for (const std::size_t width : {std::size_t{1}, std::size_t{3}, std::size_t{33}, std::size_t{1000}, std::size_t{1024}, std::size_t{4099}}) {
+        for (const std::size_t n : {std::size_t{1}, std::size_t{9}, std::size_t{300}}) {
+            const Rows x = random_rows(n, width, rng, -3.0, 3.0);
+            const HalfRows m = make_half_rows(random_rows(n, width, rng, -3.0, 3.0), places[k % 5].pad, places[k % 5].offset);
+            const bool in_place = k % 2 == 0;
+            const std::array<Place, 3> layout = {places[(k + 1) % 5], places[(k + 2) % 5], places[(k + 3) % 5]};
+            ++k;
+            const Bits want = run_add(x, m.widened, {layout[0], Place{}, layout[2]}, in_place);
+            FloatMat xm(n, width, layout[0], &x);
+            BitsMat32 om(in_place ? 0 : n, width, layout[2], nullptr);
+            float* out = in_place ? xm.ptr() : as_float(om.ptr());
+            sepal::cuda::launch_add_half_m(xm.ptr(), xm.stride(), m.ptr(), m.stride, out, in_place ? xm.stride() : om.stride(), n, width, stream());
+            CHECK(same_bits(in_place ? xm.download_bits(false) : om.download_bits(), want));
+        }
+    }
+}
+
 // ---- suite: swiglu ----
 
 namespace {

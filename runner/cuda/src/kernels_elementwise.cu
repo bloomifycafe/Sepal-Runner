@@ -162,15 +162,17 @@ __global__ void rms_norm_kernel(const float* x, std::size_t x_stride, const std:
 }
 
 /// r = x + m written to r_out, then the norm of r. Rows of r beyond the registers are read back from r_out by the
-/// thread that wrote them, so no synchronisation is needed for them and r_out may be x or m.
-template <class Out>
-__global__ void add_rms_norm_kernel(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride,
+/// thread that wrote them, so no synchronisation is needed for them and r_out may be x or m (float32 m only). `MIn` is
+/// the type of m: float, or __half (a multiply result that was left in binary16; widening is exact, so the sum is the
+/// same as with the widened values).
+template <class Out, class MIn>
+__global__ void add_rms_norm_kernel(const float* x, std::size_t x_stride, const MIn* m, std::size_t m_stride,
                                     float* r_out, std::size_t r_stride, const float* weight, std::size_t width,
                                     float eps, Out* out, std::size_t out_stride, bool aligned) {
     __shared__ float warp_sums[kWarps];
     const std::size_t row = blockIdx.x;
     const float* xr = x + row * x_stride;
-    const float* mr = m + row * m_stride;
+    const MIn* mr = m + row * m_stride;
     float* rr = r_out + row * r_stride;
     Out* yr = out + row * out_stride;
     const std::size_t chunks = (width + 3) / 4;
@@ -183,7 +185,7 @@ __global__ void add_rms_norm_kernel(const float* x, std::size_t x_stride, const 
         const std::size_t c = first + static_cast<std::size_t>(k) * kBlock;
         if (c < chunks) {
             const float4 a = load4(xr, c * 4, width, aligned);
-            const float4 b = load4(mr, c * 4, width, aligned);
+            const float4 b = load4_widened(mr, c * 4, width, aligned);
             held[k] = make_float4(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y), __fadd_rn(a.z, b.z), __fadd_rn(a.w, b.w));
             store4(rr, c * 4, width, aligned, held[k]);
             partial = add_squares(partial, held[k]);
@@ -191,7 +193,7 @@ __global__ void add_rms_norm_kernel(const float* x, std::size_t x_stride, const 
     }
     for (std::size_t c = first + static_cast<std::size_t>(kRegChunks) * kBlock; c < chunks; c += kBlock) {
         const float4 a = load4(xr, c * 4, width, aligned);
-        const float4 b = load4(mr, c * 4, width, aligned);
+        const float4 b = load4_widened(mr, c * 4, width, aligned);
         const float4 sum = make_float4(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y), __fadd_rn(a.z, b.z), __fadd_rn(a.w, b.w));
         store4(rr, c * 4, width, aligned, sum);
         partial = add_squares(partial, sum);
@@ -210,13 +212,14 @@ __global__ void add_rms_norm_kernel(const float* x, std::size_t x_stride, const 
 
 // ---- the elementwise kernels ----
 
-__global__ void add_kernel(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* out,
+template <class MIn>
+__global__ void add_kernel(const float* x, std::size_t x_stride, const MIn* m, std::size_t m_stride, float* out,
                            std::size_t out_stride, std::size_t n, std::size_t width, bool aligned) {
     const std::size_t c = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c * 4 >= width) return;
     for (std::size_t row = blockIdx.y; row < n; row += gridDim.y) {
         const float4 a = load4(x + row * x_stride, c * 4, width, aligned);
-        const float4 b = load4(m + row * m_stride, c * 4, width, aligned);
+        const float4 b = load4_widened(m + row * m_stride, c * 4, width, aligned);
         store4(out + row * out_stride, c * 4, width, aligned,
                make_float4(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y), __fadd_rn(a.z, b.z), __fadd_rn(a.w, b.w)));
     }
@@ -357,7 +360,11 @@ void launch_rms_norm(const float* x, std::size_t x_stride, const float* weight, 
     }
 }
 
-void launch_add_rms_norm(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* r_out,
+namespace {
+
+// launch_add_rms_norm for m of float32 or binary16 (`MIn`); the overlap rules are those of the float32 original.
+template <class MIn>
+void add_rms_norm_launch(const float* x, std::size_t x_stride, const MIn* m, std::size_t m_stride, float* r_out,
                          std::size_t r_stride, const float* weight, std::size_t n, std::size_t width, float eps,
                          void* norm_out, Elem out_type, std::size_t norm_stride, cudaStream_t stream) {
     require_output_type(out_type);
@@ -367,42 +374,70 @@ void launch_add_rms_norm(const float* x, std::size_t x_stride, const float* m, s
     require_matrix(n, width, norm_stride, "launch_add_rms_norm: norm_stride is smaller than width");
     if (n == 0 || width == 0) return;
     const std::size_t out_bytes = out_type == Elem::F32 ? sizeof(float) : sizeof(std::uint16_t);
+    // r_out may be x or (float32 m only) m; binary16 m is another matrix of other bytes.
     require(disjoint_or_same(r_out, r_stride, 4, x, x_stride, 4, n, width) &&
-                disjoint_or_same(r_out, r_stride, 4, m, m_stride, 4, n, width),
+                disjoint_or_same(r_out, r_stride, 4, m, m_stride, sizeof(MIn), n, width),
             "launch_add_rms_norm: r_out overlaps x or m other than as the same matrix");
     require(!overlap(extent_of(norm_out, n, width, norm_stride, out_bytes), extent_of(r_out, n, width, r_stride, 4)) &&
                 !overlap(extent_of(norm_out, n, width, norm_stride, out_bytes), extent_of(x, n, width, x_stride, 4)) &&
-                !overlap(extent_of(norm_out, n, width, norm_stride, out_bytes), extent_of(m, n, width, m_stride, 4)),
+                !overlap(extent_of(norm_out, n, width, norm_stride, out_bytes), extent_of(m, n, width, m_stride, sizeof(MIn))),
             "launch_add_rms_norm: norm_out overlaps an input or r_out");
     const bool aligned = x_stride % 4 == 0 && m_stride % 4 == 0 && r_stride % 4 == 0 && norm_stride % 4 == 0 &&
                          aligned16(x) && aligned16(m) && aligned16(r_out) && aligned16(weight) && aligned16(norm_out);
     const unsigned blocks = static_cast<unsigned>(n);
     if (out_type == Elem::F32) {
-        add_rms_norm_kernel<float><<<blocks, kBlock, 0, stream>>>(x, x_stride, m, m_stride, r_out, r_stride, weight,
-                                                                    width, eps, static_cast<float*>(norm_out),
-                                                                    norm_stride, aligned);
+        add_rms_norm_kernel<float, MIn><<<blocks, kBlock, 0, stream>>>(x, x_stride, m, m_stride, r_out, r_stride, weight,
+                                                                         width, eps, static_cast<float*>(norm_out),
+                                                                         norm_stride, aligned);
     } else {
-        add_rms_norm_kernel<__half><<<blocks, kBlock, 0, stream>>>(x, x_stride, m, m_stride, r_out, r_stride, weight,
-                                                                     width, eps, static_cast<__half*>(norm_out),
-                                                                     norm_stride, aligned);
+        add_rms_norm_kernel<__half, MIn><<<blocks, kBlock, 0, stream>>>(x, x_stride, m, m_stride, r_out, r_stride, weight,
+                                                                          width, eps, static_cast<__half*>(norm_out),
+                                                                          norm_stride, aligned);
     }
     check_launch();
 }
 
-void launch_add(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* out,
-                std::size_t out_stride, std::size_t n, std::size_t width, cudaStream_t stream) {
+template <class MIn>
+void add_launch(const float* x, std::size_t x_stride, const MIn* m, std::size_t m_stride, float* out, std::size_t out_stride,
+                std::size_t n, std::size_t width, cudaStream_t stream) {
     require_matrix(n, width, x_stride, "launch_add: x_stride is smaller than width");
     require_matrix(n, width, m_stride, "launch_add: m_stride is smaller than width");
     require_matrix(n, width, out_stride, "launch_add: out_stride is smaller than width");
     if (n == 0 || width == 0) return;
     require(disjoint_or_same(out, out_stride, 4, x, x_stride, 4, n, width) &&
-                disjoint_or_same(out, out_stride, 4, m, m_stride, 4, n, width),
+                disjoint_or_same(out, out_stride, 4, m, m_stride, sizeof(MIn), n, width),
             "launch_add: out overlaps x or m other than as the same matrix");
     const bool aligned = x_stride % 4 == 0 && m_stride % 4 == 0 && out_stride % 4 == 0 && aligned16(x) && aligned16(m) &&
                          aligned16(out);
-    add_kernel<<<grid_for_chunks(n, width), kBlock, 0, stream>>>(x, x_stride, m, m_stride, out, out_stride, n, width,
-                                                                  aligned);
+    add_kernel<MIn><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(x, x_stride, m, m_stride, out, out_stride, n, width,
+                                                                       aligned);
     check_launch();
+}
+
+} // namespace
+
+void launch_add_rms_norm(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* r_out,
+                         std::size_t r_stride, const float* weight, std::size_t n, std::size_t width, float eps,
+                         void* norm_out, Elem out_type, std::size_t norm_stride, cudaStream_t stream) {
+    add_rms_norm_launch<float>(x, x_stride, m, m_stride, r_out, r_stride, weight, n, width, eps, norm_out, out_type, norm_stride,
+                               stream);
+}
+
+void launch_add_rms_norm_half_m(const float* x, std::size_t x_stride, const void* m, std::size_t m_stride, float* r_out,
+                                std::size_t r_stride, const float* weight, std::size_t n, std::size_t width, float eps,
+                                void* norm_out, Elem out_type, std::size_t norm_stride, cudaStream_t stream) {
+    add_rms_norm_launch<__half>(x, x_stride, static_cast<const __half*>(m), m_stride, r_out, r_stride, weight, n, width, eps,
+                                norm_out, out_type, norm_stride, stream);
+}
+
+void launch_add(const float* x, std::size_t x_stride, const float* m, std::size_t m_stride, float* out,
+                std::size_t out_stride, std::size_t n, std::size_t width, cudaStream_t stream) {
+    add_launch<float>(x, x_stride, m, m_stride, out, out_stride, n, width, stream);
+}
+
+void launch_add_half_m(const float* x, std::size_t x_stride, const void* m, std::size_t m_stride, float* out,
+                       std::size_t out_stride, std::size_t n, std::size_t width, cudaStream_t stream) {
+    add_launch<__half>(x, x_stride, static_cast<const __half*>(m), m_stride, out, out_stride, n, width, stream);
 }
 
 void launch_swiglu(const float* gate, std::size_t gate_stride, const float* up, std::size_t up_stride, std::size_t n,

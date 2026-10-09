@@ -525,7 +525,7 @@ EngineOptions variant_options(const MultiplyVariant& v, std::size_t gemm_rows, s
 
 const std::vector<MultiplyVariant>& multiply_variants() {
     static const std::vector<MultiplyVariant> variants = {
-        {"cuBLAS, float32 accumulation (the default)", MultiplyPath::Cublas, false, 0, 2e-3},
+        {"cuBLAS, float32 accumulation (the default before MultiplyPath::Auto)", MultiplyPath::Cublas, false, 0, 2e-3},
         {"cuBLAS, binary16 accumulation", MultiplyPath::Cublas, true, 0, 1e-2},
         {"own kernel, float32 accumulation", MultiplyPath::Invariant, false, 0, 2e-3},
         {"own kernel, binary16 accumulation, flush every 64", MultiplyPath::Invariant, true, 64, 2e-3},

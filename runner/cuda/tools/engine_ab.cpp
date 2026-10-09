@@ -72,13 +72,23 @@ EngineOptions make_options(const std::string& name, std::size_t gemm_rows) {
     EngineOptions o;
     o.gemm_rows = gemm_rows;
     o.max_call_tokens = 16384;
-    // name: cublas | cublas16 (all four binary16) | cublas16-mlp | own32 | own16-<flush> (all four) | own16-mlp-<flush>
+    // name: auto (the engine's default) | cublas (float32 accumulators) | cublas16 (all four binary16) | cublas16-mlp |
+    //       cublas16-<groups> (gate_up, down, mixer_in, mixer_out joined by '+') | own32 | own16-<flush> (all four) | own16-mlp-<flush>
     const auto flags = [&](bool gate_up, bool down, bool mixer_in, bool mixer_out) { o.fp16_accumulate = {gate_up, down, mixer_in, mixer_out, o.fp16_accumulate.flush_k}; };
-    if (name == "cublas") {
+    if (name == "auto") {
+    } else if (name == "cublas") {
+        o.multiply_path = MultiplyPath::Cublas;
     } else if (name == "cublas16") {
+        o.multiply_path = MultiplyPath::Cublas;
         flags(true, true, true, true);
     } else if (name == "cublas16-mlp") {
+        o.multiply_path = MultiplyPath::Cublas;
         flags(true, true, false, false);
+    } else if (name.rfind("cublas16-", 0) == 0) {
+        o.multiply_path = MultiplyPath::Cublas;
+        const std::string g = name.substr(9);
+        const auto has = [&](const char* group) { return g.find(group) != std::string::npos; };
+        flags(has("gate_up"), has("down"), has("mixer_in"), has("mixer_out"));
     } else if (name == "own32") {
         o.multiply_path = MultiplyPath::Invariant;
     } else if (name.rfind("own16-mlp-", 0) == 0) {

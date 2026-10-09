@@ -56,7 +56,8 @@ struct Options {
     bool prune_last_layer = true;
     bool fp16_gate_up = true;
     sepal::cuda::Fp16Accumulate fp16_accumulate;
-    sepal::cuda::MultiplyPath multiply_path = sepal::cuda::MultiplyPath::Cublas;
+    sepal::cuda::MultiplyPath multiply_path = sepal::cuda::MultiplyPath::Auto;
+    bool accumulate_given = false; // --fp16-accumulate was passed
     sepal::cuda::Int8Multiply int8_multiply;
     bool prefill = true, alerts = true, cached = true, profile = true;
 };
@@ -106,9 +107,11 @@ Options parse(int argc, char** argv) {
             o.half_state = value != "0";
         } else if (flag == "--fp16-gate-up") {
             o.fp16_gate_up = value != "0";
-        } else if (flag == "--multiply-path") { // cublas (default) or invariant (the engine's own batch-invariant kernel)
-            if (value != "cublas" && value != "invariant") usage("unknown multiply path " + value);
-            o.multiply_path = value == "invariant" ? sepal::cuda::MultiplyPath::Invariant : sepal::cuda::MultiplyPath::Cublas;
+        } else if (flag == "--multiply-path") { // auto (default), cublas, or invariant (the engine's own batch-invariant kernel)
+            if (value != "auto" && value != "cublas" && value != "invariant") usage("unknown multiply path " + value);
+            o.multiply_path = value == "invariant" ? sepal::cuda::MultiplyPath::Invariant
+                              : value == "cublas"  ? sepal::cuda::MultiplyPath::Cublas
+                                                   : sepal::cuda::MultiplyPath::Auto;
         } else if (flag == "--fp16-flush-k") {
             o.fp16_accumulate.flush_k = static_cast<unsigned>(std::stoul(value));
         } else if (flag == "--int8") { // w8a8:<groups> or w8a16:<groups>, groups joined by '+' (gate_up, down, mixer_in, mixer_out, mlp, noout, all); none
@@ -123,7 +126,8 @@ Options parse(int argc, char** argv) {
                 o.int8_multiply.mixer_in = has("mixer_in") || has("noout") || has("all");
                 o.int8_multiply.mixer_out = has("mixer_out") || has("all");
             }
-        } else if (flag == "--fp16-accumulate") { // comma list of gate_up,down,mixer_in,mixer_out, or all, or none
+        } else if (flag == "--fp16-accumulate") { // comma list of gate_up,down,mixer_in,mixer_out, or all, or none (with cuBLAS unless --multiply-path says otherwise)
+            o.accumulate_given = true;
             o.fp16_accumulate.gate_up = value.find("gate_up") != std::string::npos || value == "all";
             o.fp16_accumulate.down = value.find("down") != std::string::npos || value == "all";
             o.fp16_accumulate.mixer_in = value.find("mixer_in") != std::string::npos || value == "all";
@@ -311,6 +315,8 @@ int main(int argc, char** argv) {
         eo.fp16_accumulate = opt.fp16_accumulate;
         eo.multiply_path = opt.multiply_path;
         eo.int8_multiply = opt.int8_multiply;
+        // An accumulation setting needs an explicit path (the default, auto, chooses it itself): --multiply-path cublas unless said.
+        if (eo.multiply_path == sepal::cuda::MultiplyPath::Auto && opt.accumulate_given) eo.multiply_path = sepal::cuda::MultiplyPath::Cublas;
         const auto created = std::chrono::steady_clock::now();
         CudaEngine engine(model, eo);
         const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count();
@@ -331,14 +337,17 @@ int main(int argc, char** argv) {
                     opt.gemm_rows == 0 ? "natural" : ("strict, gemm_rows " + std::to_string(opt.gemm_rows)).c_str(), create_s);
         std::printf("  last layer computed for the read-out tokens only: %s\n", opt.prune_last_layer ? "yes" : "no");
         std::printf("  gate and up of the MLP written as binary16 by the multiply: %s\n", opt.precision == Precision::F16 && opt.fp16_gate_up ? "yes" : "no");
-        std::printf("  multiplies by %s", opt.multiply_path == sepal::cuda::MultiplyPath::Invariant ? "the engine's own batch-invariant kernel" : "cuBLAS");
-        if (opt.multiply_path == sepal::cuda::MultiplyPath::Invariant) std::printf(" (binary16 flush every %u)", opt.fp16_accumulate.flush_k);
+        // What the engine runs, with the default (auto) resolved.
+        const EngineOptions& ran = engine.options();
+        std::printf("  multiplies by %s%s", ran.multiply_path == sepal::cuda::MultiplyPath::Invariant ? "the engine's own batch-invariant kernel" : "cuBLAS",
+                    opt.multiply_path == sepal::cuda::MultiplyPath::Auto ? " (chosen by the default)" : "");
+        if (ran.multiply_path == sepal::cuda::MultiplyPath::Invariant) std::printf(" (binary16 flush every %u)", ran.fp16_accumulate.flush_k);
         if (opt.int8_multiply.any())
             std::printf("\n  int8 weights (%s): gate_up %s, down %s, mixer_in %s, mixer_out %s", opt.int8_multiply.int8_activations ? "int8 activations" : "binary16 activations",
                         opt.int8_multiply.gate_up ? "yes" : "no", opt.int8_multiply.down ? "yes" : "no", opt.int8_multiply.mixer_in ? "yes" : "no",
                         opt.int8_multiply.mixer_out ? "yes" : "no");
-        std::printf("\n  multiplies accumulating in binary16: gate_up %s, down %s, mixer_in %s, mixer_out %s\n", opt.fp16_accumulate.gate_up ? "yes" : "no",
-                    opt.fp16_accumulate.down ? "yes" : "no", opt.fp16_accumulate.mixer_in ? "yes" : "no", opt.fp16_accumulate.mixer_out ? "yes" : "no");
+        std::printf("\n  multiplies accumulating in binary16: gate_up %s, down %s, mixer_in %s, mixer_out %s\n", ran.fp16_accumulate.gate_up ? "yes" : "no",
+                    ran.fp16_accumulate.down ? "yes" : "no", ran.fp16_accumulate.mixer_in ? "yes" : "no", ran.fp16_accumulate.mixer_out ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",
                     static_cast<double>(mem0.weights_bytes) / (1 << 20), static_cast<double>(mem0.call_buffer_bytes) / (1 << 20), mem0.slots_total,
                     static_cast<double>(mem0.slot_bytes) / (1 << 20), static_cast<double>(mem0.kv_heap_bytes) / (1 << 20), static_cast<double>(mem0.budget_bytes) / (1 << 20));

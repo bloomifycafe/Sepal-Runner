@@ -8,8 +8,10 @@
 // Optional: SEPAL_INT8_VARIANTS, a comma list of variant specs (default: a table of them); SEPAL_INT8_WAYS=all also runs the
 // workload one alert per call and with the states cached; SEPAL_ALERT_ALERTS limits the alerts (default 64).
 //
-// A variant spec is "base" (the default engine), "acc16" (own kernel, binary16 accumulation, flush 64, all four groups) or
-// "w8a8:<groups>" / "w8a16:<groups>" with groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp (gate_up+down),
+// A variant spec is "base" (cuBLAS, float32 accumulation), "auto" (the engine's default: cuBLAS, binary16 accumulation in all four
+// groups), "strict" (the default in strict mode, gemm_rows 128: the own kernel, binary16 accumulation, flush 64; one alert per call and
+// cached states give the same bits), "acc16" (own kernel, binary16 accumulation, flush 64, all four groups),
+// "cublas16:<groups>", "own16:<flush>" or "w8a8:<groups>" / "w8a16:<groups>" with groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp (gate_up+down),
 // noout (all but mixer_out), all. The design's gate for an int8 profile (docs/RUNNER.md, "q8"): largest |dp| <= 0.05 and at most
 // 1% answer flips against the float32 golden. The suite prints every figure and the verdict; it asserts only what must hold
 // whatever the verdict (finite results, the profile that the design expects to pass, and the batch invariance of the
@@ -76,10 +78,33 @@ EngineOptions base_options(std::size_t budget_mib, std::size_t slots) {
 
 Variant parse_variant(const std::string& spec, std::size_t budget_mib, std::size_t slots) {
     Variant v{spec, base_options(budget_mib, slots)};
-    if (spec == "base") return v;
+    if (spec == "base") { // cuBLAS with float32 accumulators: the engine's default before MultiplyPath::Auto, the reference of the table
+        v.options.multiply_path = MultiplyPath::Cublas;
+        return v;
+    }
+    if (spec == "auto") return v;  // the default now: cuBLAS with binary16 accumulation in all four groups
+    if (spec == "strict") {        // the default in strict mode: the own kernel, binary16 accumulation flushed every 64 values of k
+        v.options.gemm_rows = 128;
+        return v;
+    }
     if (spec == "acc16") {
         v.options.multiply_path = MultiplyPath::Invariant;
         v.options.fp16_accumulate = {true, true, true, true, 64};
+        return v;
+    }
+    // "cublas16:<groups>" (cuBLAS, binary16 accumulators in those groups) and "own16:<flush_k>" (own kernel, all four groups).
+    if (spec.rfind("cublas16:", 0) == 0) {
+        for (const std::string& g : split(spec.substr(9), '+')) {
+            if (g == "gate_up" || g == "mlp" || g == "all") v.options.fp16_accumulate.gate_up = true;
+            if (g == "down" || g == "mlp" || g == "all") v.options.fp16_accumulate.down = true;
+            if (g == "mixer_in" || g == "all") v.options.fp16_accumulate.mixer_in = true;
+            if (g == "mixer_out" || g == "all") v.options.fp16_accumulate.mixer_out = true;
+        }
+        return v;
+    }
+    if (spec.rfind("own16:", 0) == 0) {
+        v.options.multiply_path = MultiplyPath::Invariant;
+        v.options.fp16_accumulate = {true, true, true, true, static_cast<unsigned>(std::stoul(spec.substr(6)))};
         return v;
     }
     const std::size_t colon = spec.find(':');
@@ -100,6 +125,8 @@ Variant parse_variant(const std::string& spec, std::size_t budget_mib, std::size
 std::vector<std::string> variant_specs() {
     if (const auto e = environment("SEPAL_INT8_VARIANTS")) return split(*e, ',');
     return {"base",
+            "auto",
+            "strict",
             "acc16",
             "w8a16:all",
             "w8a16:noout",
@@ -390,7 +417,7 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
             }
             print(spec + ", the six real_f16 prompts", six);
             summary_line("0.8B", "6 prompts", spec, six);
-            if (spec == "base") CHECK(six.gate());
+            if (spec == "base" || spec == "auto" || spec == "strict") CHECK(six.gate()); // the default engines must pass the gate
         }
 
         // The workload.
@@ -401,7 +428,7 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
         const Report r16 = compare_alerts(x16, gold, hidden, readout);
         print(spec + ", " + std::to_string(alerts.size() * kQuestions) + " alert prompts, 16 alerts per call", r16);
         summary_line("0.8B", std::to_string(r16.prompts) + " prompts x16", spec, r16);
-        if (spec == "base") CHECK(r16.gate());
+        if (spec == "base" || spec == "auto" || spec == "strict") CHECK(r16.gate());
         if (all_ways && spec != "base" && spec != "acc16") {
             // Row independence of the int8 profile on the real model: other ways of batching give the same bits when every group is
             // run by the own kernels (strict mode needs no padding for them); with cuBLAS groups left in they differ a little.
@@ -413,7 +440,7 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
             summary_line("0.8B", "alone", spec, ra);
             summary_line("0.8B", "cached x16", spec, rc);
             const bool all_int8 = v.options.int8_multiply.gate_up && v.options.int8_multiply.down && v.options.int8_multiply.mixer_in && v.options.int8_multiply.mixer_out;
-            if (all_int8) {
+            if (all_int8 || spec == "strict") {
                 CHECK(same_bits(alone, x16));
                 CHECK(same_bits(cached, x16));
             }
@@ -439,7 +466,7 @@ SEPAL_TEST(real_int8_2b, int8_variants_against_the_float32_engine_on_the_second_
         want = run_batched(engine, alerts, 4, hidden);
     }
     const auto specs = environment("SEPAL_INT8_VARIANTS") ? variant_specs()
-                                                          : std::vector<std::string>{"base", "acc16", "w8a16:all", "w8a8:gate_up", "w8a8:down", "w8a8:mixer_in", "w8a8:mixer_out", "w8a8:mlp", "w8a8:noout", "w8a8:all"};
+                                                          : std::vector<std::string>{"base", "auto", "strict", "acc16", "w8a16:all", "w8a8:gate_up", "w8a8:down", "w8a8:mixer_in", "w8a8:mixer_out", "w8a8:mlp", "w8a8:noout", "w8a8:all"};
     for (const std::string& spec : specs) {
         Variant v = parse_variant(spec, 6000, 40);
         v.options.max_call_tokens = 4096;
