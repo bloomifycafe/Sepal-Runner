@@ -108,3 +108,29 @@ foreach(suite contract parity_small parity_real rows)
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
 set_tests_properties(cuda_parity_real PROPERTIES TIMEOUT 900)
+
+# ---- Gated DeltaNet kernels: tests and benchmark ----
+# Every arithmetic step in kernels_deltanet.cu is an explicit intrinsic; --fmad=false additionally stops nvcc from
+# contracting anything that is not (determinism rule, src/device.hpp).
+set_source_files_properties(src/kernels_deltanet.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+# A library of its own, so that the kernels build and test without the cuBLAS provider.
+add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu)
+target_include_directories(sepal_cuda_deltanet_kernels PUBLIC src)
+target_include_directories(sepal_cuda_deltanet_kernels SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_deltanet_kernels PRIVATE sepal_cuda_flags)
+
+add_executable(sepal_cuda_kernel_deltanet_tests
+  tests/test_kernels_deltanet.cpp
+  ../tests/test_main.cpp
+)
+target_include_directories(sepal_cuda_kernel_deltanet_tests PRIVATE ../tests)
+target_link_libraries(sepal_cuda_kernel_deltanet_tests PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
+
+add_executable(sepal-cuda-deltanet-bench tools/bench_deltanet.cpp)
+target_link_libraries(sepal-cuda-deltanet-bench PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
+
+foreach(suite stages growth geometry continuation waves invariance edge)
+  add_test(NAME cuda_deltanet_${suite} COMMAND sepal_cuda_kernel_deltanet_tests ${suite})
+  set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900)
+endforeach()
