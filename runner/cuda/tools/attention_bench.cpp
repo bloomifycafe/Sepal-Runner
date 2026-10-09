@@ -41,6 +41,8 @@ struct RowSpec {
 struct Scenario {
     const char* name;
     std::vector<RowSpec> rows;
+    std::uint32_t links = 0;  // the first row continues a chain of this many one-token snapshot links (rows[0].parent is -1)
+    bool indexed = false;     // the rows' segments carry `before` (binary search instead of a scan for a key's segment)
 };
 
 std::vector<Scenario> scenarios() {
@@ -55,6 +57,9 @@ std::vector<Scenario> scenarios() {
         for (int b = 0; b < 8; ++b) c.rows.push_back({27, s});
     }
     all.push_back(c);
+    // One new token over a chain of 1,000 one-token snapshot links, found by a scan from the first segment or by binary search.
+    all.push_back({"(d) 1 x 1 over 1000 links, scanned", {{1, -1}}, 1000, false});
+    all.push_back({"(e) 1 x 1 over 1000 links, indexed", {{1, -1}}, 1000, true});
     return all;
 }
 
@@ -103,15 +108,23 @@ Timing run(const sepal::ModelConfig& cfg, const Scenario& scenario, const Varian
     }
     std::vector<AttentionRowDesc> descs;
     std::vector<KvSegment> segments;
+    // The links of a chain all point at one token's keys and values: the timing does not depend on where they live.
+    DeviceBuffer<unsigned char> link_keys(kv_width * esize), link_values(kv_width * esize);
+    link_keys.zero();
+    link_values.zero();
     for (std::size_t i = 0; i < scenario.rows.size(); ++i) {
         const RowSpec& r = scenario.rows[i];
         const std::uint32_t parent_tokens = r.parent >= 0 ? scenario.rows[static_cast<std::size_t>(r.parent)].length : 0;
-        descs.push_back({static_cast<std::uint32_t>(segments.size()), r.parent >= 0 ? 2u : 1u, parent_tokens, 0});
+        const std::uint32_t links = i == 0 ? scenario.links : 0;
+        descs.push_back({static_cast<std::uint32_t>(segments.size()), (r.parent >= 0 ? 2u : 1u) + links, parent_tokens + links, scenario.indexed ? 1u : 0u});
+        std::uint32_t before = 0;
+        for (std::uint32_t l = 0; l < links; ++l) segments.push_back({link_keys.data(), link_values.data(), 1, before++});
         if (r.parent >= 0) {
             const std::size_t p = static_cast<std::size_t>(r.parent);
-            segments.push_back({keys[p].data(), values[p].data(), scenario.rows[p].length, 0});
+            segments.push_back({keys[p].data(), values[p].data(), scenario.rows[p].length, before});
+            before += scenario.rows[p].length;
         }
-        segments.push_back({keys[i].data(), values[i].data(), r.length, 0});
+        segments.push_back({keys[i].data(), values[i].data(), r.length, before});
     }
     check_attention_rows(spans, descs, segments);
     DeviceBuffer<RowSpan> d_spans(spans);
