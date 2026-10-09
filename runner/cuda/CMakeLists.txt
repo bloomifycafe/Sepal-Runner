@@ -108,3 +108,22 @@ foreach(suite contract parity_small parity_real rows)
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
 set_tests_properties(cuda_parity_real PROPERTIES TIMEOUT 900)
+
+# ---- attention kernels (full-attention mixer: norm, RoPE, K/V storage, attention, gate) ----
+# A library of its own so that it builds and tests without the cuBLAS provider.
+add_library(sepal_cuda_attention STATIC src/kernels_attention.cu)
+target_include_directories(sepal_cuda_attention PUBLIC src)
+target_include_directories(sepal_cuda_attention SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_attention PUBLIC sepal_core PRIVATE sepal_cuda_flags)
+
+add_executable(sepal_cuda_kernel_attention_tests tests/test_kernels_attention.cpp ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_attention_tests PRIVATE ../tests)
+target_link_libraries(sepal_cuda_kernel_attention_tests PRIVATE sepal_cuda_attention sepal_cuda_flags)
+
+add_executable(sepal-cuda-attention-bench tools/attention_bench.cpp)
+target_link_libraries(sepal-cuda-attention-bench PRIVATE sepal_cuda_attention sepal_cuda_flags)
+
+foreach(suite stages geometry continuation shared_context causality invariance positions rope_exact tables)
+  add_test(NAME cuda_attention_${suite} COMMAND sepal_cuda_kernel_attention_tests ${suite})
+endforeach()
+set_tests_properties(cuda_attention_geometry PROPERTIES TIMEOUT 900)
