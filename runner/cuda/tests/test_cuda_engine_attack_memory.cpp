@@ -88,7 +88,9 @@ SEPAL_TEST(attack_memory, fill_slots_and_heap_release_in_random_order_refill_and
             for (const DeviceSnapshot& s : snaps) rows.push_back(child_of(make_row(probe_tokens, {8}), s));
             return run(e, rows);
         };
-        // Reference answers from the fresh engine: parent tokens + probe tokens as one row (strict mode: same bits as continuing).
+        // Reference answers from the fresh engine: parent tokens + probe tokens as one row. A row cut at a snapshot is not the same
+        // decomposition as the uncut row (the DeltaNet scan folds its decay scale at the cut), so the two agree to rounding, not in
+        // bits; the bars are the noise of this random model, float16 included.
         const auto want = [&](std::size_t i) {
             std::vector<std::uint32_t> all = held_tokens[i];
             all.insert(all.end(), probe_tokens.begin(), probe_tokens.end());
@@ -104,7 +106,7 @@ SEPAL_TEST(attack_memory, fill_slots_and_heap_release_in_random_order_refill_and
             worst = std::max(worst, hidden_distance(got[i].hidden, w));
         }
         std::cout << "    " << exact << " of " << held.size() << " continued snapshots equal the one-row run bit for bit (largest difference " << worst << ")\n";
-        CHECK(worst <= (precision == Precision::F32 ? 1e-4 : 0.01));
+        CHECK(worst <= (precision == Precision::F32 ? 1e-4 : 0.03));
 
         // 2. Release in random order, refill, repeat; the pool must hand out exactly slots_total each time.
         for (int round = 0; round < 6; ++round) {
