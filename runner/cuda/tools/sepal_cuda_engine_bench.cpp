@@ -65,7 +65,7 @@ struct Options {
     std::fprintf(stderr,
                  "%s\nusage: sepal-cuda-engine-bench --model <dir> --workload <json> [--precision f16|f32] [--gemm-rows N] [--reps N]\n"
                  "       [--warmup N] [--json out.json] [--sections prefill,alerts,cached,profile] [--max-call-tokens N] [--budget-mib N]\n"
-                 "       [--state-slots N] [--prune-last-layer 0|1] [--fp16-gate-up 0|1]\n",
+                 "       [--state-slots N] [--prune-last-layer 0|1] [--fp16-gate-up 0|1] [--int8 w8a8:<groups>] [--smooth-stats <file> --smooth rms:0.6]\n",
                  why.c_str());
     std::exit(2);
 }
@@ -123,6 +123,14 @@ Options parse(int argc, char** argv) {
                 o.int8_multiply.mixer_in = has("mixer_in") || has("noout") || has("all");
                 o.int8_multiply.mixer_out = has("mixer_out") || has("all");
             }
+        } else if (flag == "--smooth-stats") { // the file sepal-cuda-calibrate wrote
+            o.int8_multiply.smoothing.stats = std::make_shared<const cuda::ActivationStats>(cuda::load_activation_stats(value));
+        } else if (flag == "--smooth") { // <max|mean|rms>:<alpha>, with --smooth-stats: W8A8 smoothing
+            const std::size_t colon = value.find(':');
+            const std::string stat = value.substr(0, colon);
+            if (colon == std::string::npos || (stat != "max" && stat != "mean" && stat != "rms")) usage("--smooth takes <max|mean|rms>:<alpha>");
+            o.int8_multiply.smoothing.statistic = stat == "max" ? cuda::Int8Smoothing::Statistic::Max : stat == "mean" ? cuda::Int8Smoothing::Statistic::MeanAbs : cuda::Int8Smoothing::Statistic::Rms;
+            o.int8_multiply.smoothing.alpha = std::stof(value.substr(colon + 1));
         } else if (flag == "--fp16-accumulate") { // comma list of gate_up,down,mixer_in,mixer_out, or all, or none
             o.fp16_accumulate.gate_up = value.find("gate_up") != std::string::npos || value == "all";
             o.fp16_accumulate.down = value.find("down") != std::string::npos || value == "all";
@@ -337,6 +345,9 @@ int main(int argc, char** argv) {
             std::printf("\n  int8 weights (%s): gate_up %s, down %s, mixer_in %s, mixer_out %s", opt.int8_multiply.int8_activations ? "int8 activations" : "binary16 activations",
                         opt.int8_multiply.gate_up ? "yes" : "no", opt.int8_multiply.down ? "yes" : "no", opt.int8_multiply.mixer_in ? "yes" : "no",
                         opt.int8_multiply.mixer_out ? "yes" : "no");
+        if (opt.int8_multiply.smoothing.active())
+            std::printf("; smoothed (%s, alpha %.2f)", opt.int8_multiply.smoothing.statistic == cuda::Int8Smoothing::Statistic::Max ? "max" : opt.int8_multiply.smoothing.statistic == cuda::Int8Smoothing::Statistic::MeanAbs ? "mean" : "rms",
+                        static_cast<double>(opt.int8_multiply.smoothing.alpha));
         std::printf("\n  multiplies accumulating in binary16: gate_up %s, down %s, mixer_in %s, mixer_out %s\n", opt.fp16_accumulate.gate_up ? "yes" : "no",
                     opt.fp16_accumulate.down ? "yes" : "no", opt.fp16_accumulate.mixer_in ? "yes" : "no", opt.fp16_accumulate.mixer_out ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",

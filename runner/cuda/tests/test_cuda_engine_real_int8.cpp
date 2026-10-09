@@ -7,6 +7,9 @@
 //     real_int8_2b   SEPAL_REAL_MODEL_2B, SEPAL_ALERTS (the 2B model has no golden: the float32 engine is the reference)
 // Optional: SEPAL_INT8_VARIANTS, a comma list of variant specs (default: a table of them); SEPAL_INT8_WAYS=all also runs the
 // workload one alert per call and with the states cached; SEPAL_ALERT_ALERTS limits the alerts (default 64).
+// Smoothing variants (a "~<statistic>:<alpha>" suffix) need calibration statistics: the float16 engine's run over a calibration workload that is NOT
+// the workload it is judged on, SEPAL_CALIB_ALERTS (or calibration_workload.json next to SEPAL_ALERTS; make it with
+// `tools/make_alert_workload.py --seed 4242 --out runs/calibration_workload.json`). Without one the smoothing variants are skipped, with a message.
 //
 // A variant spec is "base" (the default engine), "acc16" (own kernel, binary16 accumulation, flush 64, all four groups) or
 // "w8a8:<groups>" / "w8a16:<groups>" with groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp (gate_up+down),
@@ -18,7 +21,9 @@
 // Memory: the 0.8B engine takes about 3 GiB (weights 1.4 GiB, binary16); take the GPU lock when something else is running.
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "engine_test_util.hpp"
@@ -32,8 +37,10 @@ using sepal::cuda::CudaEngine;
 using sepal::cuda::DeviceSnapshot;
 using sepal::cuda::EngineOptions;
 using sepal::cuda::EngineRow;
+using sepal::cuda::ActivationStats;
 using sepal::cuda::EngineRowResult;
 using sepal::cuda::Int8Multiply;
+using sepal::cuda::Int8Smoothing;
 using sepal::cuda::MultiplyPath;
 using sepal::cuda::ParentRow;
 using sepal::cuda::Precision;
@@ -74,8 +81,30 @@ EngineOptions base_options(std::size_t budget_mib, std::size_t slots) {
     return o;
 }
 
-Variant parse_variant(const std::string& spec, std::size_t budget_mib, std::size_t slots) {
-    Variant v{spec, base_options(budget_mib, slots)};
+// The statistics a "~<max|mean|rms>:<alpha>" suffix smooths with: the float16 engine run over the calibration alerts (SEPAL_CALIB_ALERTS),
+// which are not the evaluation alerts. Collected on first use.
+
+std::shared_ptr<const ActivationStats> calibration_stats(const LoadedModel& model);
+
+Variant parse_variant(const LoadedModel& model, const std::string& whole_spec, std::size_t budget_mib, std::size_t slots) {
+    // spec ::= base | acc16 | (w8a8|w8a16):<group>{+<group>}[~<max|mean|rms>:<alpha>][/<cublas16|own16-<flush>|own32>]
+    //   ~: smoothing (W8A8 only); /: how the groups that are not int8 multiply
+    const std::size_t slash = whole_spec.find('/');
+    const std::string full_spec = whole_spec.substr(0, slash);
+    const std::string rest_spec = slash == std::string::npos ? std::string() : whole_spec.substr(slash + 1);
+    const std::size_t tilde = full_spec.find('~');
+    const std::string spec = full_spec.substr(0, tilde);
+    Variant v{whole_spec, base_options(budget_mib, slots)};
+    if (rest_spec == "cublas16") {
+        v.options.fp16_accumulate = {true, true, true, true, 64};
+    } else if (rest_spec.rfind("own16-", 0) == 0) {
+        v.options.multiply_path = MultiplyPath::Invariant;
+        v.options.fp16_accumulate = {true, true, true, true, static_cast<unsigned>(std::stoul(rest_spec.substr(6)))};
+    } else if (rest_spec == "own32") {
+        v.options.multiply_path = MultiplyPath::Invariant;
+    } else if (!rest_spec.empty()) {
+        throw std::invalid_argument("bad variant suffix: " + rest_spec);
+    }
     if (spec == "base") return v;
     if (spec == "acc16") {
         v.options.multiply_path = MultiplyPath::Invariant;
@@ -86,6 +115,15 @@ Variant parse_variant(const std::string& spec, std::size_t budget_mib, std::size
     if (colon == std::string::npos || (spec.substr(0, colon) != "w8a8" && spec.substr(0, colon) != "w8a16")) throw std::invalid_argument("bad int8 variant spec: " + spec);
     Int8Multiply q;
     q.int8_activations = spec.substr(0, colon) == "w8a8";
+    if (tilde != std::string::npos) {
+        const std::string rest = full_spec.substr(tilde + 1);
+        const std::size_t c2 = rest.find(':');
+        if (c2 == std::string::npos) throw std::invalid_argument("bad smoothing spec: " + rest);
+        const std::string stat = rest.substr(0, c2);
+        q.smoothing.statistic = stat == "max" ? Int8Smoothing::Statistic::Max : stat == "mean" ? Int8Smoothing::Statistic::MeanAbs : Int8Smoothing::Statistic::Rms;
+        q.smoothing.alpha = std::stof(rest.substr(c2 + 1));
+        q.smoothing.stats = calibration_stats(model);
+    }
     for (const std::string& g : split(spec.substr(colon + 1), '+')) {
         if (g == "gate_up" || g == "mlp" || g == "noout" || g == "all") q.gate_up = true;
         if (g == "down" || g == "mlp" || g == "noout" || g == "all") q.down = true;
@@ -97,20 +135,41 @@ Variant parse_variant(const std::string& spec, std::size_t budget_mib, std::size
     return v;
 }
 
+// The recommended int8 profile (README.md, "int8 multiplies"): W8A8 with smoothing for the MLP's gate/up and the mixers' two projections, the MLP's
+// down projection on the engine's own kernel with binary16 accumulation flushed every 64 (all multiplies on the engine's own kernels: batch-invariant).
+constexpr const char* kRecommended = "w8a8:gate_up+mixer_in+mixer_out~rms:0.6/own16-64";
+
+std::filesystem::path calibration_path() {
+    if (const auto e = environment("SEPAL_CALIB_ALERTS")) return *e;
+    if (const auto a = environment("SEPAL_ALERTS")) {
+        const std::filesystem::path beside = std::filesystem::path(*a).parent_path() / "calibration_workload.json";
+        if (std::filesystem::exists(beside)) return beside;
+    }
+    return {};
+}
+
 std::vector<std::string> variant_specs() {
     if (const auto e = environment("SEPAL_INT8_VARIANTS")) return split(*e, ',');
-    return {"base",
-            "acc16",
-            "w8a16:all",
-            "w8a16:noout",
-            "w8a8:gate_up",
-            "w8a8:down",
-            "w8a8:mixer_in",
-            "w8a8:mixer_out",
-            "w8a8:mlp",
-            "w8a8:gate_up+mixer_in",
-            "w8a8:noout",
-            "w8a8:all"};
+    std::vector<std::string> specs = {"base",
+                                      "acc16",
+                                      "w8a16:all",
+                                      "w8a16:noout",
+                                      "w8a8:gate_up",
+                                      "w8a8:down",
+                                      "w8a8:mixer_in",
+                                      "w8a8:mixer_out",
+                                      "w8a8:mlp",
+                                      "w8a8:gate_up+mixer_in",
+                                      "w8a8:noout",
+                                      "w8a8:all"};
+    if (!calibration_path().empty()) {
+        for (const char* s : {"w8a8:all~rms:0.6", "w8a8:gate_up~rms:0.6", "w8a8:down~rms:0.6", "w8a8:mixer_in~rms:0.6", "w8a8:mixer_out~rms:0.6",
+                              "w8a8:gate_up+mixer_in+mixer_out~rms:0.6/own16-64", "w8a8:gate_up+mixer_in+mixer_out~rms:0.6/cublas16"})
+            specs.push_back(s);
+    } else {
+        std::cout << "SMOOTHING VARIANTS NOT RUN: no calibration workload (set SEPAL_CALIB_ALERTS, see the header of this file)\n";
+    }
+    return specs;
 }
 
 // ---- data ----
@@ -120,8 +179,8 @@ struct Alert {
     std::vector<std::vector<std::uint32_t>> suffixes;
 };
 
-std::vector<Alert> load_alerts(std::size_t limit) {
-    std::ifstream in(*environment("SEPAL_ALERTS"), std::ios::binary);
+std::vector<Alert> load_alerts(std::size_t limit, const std::filesystem::path& path = *environment("SEPAL_ALERTS")) {
+    std::ifstream in(path, std::ios::binary);
     std::stringstream buffer;
     buffer << in.rdbuf();
     const json::Value root = json::parse(buffer.str());
@@ -140,10 +199,11 @@ std::vector<Alert> load_alerts(std::size_t limit) {
     return alerts;
 }
 
-std::size_t alert_count(std::size_t fallback) {
-    if (const auto e = environment("SEPAL_ALERT_ALERTS")) return std::stoul(*e);
+std::size_t alert_count_of(const char* variable, std::size_t fallback) {
+    if (const auto e = environment(variable)) return std::stoul(*e);
     return fallback;
 }
+std::size_t alert_count(std::size_t fallback) { return alert_count_of("SEPAL_ALERT_ALERTS", fallback); }
 
 using Hidden = std::vector<float>;
 
@@ -216,6 +276,47 @@ Hidden run_cached(CudaEngine& e, const std::vector<Alert>& alerts, std::size_t p
             std::copy(results[r].hidden.begin(), results[r].hidden.end(), out.begin() + static_cast<std::ptrdiff_t>((owner[r].first * kQuestions + owner[r].second) * hidden));
     }
     return out;
+}
+
+const std::vector<Alert>& calibration_alerts() {
+    static const std::vector<Alert> alerts = [] {
+        if (calibration_path().empty()) throw std::invalid_argument("a smoothing variant needs SEPAL_CALIB_ALERTS (a calibration workload that is not SEPAL_ALERTS)");
+        return load_alerts(alert_count_of("SEPAL_CALIB_COUNT", 64), calibration_path());
+    }();
+    return alerts;
+}
+
+std::shared_ptr<const ActivationStats> calibration_stats(const LoadedModel& model) {
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<const ActivationStats>> cache; // by layers and hidden size
+    auto& stats = cache[{model.config().num_layers, model.config().hidden_size}];
+    if (stats) return stats;
+    EngineOptions o = base_options(6000, 80);
+    o.collect_activation_stats = true;
+    o.max_call_tokens = 4096; // four alerts per call fit in it, on either model
+    o.multiply_path = sepal::cuda::MultiplyPath::Invariant; // a row's activations do not depend on how the calibration was batched
+    CudaEngine engine(model, o);
+    (void)run_batched(engine, calibration_alerts(), 4, ref::dim(model.config().hidden_size));
+    stats = std::make_shared<const ActivationStats>(engine.activation_stats());
+    std::cout << "calibration: " << calibration_alerts().size() << " alerts, " << stats->tokens[0][0] << " tokens per layer\n";
+    if (environment("SEPAL_CALIB_REPORT")) {
+        // How peaked the channels are: for each layer and group, the median over channels of the largest |x|, the largest of them and how many are over 10 times the median.
+        std::cout << "calibration report: layer group K median(amax) max(amax) max/median n>10x median(mean|x|) max(mean|x|) median(rms) max(rms)\n";
+        const auto median = [](std::vector<float> v) {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0f : v[v.size() / 2];
+        };
+        for (std::size_t l = 0; l < stats->layers.size(); ++l) {
+            for (std::size_t g = 0; g < ActivationStats::kGroups; ++g) {
+                const auto& c = stats->layers[l][g];
+                const float med = median(c.amax), mx = *std::max_element(c.amax.begin(), c.amax.end());
+                std::size_t over = 0;
+                for (const float a : c.amax) over += a > 10.0f * med ? 1 : 0;
+                std::cout << "  calib " << l << " " << g << " " << c.amax.size() << " " << std::setprecision(4) << med << " " << mx << " " << mx / std::max(med, 1e-30f) << " " << over << " "
+                          << median(c.mean_abs) << " " << *std::max_element(c.mean_abs.begin(), c.mean_abs.end()) << " " << median(c.rms) << " " << *std::max_element(c.rms.begin(), c.rms.end()) << "\n";
+            }
+        }
+    }
+    return stats;
 }
 
 // ---- statistics ----
@@ -327,7 +428,7 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
     const bool all_ways = environment("SEPAL_INT8_WAYS").value_or("") == "all";
 
     for (const std::string& spec : variant_specs()) {
-        const Variant v = parse_variant(spec, 6000, 80);
+        const Variant v = parse_variant(model, spec, 6000, 80);
         const auto start = Clock::now();
         CudaEngine engine(model, v.options);
         std::cout << "variant " << spec << ": engine created in " << std::fixed << std::setprecision(1) << since(start) << " s, weights " << engine.memory().weights_bytes / (1 << 20) << " MiB\n";
@@ -401,8 +502,8 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
         const Report r16 = compare_alerts(x16, gold, hidden, readout);
         print(spec + ", " + std::to_string(alerts.size() * kQuestions) + " alert prompts, 16 alerts per call", r16);
         summary_line("0.8B", std::to_string(r16.prompts) + " prompts x16", spec, r16);
-        if (spec == "base") CHECK(r16.gate());
-        if (all_ways && spec != "base" && spec != "acc16") {
+        if (spec == "base" || spec == kRecommended) CHECK(r16.gate());
+        if ((all_ways || spec == kRecommended) && spec != "base" && spec != "acc16") {
             // Row independence of the int8 profile on the real model: other ways of batching give the same bits when every group is
             // run by the own kernels (strict mode needs no padding for them); with cuBLAS groups left in they differ a little.
             const Hidden alone = run_batched(engine, alerts, 1, hidden);
@@ -413,7 +514,7 @@ SEPAL_TEST(real_int8, the_six_prompts_and_the_512_prompt_workload_against_the_fl
             summary_line("0.8B", "alone", spec, ra);
             summary_line("0.8B", "cached x16", spec, rc);
             const bool all_int8 = v.options.int8_multiply.gate_up && v.options.int8_multiply.down && v.options.int8_multiply.mixer_in && v.options.int8_multiply.mixer_out;
-            if (all_int8) {
+            if (all_int8 || v.options.multiply_path == MultiplyPath::Invariant) {
                 CHECK(same_bits(alone, x16));
                 CHECK(same_bits(cached, x16));
             }
@@ -438,10 +539,13 @@ SEPAL_TEST(real_int8_2b, int8_variants_against_the_float32_engine_on_the_second_
         CudaEngine engine(model, f32);
         want = run_batched(engine, alerts, 4, hidden);
     }
-    const auto specs = environment("SEPAL_INT8_VARIANTS") ? variant_specs()
-                                                          : std::vector<std::string>{"base", "acc16", "w8a16:all", "w8a8:gate_up", "w8a8:down", "w8a8:mixer_in", "w8a8:mixer_out", "w8a8:mlp", "w8a8:noout", "w8a8:all"};
+    std::vector<std::string> specs = environment("SEPAL_INT8_VARIANTS") ? variant_specs()
+                                                                        : std::vector<std::string>{"base", "acc16", "w8a16:all", "w8a8:gate_up", "w8a8:down", "w8a8:mixer_in", "w8a8:mixer_out", "w8a8:mlp", "w8a8:noout", "w8a8:all"};
+    if (!environment("SEPAL_INT8_VARIANTS") && !calibration_path().empty()) {
+        for (const char* s : {"w8a8:all~rms:0.6", "w8a8:gate_up+mixer_in+mixer_out~rms:0.6/cublas16", kRecommended}) specs.push_back(s);
+    }
     for (const std::string& spec : specs) {
-        Variant v = parse_variant(spec, 6000, 40);
+        Variant v = parse_variant(model, spec, 6000, 40);
         v.options.max_call_tokens = 4096;
         CudaEngine engine(model, v.options);
         const Hidden got = run_batched(engine, alerts, 4, hidden);

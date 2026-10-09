@@ -2,7 +2,12 @@
 // moment of a shared GPU hits every option alike, and reporting the best rate of each option over the rounds.
 //
 //   sepal-cuda-engine-ab --model <dir> --workload <json> [--rounds 2] [--reps 5] [--gemm-rows N] [--sizes 64,600,2048]
-//                        [--options cublas,cublas16,cublas16-mlp,own32,own16-64,own16-128,...]
+//                        [--options cublas,cublas16,cublas16-mlp,own32,own16-64,own16-128,...] [--smooth-stats <file>]
+//
+// An option set is one name or several joined by '/', applied in order: cublas | cublas16 | cublas16-mlp | own32 | own16-<flush> |
+// own16-mlp-<flush> | w8a8-<groups> | w8a16-<groups> (groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp, noout, all) |
+// smooth=<max|mean|rms>:<alpha> (W8A8 smoothing from the --smooth-stats file). A group on int8 overrides the binary16 accumulation
+// chosen for it: "w8a8-gate_up+mixer_in+mixer_out/own16-64" is int8 for three groups and the own binary16-accumulate kernel for down.
 //
 // Rows: one row of N tokens (one readout), 16 rows of 640 tokens, and the alert shapes (a state with eight questions, one
 // alert and sixteen alerts per call). Rates are tokens per second, alerts per second for the alert rows.
@@ -68,13 +73,22 @@ std::vector<std::string> split(const std::string& s, char sep) {
     return parts;
 }
 
-EngineOptions make_options(const std::string& name, std::size_t gemm_rows) {
-    EngineOptions o;
-    o.gemm_rows = gemm_rows;
-    o.max_call_tokens = 16384;
-    // name: cublas | cublas16 (all four binary16) | cublas16-mlp | own32 | own16-<flush> (all four) | own16-mlp-<flush>
+std::shared_ptr<const cuda::ActivationStats> g_stats;
+
+void apply_part(EngineOptions& o, const std::string& name) {
     const auto flags = [&](bool gate_up, bool down, bool mixer_in, bool mixer_out) { o.fp16_accumulate = {gate_up, down, mixer_in, mixer_out, o.fp16_accumulate.flush_k}; };
     if (name == "cublas") {
+    } else if (name.rfind("smooth=", 0) == 0) {
+        const std::string spec = name.substr(7);
+        const std::size_t colon = spec.find(':');
+        if (!g_stats || colon == std::string::npos) {
+            std::fprintf(stderr, "smooth=<max|mean|rms>:<alpha> needs --smooth-stats\n");
+            std::exit(1);
+        }
+        const std::string stat = spec.substr(0, colon);
+        o.int8_multiply.smoothing.stats = g_stats;
+        o.int8_multiply.smoothing.statistic = stat == "max" ? cuda::Int8Smoothing::Statistic::Max : stat == "mean" ? cuda::Int8Smoothing::Statistic::MeanAbs : cuda::Int8Smoothing::Statistic::Rms;
+        o.int8_multiply.smoothing.alpha = std::stof(spec.substr(colon + 1));
     } else if (name == "cublas16") {
         flags(true, true, true, true);
     } else if (name == "cublas16-mlp") {
@@ -103,6 +117,13 @@ EngineOptions make_options(const std::string& name, std::size_t gemm_rows) {
         std::fprintf(stderr, "unknown option set %s\n", name.c_str());
         std::exit(1);
     }
+}
+
+EngineOptions make_options(const std::string& name, std::size_t gemm_rows) {
+    EngineOptions o;
+    o.gemm_rows = gemm_rows;
+    o.max_call_tokens = 16384;
+    for (const std::string& part : split(name, '/')) apply_part(o, part);
     return o;
 }
 
@@ -158,6 +179,7 @@ int main(int argc, char** argv) {
         else if (flag == "--reps") reps = std::stoi(value);
         else if (flag == "--gemm-rows") gemm_rows = std::stoul(value);
         else if (flag == "--options") options = value;
+        else if (flag == "--smooth-stats") g_stats = std::make_shared<const cuda::ActivationStats>(cuda::load_activation_stats(value));
         else if (flag == "--sizes") {
             sizes.clear();
             for (const auto& s : split(value, ',')) sizes.push_back(std::stoul(s));
