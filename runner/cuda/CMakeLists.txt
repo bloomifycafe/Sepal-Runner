@@ -134,3 +134,22 @@ foreach(suite stages growth geometry continuation waves invariance edge)
   add_test(NAME cuda_deltanet_${suite} COMMAND sepal_cuda_kernel_deltanet_tests ${suite})
   set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900)
 endforeach()
+
+# ---- elementwise, norm, MLP, embedding and readout kernels ----
+# A library of their own (no cuBLAS), so the kernels and their tests build and run whatever state the GEMM provider is in.
+add_library(sepal_cuda_elementwise STATIC src/kernels_elementwise.cu)
+target_include_directories(sepal_cuda_elementwise PUBLIC src)
+target_include_directories(sepal_cuda_elementwise SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_elementwise PRIVATE sepal_cuda_flags)
+
+add_executable(sepal-cuda-kernel-bench tools/sepal_cuda_kernel_bench.cpp)
+target_link_libraries(sepal-cuda-kernel-bench PRIVATE sepal_cuda_elementwise sepal_cuda_flags)
+
+# The tests also run the provider's conversion kernels (src/convert_kernels.cu) to check their own binary16 oracle.
+add_executable(sepal_cuda_kernel_elem_tests tests/test_kernels_elementwise.cpp ../tests/test_main.cpp src/convert_kernels.cu)
+target_include_directories(sepal_cuda_kernel_elem_tests PRIVATE ../tests)
+target_link_libraries(sepal_cuda_kernel_elem_tests PRIVATE sepal_cuda_elementwise sepal_core sepal_cuda_flags)
+foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu readout invariance edge)
+  add_test(NAME cuda_elem_${suite} COMMAND sepal_cuda_kernel_elem_tests ${suite})
+  set_tests_properties(cuda_elem_${suite} PROPERTIES TIMEOUT 600)
+endforeach()

@@ -128,6 +128,10 @@ public:
     /// reference provider does, and CudaError when a device call fails or the arena is too small.
     void gemm_f(MatRef x, MatRef w, MatView y, float beta) const override;
 
+    /// The float64 reference product, computed on the host by the reference provider: nothing here is float64
+    /// on the device.
+    void gemm_f64(ConstMatViewD x, ConstMatViewD w, MatViewD y, double beta) const override;
+
     /// Copies W [N, K] to the device once, converted to the provider's precision, and keeps it there.
     WeightId upload_weights(MatRef w);
 
