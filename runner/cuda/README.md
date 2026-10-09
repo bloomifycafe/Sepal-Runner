@@ -276,7 +276,9 @@ multiply and the `o_proj` multiply. Library `sepal_cuda_attention`, tests `sepal
   rows: no waves are needed, because a branch needs its parent's keys and values, not its output.
 - K/V layout: a segment is `[tokens, kv_heads, head_dim]` for keys and again for values, float32 or binary16.
   A row lists its segments (parent chain, oldest first, its own last) in a device table; segments are read in
-  place, never copied. Three arrays describe a launch: `RowSpan`, `AttentionRowDesc`, `KvSegment`.
+  place, never copied. Three arrays describe a launch: `RowSpan`, `AttentionRowDesc`, `KvSegment`. A row whose `AttentionRowDesc::indexed` is 1 has
+  `KvSegment::before` (the tokens in the segments before it) set, and the kernels find the segment of a key by bisection instead of a scan from the
+  first segment (`check_attention_rows` verifies `before`); the bits are the same either way.
 - Paths: `Reference` (a plain kernel, either type, any head_dim up to 256) and `Tiled` (mma.sync tensor cores,
   binary16 only, head_dim 16/64/128/256, group size 1 to 16). Both reduce in an order that depends only on the
   row's own chain, so a token's bits do not depend on other rows, their number, or the row's place in the list.
@@ -418,7 +420,10 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
 - **Multiply batching.** `gemm_rows = 0` is natural (one multiply over all tokens). `gemm_rows = T` is strict: every
   multiply is cut into multiplies of exactly T rows, the last zero-padded, so a row's bits do not depend on the rest of
   the call. All of the engine's own kernels are batch-invariant. With `multiply_path = Invariant` the multiplies are too
-  (the engine's own kernel, see "Multiply throughput" below), and strict mode then pads nothing.
+  (the engine's own kernel, see "Multiply throughput" below), and strict mode then pads nothing. The default,
+  `multiply_path = Auto`, picks by mode: natural mode runs cuBLAS with binary16 accumulators, strict mode the own kernel with
+  binary16 accumulators flushed every 64 values of k (so strict mode pads nothing by default); "The default multiply
+  configuration" below has the accuracy and the speed.
 - **Residual ladder**: `EngineRow::capture_layers` returns every layer's output for that row.
 - **Tuning that is on by default**: the last layer's queries, attention, `o_proj` and MLP are computed for the tokens
   that are read out only (`prune_last_layer`; its keys and values are still stored for every token; bit-identical to
@@ -477,9 +482,13 @@ What was found and fixed:
 
 Not changed, but true and worth knowing:
 
-* Attention locates each key by scanning the segment list (`locate_key`), so one query over a chain of S snapshot links costs
-  O(S^2): the attention phase of a one-token call takes 3.8 ms at 250 links, 15 ms at 500, 33 ms at 750 and 60 ms at 1000.
-  `KvBlock` destruction recurses along the chain; chains deeper than 400 were not released in a test (building one is too slow).
+* Attention located each key by scanning the segment list (`locate_key`), so one query over a chain of S snapshot links cost
+  O(S^2): the attention phase of a one-token call took 3.8 ms at 250 links, 15 ms at 500, 33 ms at 750 and 60 ms at 1000.
+  Fixed since: the engine gives every segment the number of tokens before it (`KvSegment::before`, `AttentionRowDesc::indexed`) and the
+  kernels search for the segment by bisection, with the same bits. Per layer, one new token over 1,000 one-token links
+  (`sepal-cuda-attention-bench`, 0.8B geometry): tiled kernel 11.7 ms -> 0.5 ms, plain kernel 27.8 ms -> 0.95 ms (6 attention layers: about
+  70 ms -> 3 ms per call). Tests: `chains` (attention kernels: 5 chain lengths, both geometries, every kernel, indexed against scanned bit for bit; a wrong `before`
+  is refused). `KvBlock` destruction recurses along the chain; chains deeper than 400 were not released in a test (building one is too slow).
 * `run` refuses a start position whose `start + chain tokens` reaches 2^32 in `check_attention_rows`, after the call's memory
   was taken (it is given back), not at admission.
 * More than `max_call_tokens` read-outs of a single row (repeated offsets) are refused even though they are not extra tokens.
@@ -511,42 +520,48 @@ and 2 answer flips, both at p = 0.5 within 4e-4.
 Rows of 8,192 and 16,384 tokens, whole against pieces of 1,024 to 4,096 tokens continuing snapshots, twelve read-outs each:
 float32 within 6.7e-5, float16 within 1.5e-2 (|Δp| 6.6e-4); float16 against float32 at 8,192 tokens within 1.4e-3 relative L2.
 
-### Speed (RTX 3060 12 GB, driver 591.86, CUDA 13.1, cuBLAS 13.2.1, float16; best of 7 runs; llama.cpp b11514 for comparison)
+### Speed (RTX 3060 12 GB, driver 591.86, CUDA 13.1, cuBLAS 13.2.1, float16; best of two runs of 7 calls; llama.cpp b11514 for comparison)
 
-`sepal-cuda-engine-bench --model <dir> --workload runs/alert_workload.json [--gemm-rows 1024] [--json out.json]`.
+`sepal-cuda-engine-bench --model <dir> --workload runs/alert_workload.json [--gemm-rows 128] [--multiply-path cublas] [--json out.json]`. "Default" is
+`multiply_path = Auto`: natural mode cuBLAS with binary16 accumulation, strict mode (`--gemm-rows 128`) the own kernel with a flush every 64 (see
+"The default multiply configuration"). "cuBLAS fp32" is the engine as it was before `Auto` (`--multiply-path cublas`: float32 accumulation). The ratio
+columns are the default's rate over llama.cpp's.
 
-| Prefill, tokens/s | 0.8B natural | 0.8B strict 1024 | llama.cpp 0.8B | 2B natural | 2B strict 1024 | llama.cpp 2B |
-|---|---|---|---|---|---|---|
-| 1 row x 64 | 8,610 | 1,352 | 5,204 | 4,020 | 506 | 3,281 |
-| 1 row x 600 | 12,906 | 9,328 | 9,422 | 6,179 | 4,176 | 6,342 |
-| 1 row x 1000 | 13,522 | 12,886 | 10,653 | 6,287 | 6,329 | |
-| 1 row x 2048 | 13,613 | 13,166 | 11,056 | 6,859 | 6,483 | 6,888 |
-| 1 row x 4800 | 13,432 | 12,511 | 10,018 | 6,666 | 6,167 | |
-| 16 rows x 640 | 17,571 | 16,725 | | 7,923 | 7,317 | |
+| Prefill, tokens/s | 0.8B cuBLAS fp32 | 0.8B default | 0.8B default, strict | llama.cpp 0.8B | ratio | 2B cuBLAS fp32 | 2B default | 2B default, strict | llama.cpp 2B | ratio |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 row x 64 | 9,257 | 10,506 | 8,241 | 5,204 | 2.02 | 4,482 | 5,071 | 3,687 | 3,281 | 1.55 |
+| 1 row x 128 | 12,923 | 15,434 | 12,877 | | | 6,207 | 7,730 | 6,038 | | |
+| 1 row x 300 | 13,467 | 17,700 | 15,935 | | | 6,267 | 9,063 | 7,573 | | |
+| 1 row x 600 | 15,514 | 21,256 | 18,249 | 9,422 | 2.26 | 7,241 | 10,334 | 8,944 | 6,342 | 1.63 |
+| 1 row x 1000 | 16,350 | 21,461 | 19,651 | 10,653 | 2.01 | 7,269 | 10,999 | 9,652 | | |
+| 1 row x 2048 | 16,718 | 22,511 | 20,660 | 11,056 | 2.04 | 7,728 | 11,155 | 9,985 | 6,888 | 1.62 |
+| 1 row x 4800 | 16,672 | 21,582 | 19,961 | 10,018 | 2.15 | 7,383 | 10,903 | 9,633 | | |
+| 16 rows x 640 | 19,174 | 26,994 | 23,952 | | | 8,357 | 12,396 | 10,098 | | |
 
-| Alerts per second (state + 8 questions) | 0.8B natural | 0.8B strict 1024 | llama-server 0.8B | 2B natural | 2B strict 1024 | llama-server 2B |
-|---|---|---|---|---|---|---|
-| 1 alert per call | 16.1 | 14.0 | 1.7 (2.9 best) | 7.6 | 6.5 | 1.1 (2.5 best) |
-| 4 alerts per call | 18.4 | 15.9 | | 8.4 | 7.1 | |
-| 16 alerts per call | 20.2 | 18.6 | | 9.2 | 8.2 | |
-| state cached, 1 alert per call | 56.3 | 19.7 | | 25.1 | 7.8 | |
-| state cached, 16 alerts per call | 77.1 | 65.5 | | 34.4 | 28.8 | |
+| Alerts per second (state + 8 questions) | 0.8B cuBLAS fp32 | 0.8B default | 0.8B default, strict | llama-server 0.8B | 2B cuBLAS fp32 | 2B default | 2B default, strict | llama-server 2B |
+|---|---|---|---|---|---|---|---|---|
+| 1 alert per call | 18.7 | 24.4 | 23.5 | 1.7 (2.9 best) | 8.4 | 12.6 | 11.2 | 1.1 (2.5 best) |
+| 4 alerts per call | 20.8 | 27.3 | 26.0 | | 9.2 | 13.4 | 11.9 | |
+| 16 alerts per call | 21.8 | 29.8 | 26.8 | | 9.6 | 14.3 | 11.3 | |
+| state cached, 1 alert per call | 56.7 | 74.4 | 64.2 | | 25.9 | 40.0 | 31.6 | |
+| state cached, 16 alerts per call | 79.4 | 99.5 | 97.8 | | 35.4 | 50.6 | 45.8 | |
 
-Where a call's time goes (synchronised profiling mode, so each total is longer than the same call unprofiled), ms:
+Where a call's time goes with the default (0.8B, natural; synchronised profiling mode, so each total is longer than the same call unprofiled, and "host +
+launch" is mostly the synchronisation: see "Where the host and launch time goes"), ms:
 
 | Call (0.8B, natural) | multiplies | DeltaNet | attention | elementwise | host + launch | wall |
 |---|---|---|---|---|---|---|
-| 1 row x 600 | 28.4 | 15.5 | 1.2 | 2.6 | 2.1 | 49.8 |
-| 16 rows x 640 | 407 | 128 | 15.6 | 37 | 2.7 | 591 |
-| 16 alerts per call | 546 | 175 | 24.8 | 49.8 | 3.2 | 799 |
+| 1 row x 64 | 5.1 | 1.3 | 0.4 | 0.5 | 2.9 | 10.1 |
+| 1 row x 600 | 16.7 | 9.6 | 1.2 | 2.4 | 2.6 | 32.5 |
+| 1 row x 2048 | 48.5 | 31.5 | 6.6 | 7.3 | 3.1 | 97.0 |
+| 16 rows x 640 | 232.5 | 101.9 | 16.1 | 33.6 | 6.1 | 390.2 |
+| 16 alerts per call | 310.6 | 157.8 | 27.2 | 45.9 | 5.0 | 546.3 |
 
-The multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's tensor rate with binary16 operands and float32 accumulation (28 SMs x
-512 FLOPs per clock x about 1.9 GHz = 27.8 TFLOP/s; cuBLAS reaches 96% of it): on the 2B model they are 81% of a call, so raw tokens per
-second there (83% of a 16 x 640 call) cannot move far from llama.cpp's **while the accumulators are float32**. That rate is not the
-card's tensor peak: the same tensor cores run twice as fast with binary16 accumulators, which is what the next section measures and
-the new `EngineOptions` use. What is left is the DeltaNet scan and the memory-bound elementwise kernels. (The table above and the throughput tables are
-from before the DeltaNet kernel was rewritten; its effect on the profile is in the "DeltaNet kernels" section: 1 x 600
-15.3 -> 7.5 ms, 16 x 640 126 -> 75 ms, 16 alerts 171 -> 118 ms of DeltaNet time per call.)
+With float32 accumulators the multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's tensor rate with binary16 operands and float32 accumulation (28 SMs x
+512 FLOPs per clock x about 1.9 GHz = 27.8 TFLOP/s; cuBLAS reaches 96% of it): on the 2B model they were 81% of a call. That rate is not the
+card's tensor peak: the same tensor cores run twice as fast with binary16 accumulators, which is what the default uses now (the sections below). What is
+left is the DeltaNet scan (a third of the call from 2,048 tokens up) and the memory-bound elementwise kernels. (Older tables further down were measured
+before the DeltaNet kernel was rewritten and before `Auto`.)
 
 Peak device memory (0.8B and 2B, float16, the bench's default budget of 85% of the free memory): the engine reserves
 9,557 MiB at creation (0.8B: weights 1,436, call buffers 962, 148 state slots of 19.3 MiB 2,851, key/value heap 4,307;
@@ -727,14 +742,13 @@ accumulation back to the accuracy of a binary16 output, and **no padding in stri
 
 | Field | Default | What it does |
 |---|---|---|
-| `multiply_path` | `Cublas` | `Invariant` runs every float16-path multiply on `src/gemm_kernels.cu`: bits independent of the batch (natural mode is invariant too), strict mode (`gemm_rows` > 0) pads nothing. A multiply whose shape the kernel does not take (K or a row stride not a multiple of 8, odd N) falls back to cuBLAS and strict mode pads as before |
-| `fp16_accumulate.{gate_up, down, mixer_in, mixer_out}` | all `false` | which multiplies accumulate in binary16: with `Cublas`, `CUBLAS_COMPUTE_16F` and a binary16 result widened by a small kernel; with `Invariant`, the own kernel with the flush |
+| `multiply_path` | `Auto` | `Auto` resolves once, at creation, from the options alone (never from a call): natural mode `Cublas` with `fp16_accumulate` on in all four groups; strict mode `Invariant` with all four groups on and a flush every 64 values of k; the float32 path, and `int8_multiply` groups (the other groups then stay on cuBLAS with float32 accumulators, as in the measured int8 profiles), `Cublas` with none. `CudaEngine::options()` returns what it resolved to, and the compute fingerprint of snapshot files is made from that. `fp16_accumulate` must be left at its default with `Auto` (the engine refuses anything else rather than ignore it). `Cublas` runs the multiplies on cuBLAS; `Invariant` runs every float16-path multiply on `src/gemm_kernels.cu`: bits independent of the batch (natural mode is invariant too), strict mode (`gemm_rows` > 0) pads nothing. A multiply whose shape the kernel does not take (K or a row stride not a multiple of 8, odd N) falls back to cuBLAS and strict mode pads as before |
+| `fp16_accumulate.{gate_up, down, mixer_in, mixer_out}` | all `false` (with an explicit path) | which multiplies accumulate in binary16: with `Cublas`, `CUBLAS_COMPUTE_16F` and a binary16 result (the DeltaNet scan and the residual additions read it as it is; attention's input projection and the other consumers have it widened by a small kernel); with `Invariant`, the own kernel with the flush |
 | `fp16_accumulate.flush_k` | 128 | `Invariant` only: binary16 values summed before they are added to the float32 sum (a multiple of 32; 0 never flushes) |
 
-`sepal-cuda-engine-bench` takes `--multiply-path cublas|invariant`, `--fp16-accumulate all|none|gate_up,down,...` and `--fp16-flush-k N`;
-`sepal-cuda-engine-ab` runs several option sets in one process, round after round, and reports the best of each (a shared GPU
-needs that). Nothing is on by default: binary16 accumulation changes the numbers, and `Invariant` changes the bits and is
-slower than cuBLAS with float32 accumulators.
+`sepal-cuda-engine-bench` takes `--multiply-path auto|cublas|invariant`, `--fp16-accumulate all|none|gate_up,down,...` (with the default path it
+means cuBLAS) and `--fp16-flush-k N`; `sepal-cuda-engine-ab` runs several option sets in one process, round after round, and reports the best of each (a
+shared GPU needs that): `auto`, `cublas` (float32 accumulators, the default before `Auto`), `cublas16`, `cublas16-<groups>`, `own32`, `own16-<flush>`, `w8a8-...`.
 
 #### Engine speed, before and after (same session, `sepal-cuda-engine-ab`, best of 2 rounds x 5 reps, tokens/s)
 
@@ -803,6 +817,109 @@ In strict mode the own kernel removes the padding: a 64-token call goes from 1,3
 is 8,500) and from 524 to 3,016 on the 2B (5.8x), a single alert from 14.0 to 14.7 alerts/s (float32 accumulators) or 19.2 (binary16, flush 64)
 on the 0.8B and from 6.7 to 7.4 or 10.4 on the 2B, while a row's bits still do not depend on the call. The 2B strict rows were measured
 with the other jobs on the card at their noisiest; read them to within 10%.
+
+### The default multiply configuration (`MultiplyPath::Auto`)
+
+The tables above showed binary16 accumulation to be the one lever on the multiplies and left it off. It is on now, because the 512-prompt accuracy check
+below passes the design's gate with room to spare in every variant. `EngineOptions::multiply_path` defaults to `Auto`, which is resolved once, when the
+engine is created, from the options alone (never from a call, so a call's result cannot depend on which path an earlier call took):
+
+| Mode | Resolves to | Why |
+|---|---|---|
+| natural (`gemm_rows` 0), float16 | cuBLAS `COMPUTE_16F`, all four groups (`gate_up`, `down`, `mixer_in`, `mixer_out`) | the fastest configuration that passes the gate, at every call size measured (below) |
+| strict (`gemm_rows` > 0), float16 | the own kernel, binary16 partial sums flushed into float32 every 64 values of k, all four groups | batch-invariant by construction, pads nothing, and 5 times as close to the float32 hidden state as cuBLAS with binary16 accumulators, at 8 to 22% lower speed |
+| float32 path, or any `int8_multiply` group | cuBLAS, float32 accumulation (the groups next to int8 ones are the measured int8 profiles) | nothing to choose / keep the int8 profiles as they were measured |
+
+There is no switch by call size, and that is a measurement: cuBLAS with binary16 accumulation beat the own kernel (flush 64) at every size, 1.22x at 64
+tokens (0.8B, 9.9k against 8.1k tokens/s; the 2B 1.53x), 1.18x at 600 and 1.06x at 2,048 (same session, before the consumers read binary16 directly), and beat cuBLAS with
+float32 accumulation at every size (+12% at 64 tokens, +36% at 600, +34% at 2,048 on the 0.8B; +12%, +43%, +45% on the 2B). `CudaEngine::options()` returns what `Auto` resolved to, `fp16_accumulate` must be left alone with `Auto`
+(the engine throws rather than ignore it), and the snapshot files' compute fingerprint is made from the resolved values: a file from the default engine
+loads in an engine that spells out the same multiplies (`multiply_path = Cublas`, all four groups) and in no other (test `snap_tiers`,
+`the_default_multiply_options_are_part_of_the_snapshot_kind`).
+
+**Accuracy** (`sepal_cuda_engine_tests real_int8` with `SEPAL_INT8_VARIANTS=...`; jeff-base, 64 alerts x 8 questions = 512 prompts, 16 alerts per call, against
+the transformers float32 hidden states and probabilities; the gate is max |Δp| <= 0.05 and at most 1% flips, 5 of 512; `docs/RUNNER.md` holds `gpu-f16` to 0.03, p99 0.01 and
+0.5% flips, which every row of the table passes):
+
+| multiplies | median / p99 / max \|Δp\| | flips of 512 | median relative L2 of the hidden state |
+|---|---|---|---|
+| cuBLAS float32 accumulation (the default before `Auto`) | 2.0e-4 / 1.0e-3 / 1.9e-3 | 0 | 4.7e-4 |
+| cuBLAS binary16, `gate_up` only | 7.0e-4 / 3.8e-3 / 4.4e-3 | 1 | 2.0e-3 |
+| cuBLAS binary16, `down` only | 7.0e-4 / 3.6e-3 / 6.4e-3 | 2 | 3.4e-3 |
+| cuBLAS binary16, `mixer_in` only | 7.9e-4 / 4.0e-3 / 4.9e-3 | 1 | 2.2e-3 |
+| cuBLAS binary16, `mixer_out` only | 3.8e-4 / 2.0e-3 / 3.7e-3 | 1 | 1.4e-3 |
+| **cuBLAS binary16, all four (natural default)** | 1.3e-3 / 6.6e-3 / 8.4e-3 | 2 | 4.8e-3 |
+| the same, one alert per call / states cached, 16 per call | 1.3e-3 / 6.0e-3 / 7.5e-3; 1.4e-3 / 6.1e-3 / 8.2e-3 | 2; 1 | 4.2e-3; 4.6e-3 |
+| own kernel, flush 32 | 2.5e-4 / 1.4e-3 / 2.1e-3 | 0 | 7.6e-4 |
+| **own kernel, flush 64, all four (strict default)** | 3.3e-4 / 1.5e-3 / 2.0e-3 | 1 | 9.4e-4 |
+| own kernel, flush 128 | 4.2e-4 / 2.0e-3 / 3.1e-3 | 1 | 1.3e-3 |
+
+Every flip in the table is a prompt whose golden probability is within 0.01 of one half. The strict default gives the same bits whether the 512 prompts run
+16 alerts per call, one alert per call or from cached states (checked on the real model: `real_int8` with `SEPAL_INT8_WAYS=all`, spec `strict`).
+On the six prompts of `real_f16` the natural default has max |Δp| 3.9e-3 (no flip). The hidden state of the natural default is ten times as far from the float32
+one (4.8e-3 against 4.7e-4 relative L2) as the float32-accumulate engine's, which the probabilities hardly show (max |Δp| 8.4e-3): the accuracy figure that matters to a
+decision read-out is the one in the middle column, and an application that reads the hidden state itself should know this. **Not verified:** the 2B model has no
+read-out head in its checkpoint and no golden, so only the hidden state could be compared (256 prompts, mean relative L2 against the float32 engine: float32-accumulate
+5.6e-4, natural default 5.7e-3, strict default 1.0e-3, own kernel flush 32 / 128 8.7e-4 / 1.3e-3); the |Δp| and flip figures above are the 0.8B's.
+
+**Speed of the groups** (`sepal-cuda-engine-ab`, same process, best of 2 rounds x 5 calls, tokens/s; the first column is the engine before `Auto`):
+
+| 0.8B | cuBLAS fp32 | all four (default) | gate_up + down | + mixer_in | + mixer_out |
+|---|---|---|---|---|---|
+| 1 row x 64 | 9,314 | 10,391 | 9,763 | 10,262 | 9,864 |
+| 1 row x 600 | 15,556 | 21,192 | 18,408 | 19,547 | 19,653 |
+| 1 row x 2048 | 16,754 | 22,483 | 20,053 | 21,375 | 20,832 |
+| 1 row x 4800 | 16,663 | 21,449 | 19,519 | 20,731 | 20,129 |
+| 16 rows x 640 | 19,365 | 26,949 | 23,219 | 25,438 | 24,322 |
+| 16 alerts per call, alerts/s | 21.8 | 29.8 | 26.2 | 28.2 | 27.3 |
+
+| 2B | cuBLAS fp32 | all four (default) | gate_up + down | + mixer_in | + mixer_out |
+|---|---|---|---|---|---|
+| 1 row x 64 | 4,490 | 5,046 | 4,701 | 4,895 | 4,835 |
+| 1 row x 600 | 7,209 | 10,315 | 9,101 | 9,862 | 9,501 |
+| 1 row x 2048 | 7,710 | 11,202 | 9,848 | 10,720 | 10,217 |
+| 1 row x 4800 | 7,397 | 10,894 | 9,417 | 10,451 | 9,836 |
+| 16 rows x 640 | 8,333 | 12,372 | 10,539 | 11,742 | 11,103 |
+| 16 alerts per call, alerts/s | 9.6 | 14.3 | 12.2 | 13.5 | 12.7 |
+
+Every group pays: against all four, leaving out the output projections costs 1 to 5% (at 64 tokens 1%), the input projections 5 to 9%, both 6 to 15%, so the MLP's two groups are the
+largest part of the gain. In strict
+mode (`--gemm-rows 128`, same tool) the default against the engine before `Auto` (cuBLAS float32 padded to 128 rows) is, 0.8B / 2B: 64 tokens 8,104 against 7,162 /
+3,363 against 3,246; 600 tokens 18,462 against 13,415 / 9,023 against 6,122; 2,048 tokens 20,808 against 14,003 / 9,984 against 6,458; one alert per call 23.7 against 15.6 / 11.3 against 7.2 alerts/s.
+
+**What else changed with the default**
+
+* *The binary16 result is consumed as it is.* A cuBLAS multiply with binary16 accumulators produces binary16; the engine used to widen it into float32 with a pass of its
+  own (write 4 bytes and read 4 again for every element, per multiply). Now the DeltaNet scan (`DeltaNetInputsT<__half>`: the convolution input, `z`, `b` and `a`) and the
+  residual additions (`launch_add_rms_norm_half_m`, `launch_add_half_m`) read the binary16 matrix and widen it in registers; widening is exact, so every bit is what it was
+  (kernel tests: half and float32 inputs give the same bits in the scan, the conv tail and both additions). Attention's input projection still has the pass (one in four
+  layers of the 0.8B). Same session, before and after, tokens/s, 0.8B / 2B: 64 tokens 9,895 -> 10,391 / 4,929 -> 5,046; 600 tokens 20,764 -> 21,192 / 9,899 -> 10,315;
+  2,048 tokens 21,917 -> 22,483 / 10,862 -> 11,202; 16 x 640 24,941 -> 26,949 / 11,544 -> 12,372 (+2 to +8%). A natural-mode multiply that leaves binary16 is no longer cut into
+  chunks of 2,048 rows (the chunking existed for the widening scratch), which changes bits of calls above 2,048 tokens in natural mode only.
+* *Tile shape of the own kernel up to 128 rows* is taken from a measurement of the engine's shapes (`sepal-cuda-gemm-probe shapes --config`: the 8 multiplies of each geometry,
+  11 sizes, 6 tile shapes, shorter of 2 passes) instead of from the block count: the bits do not depend on it (`gemmk_*`), the strict-mode rate at 64 tokens did: 0.8B 8,104 -> 8,181,
+  2B 3,363 -> 3,683 (+1%, +9%). The same data suggest tens of percent on single multiplies at 128 to 512 rows, but two passes of a card shared with a desktop were too noisy there
+  (the same configuration timed 1.1 ms in one run and 7.5 ms in another) to turn into a rule I trust: left as it was. A quiet card and a tuning run of `sepal-cuda-gemm-probe` would pay.
+* *Attention over long snapshot chains*, see "Not changed, but true" in the adversarial review: bisection instead of a scan, 11.7 -> 0.5 ms per layer at 1,000 links.
+
+**Where the host and launch time goes (the "2 ms" of the profile).** The profile's "host + launch" column is wall time minus the four synchronised phases, and every phase
+ends in a stream synchronisation, so it measures those synchronisations. Measured on the unprofiled call instead (a 64-token call of the 0.8B, 6.5 ms): building the row tables and
+uploading them takes 0.01 ms; the launches (a few hundred) cost 2.4 to 3 ms of CPU time spread over the call (multiplies 1.6 to 2.1 ms, elementwise 0.5, DeltaNet 0.2, attention 0.1), always ahead of the card, and
+the wait for the card after the last launch is 0.01 ms: the CPU is not what limits a call. What is left is the gap between kernels on the stream. A CUDA graph of the whole call, replayed (a throw-away
+experiment: capture one call, replay it five times, time the replay), runs the call in 5.89 ms against 6.46 ms (-9%) at 64 tokens, 7.9 against 8.6 at 128 (-8%), 16.65 against 17.96 at 300 (-7%), 28.2
+against 29.7 at 600 (-5%). That is the most any launch work (graphs, fewer launches) could give, and graphs do not apply to calls whose token count, row tables and grid sizes
+change from call to call; not done. A layer is 9 to 11 launches; fusing the DeltaNet's conv-tail launch into the scan is not possible while a row can be continued in place
+(the tail kernel must run after every block has read the old tail). Removing the widening passes (above) took about 66 launches out of a call (3 per DeltaNet layer, 2 per attention layer).
+
+**Elementwise kernels (audit, nothing to change).** At 2,048 tokens of the 0.8B one layer moves: two add + RMSNorm launches (reads x 8 MB, m 4 MB; writes the residual 8 MB and the norm 4 MB = 24 MB each) and SwiGLU
+(reads gate and up, 2 x 14.7 MB, writes 14.7 MB) = 92 MB, 2.2 GB for 24 layers, 6.5 ms at 340 GB/s; the profile shows 7.3 ms for all elementwise work (embedding, gathers, readout included),
+so the kernels are at about 90% of the bandwidth bound with 16-byte loads and a single pass; the only fusion left is SwiGLU into the multiply's epilogue, which cuBLAS does not offer and the own kernel
+would pay for in the tile it keeps in registers (it would also have to keep the rounding of gate and up to binary16 that the engine does today).
+
+**DeltaNet (looked at, not changed).** A third of a 2,048-token call (31.5 of 97 ms in the profile). At one row the grid is 16 blocks (one per value head) on 28 SMs; two blocks per head
+(each owning half the value columns, which is exact because columns never meet) would repeat the convolution and normalisation of q and k in both, and those input warps, not the recurrence, set the block's
+time ("DeltaNet kernels" above), so 32 blocks would run in two waves on 28 SMs at about the same time per block. At 16 x 640 the card is full. A chunked tensor-core form of the recurrence is the real
+option and is a project of its own.
 
 ## Snapshot density and tiers
 

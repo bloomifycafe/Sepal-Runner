@@ -424,6 +424,16 @@ POST /v1/systemone
 | K/V | fp16 | fp16; int8 opt-in | fp16 |
 | Head | fp32 | fp32 | fp32 |
 
+**Accumulation on `gpu-f16`.** Operands are fp16 everywhere in that column; what the tensor cores add the products into is a
+separate choice, and the GPU engine's default makes it fp16 for the four groups of matrix multiplies (MLP gate/up, MLP down,
+the input projections, the output projections), which runs the multiplies at twice the fp32-accumulate rate on a GeForce card.
+In natural batching that is cuBLAS `CUBLAS_COMPUTE_16F`; in strict batching (the mode whose cache hit equals its miss bit for
+bit) it is the engine's own kernel, which adds fp16 partial sums into fp32 every 64 values of the inner dimension and is
+batch-invariant by construction. Measured against the fp32 transformers golden on the 512-prompt alert workload
+(`runner/cuda/README.md`, "The default multiply configuration"): natural max |dp| 8.4e-3 (p99 6.6e-3, 2 flips of 512, both within 0.01
+of p = 0.5), strict max |dp| 2.0e-3 (p99 1.5e-3, 1 flip), against 1.9e-3 and 0 flips with fp32 accumulation; both inside the
+`gpu-f16` row of the gate table in section 14. The fp32 accumulation stays selectable (`multiply_path = Cublas`, no `fp16_accumulate`).
+
 **Weight size per profile.** Computed by this project's code: `trunk_weight_bytes` in `runner/src/plan/planner.cpp`,
 from the geometry of section 3 and the table above, printed by `sepal-info`. Body weights only, in GB of 10^9 bytes;
 the embedding table is separate and stays in host memory on the GPU profiles. Per-channel quantisation scales are
