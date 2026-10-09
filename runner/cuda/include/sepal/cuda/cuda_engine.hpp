@@ -90,6 +90,26 @@ struct Fp16Accumulate {
     unsigned flush_k = 128; // own kernel only: a multiple of 32
 };
 
+/// Which multiplies of the float16 path run on int8 weights (README.md, "int8 multiplies"). The weights of a selected group
+/// are quantised when the engine is created, per output channel and symmetrically (scale = max |w| / 127), straight from the
+/// checkpoint's values; the binary16 copy is not kept, so those weights take half the memory. The engine's own kernels do the
+/// multiply (a row's bits depend on that row only, whatever `multiply_path` says, and strict mode pads nothing for them):
+///   int8_activations = true  (W8A8): the activations that feed the multiply are quantised per row (per token, scale =
+///       max |x| / 127, round to nearest even), the products are summed exactly in int32 on the int8 tensor cores and
+///       scaled back to float32 (well above the binary16-accumulate rate of the card, half the memory traffic);
+///   int8_activations = false (W8A16): activations stay binary16, weights are widened to binary16 in registers, float32
+///       accumulators (the binary16 multiply's speed, half its weight traffic).
+/// A selected group overrides `fp16_accumulate` for that group. The DeltaNet's in_proj_b and in_proj_a rows (tiny, and they
+/// set the decay and the write strength) stay binary16 in every case. Needs the float16 path and K multiples of 16.
+struct Int8Multiply {
+    bool gate_up = false;   // the MLP's gate and up projections
+    bool down = false;      // the MLP's down projection
+    bool mixer_in = false;  // the DeltaNet and attention input projections (not in_proj_b / in_proj_a)
+    bool mixer_out = false; // the DeltaNet and attention output projections
+    bool int8_activations = true;
+    bool any() const { return gate_up || down || mixer_in || mixer_out; }
+};
+
 /// Who computes the matrix multiplies of the float16 path.
 enum class MultiplyPath {
     /// cuBLAS. A row's bits depend on how many rows share its multiply (cuBLAS picks its kernel from the shape), which is
@@ -117,6 +137,8 @@ struct EngineOptions {
     MultiplyPath multiply_path = MultiplyPath::Cublas;
     /// Float16 path only: multiplies that accumulate in binary16. Default: none.
     Fp16Accumulate fp16_accumulate;
+    /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
+    Int8Multiply int8_multiply;
     /// Compute the last layer's queries, attention, output projection and MLP only for the tokens that are read out
     /// (its keys and values are still computed for every token). The last layer is always a full-attention layer.
     bool prune_last_layer = true;

@@ -124,6 +124,11 @@ target_include_directories(sepal-cuda-gemm-probe PRIVATE src)
 target_include_directories(sepal-cuda-gemm-probe SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal-cuda-gemm-probe PRIVATE sepal_cublas sepal_cublaslt sepal_cuda sepal_cuda_flags)
 
+add_executable(sepal-cuda-int8-probe tools/int8_probe.cpp src/gemm_kernels.cu src/gemm_s8_kernels.cu)
+target_include_directories(sepal-cuda-int8-probe PRIVATE src)
+target_include_directories(sepal-cuda-int8-probe SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-cuda-int8-probe PRIVATE sepal_cublas sepal_cublaslt sepal_cuda sepal_cuda_flags)
+
 add_executable(sepal_cuda_tests tests/test_cuda_gemm.cpp)
 target_link_libraries(sepal_cuda_tests PRIVATE sepal_cuda sepal_cuda_flags)
 
@@ -202,7 +207,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/engine_kernels.cu src/gemm_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
@@ -224,6 +229,16 @@ foreach(suite gemmk_convert gemmk_accuracy gemmk_invariance gemmk_edge)
   set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
 
+# ---- the int8 multiply kernels ----
+add_executable(sepal_cuda_kernel_s8_tests tests/test_gemm_s8_kernels.cpp src/gemm_s8_kernels.cu ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_s8_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_kernel_s8_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_kernel_s8_tests PRIVATE sepal_core sepal_cuda_flags)
+foreach(suite s8_quantize s8_gemm s8_invariance s8_edge)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_s8_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
+endforeach()
+
 # ---- engine tests ----
 # The real-model suite is skipped, with a message, unless SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN are set.
 add_executable(sepal_cuda_engine_tests
@@ -239,18 +254,19 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_real_alerts.cpp
   tests/test_cuda_engine_snapshots.cpp
   tests/test_cuda_engine_real_snapshots.cpp
+  tests/test_cuda_engine_real_int8.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests src)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz snap_default snap_default_big real_half_state real_tiers soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply engine_int8 attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz snap_default snap_default_big real_half_state real_tiers soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
 # A real-model suite prints "SKIPPED: real-model ..." and exits 0 when its environment variables are not set; CTest
 # must show that as Skipped, not Passed (the parent project's `real` test does the same).
-foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
   set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 endforeach()

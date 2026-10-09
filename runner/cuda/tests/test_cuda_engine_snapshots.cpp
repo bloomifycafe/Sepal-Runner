@@ -450,6 +450,53 @@ SEPAL_TEST(snap_tiers, refusals) {
     fs::remove(file);
 }
 
+// The int8 multiplies change the weights and the numbers: their snapshots are a different kind (weight and compute fingerprints),
+// and with them the host and file tiers and binary16 state still round-trip bit for bit.
+SEPAL_TEST(snap_tiers, int8_multiply_engines_round_trip_and_do_not_mix_with_the_others) {
+    ModelConfig cfg = tiny_test_config();
+    cfg.name = "tiny-int8";
+    cfg.dn_key_head_dim = 8;
+    cfg.dn_value_head_dim = 8;
+    cfg.hidden_size = 32;
+    cfg.intermediate_size = 48;
+    const Weights<float> weights = random_weights<float>(cfg, 5);
+    const auto make = [&](bool int8, bool half_state, std::size_t slots = 32) {
+        Knobs k;
+        k.precision = Precision::F16;
+        k.gemm_rows = 8;
+        k.slots = slots;
+        k.budget_mib = 96;
+        k.max_tokens = 1024;
+        EngineOptions o = options_of(k);
+        o.half_state = half_state;
+        o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
+        if (int8) o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+        return std::make_unique<CudaEngine>(cfg, weights, o);
+    };
+    const fs::path file = scratch_dir() / "int8.snap";
+    const auto q = make(true, true);
+    const DeviceSnapshot original = make_chain(*q, 3, 12);
+    const auto want = probe(*q, original, 4);
+    q->save(original, file);
+    CHECK(same_hidden(want, probe(*q, q->load(file), 4)));
+    CHECK(same_hidden(want, probe(*q, q->to_device(q->to_host(original, HostMemory::Pinned)), 4)));
+    const auto plain = make(false, true);
+    CHECK_THROWS(plain->load(file), SnapshotFileError);                  // other weights and compute options
+    const auto q_other = make(true, false);
+    CHECK_THROWS(q_other->load(file), SnapshotFileError);                // other state storage
+    CHECK(make(true, true)->load(file).valid());                         // a second int8 engine accepts it
+    // The default pools account for the int8 weights (smaller) and activation buffers (larger): 64 snapshots fit.
+    EngineOptions o;
+    o.precision = Precision::F16;
+    o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
+    o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+    o.max_call_tokens = 1024;
+    CudaEngine defaults(cfg, weights, o);
+    CHECK_EQ(defaults.memory().slots_total, std::size_t{64});
+    CHECK(defaults.memory().weights_bytes < make(false, false)->memory().weights_bytes);
+    fs::remove(file);
+}
+
 // ---- snap_fuzz ----
 
 namespace {

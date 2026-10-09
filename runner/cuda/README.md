@@ -255,10 +255,14 @@ candidate, unmeasured) or less work per alert (last-layer pruning, the prefix ca
 | `src/gemm_kernels.hpp`, `src/gemm_kernels.cu` | The batch-invariant tensor-core multiply (binary16 or float32 accumulators) and the 2-D widening used by binary16-accumulating cuBLAS multiplies |
 | `tests/test_cuda_gemm.cpp` | Suites `contract`, `parity_small`, `parity_real`, `rows` |
 | `tests/test_gemm_kernels.cpp` | Suites `gemmk_convert`, `gemmk_accuracy`, `gemmk_invariance`, `gemmk_edge` (CTest `cuda_gemmk_*`) |
-| `tests/test_cuda_engine_multiply.cpp` | Suite `engine_multiply`: the multiply options on a tiny geometry |
+| `src/gemm_s8_kernels.hpp`, `src/gemm_s8_kernels.cu`, `src/gemm_ptx.cuh` | The int8 multiplies (int8 activations on `mma.m16n8k32`; binary16 activations with int8 weights), the row and weight quantisers, and the PTX helpers they share with `gemm_kernels.cu` |
+| `tests/test_gemm_s8_kernels.cpp` | Suites `s8_quantize`, `s8_gemm`, `s8_invariance`, `s8_edge` (CTest `cuda_s8_*`) |
+| `tests/test_cuda_engine_multiply.cpp` | Suites `engine_multiply` (the multiply options on a tiny geometry) and `engine_int8` (the int8 options) |
+| `tests/test_cuda_engine_real_int8.cpp` | Suites `real_int8` and `real_int8_2b`: accuracy of every int8 variant on the real checkpoints |
 | `tools/sepal_cuda_bench.cpp` | `sepal-cuda-bench` |
 | `tools/gemm_probe.cpp` | `sepal-cuda-gemm-probe`: cuBLAS, cuBLASLt (every candidate algorithm) and the own kernel at the engine's shapes, with their error |
 | `tools/engine_ab.cpp` | `sepal-cuda-engine-ab`: engine option sets compared inside one process |
+| `tools/int8_probe.cpp` | `sepal-cuda-int8-probe`: int8 against binary16 multiplies (cuBLAS, cuBLASLt, the own kernels) at the engine's shapes |
 
 ## Attention kernels
 
@@ -651,7 +655,7 @@ others are the variants discussed below (`sepal-cuda-gemm-probe shapes --model 0
 - *Compute types.* binary16 output instead of float32 saves 0 to 10% of the multiply and costs the traffic of widening it again; the
   engine already does it where the consumer takes binary16 (the MLP's gate and up). `FAST_16F` is the same speed as `COMPUTE_32F` (the operands are
   already binary16). TF32 and float32 are 2 and 3.5 times slower. `CUBLAS_COMPUTE_16F` is 1.8 times faster and is the one lever
-  that moves the multiplies, at an accuracy cost (below). int8 was out of scope.
+  that moves the multiplies, at an accuracy cost (below). int8 is measured in "int8 multiplies" at the end of this file.
 - *Strided batched over row blocks* (`cublasGemmStridedBatchedEx`, 64 rows per batch entry): slower than one call (above).
 - *Pedantic mode* changes no result (`CudaGemmOptions::pedantic`, README above).
 
@@ -989,3 +993,264 @@ from timings the document itself calls historical; `VRAM_ELASTIC` is about resiz
 state. Our format shares their order of checks and the fail-closed stance; it differs in verifying the identity from the engine's own
 geometry and a hash of the device weights (theirs hashes the first and last MiB of the model files), and in refusing a file whose size does not
 equal what the header derives, which bounds every allocation.
+
+## int8 multiplies: what the card does, what they cost in accuracy, and whether to have them
+
+Everything in this section was measured on the RTX 3060 12 GB of the sections above (driver 591.86, CUDA 13.1, cuBLAS 13.2.1), on jeff-base (the
+Qwen3.5-0.8B fine-tune) and Qwen3.5-2B-Base, float16 path. Code: `src/gemm_s8_kernels.{hpp,cu}`, `EngineOptions::int8_multiply`; off by default.
+
+### Conclusion
+
+* **The int8 tensor cores are there.** `mma.sync` int8 (`m16n8k32`) in our own kernel runs at 64 to 72 TOP/s at 4,096 tokens (49 to 70 at 1,024), 1.5 to 1.8 times
+  cuBLAS's binary16-accumulate rate (39 to 45) and 2.6 to 3.1 times its float32-accumulate rate (21 to 25), which is what the engine runs today; cuBLAS's own int8
+  reaches 83 to 92 TOP/s on big shapes (the card's peak is 111). At the engine's shapes our kernel is 1.4 to 3.0 times today's multiply from 256 tokens up and 1.4 to 2.1 times at 64
+  tokens. In the engine, with all four multiply groups on int8 (W8A8): **1.62x (0.8B) and 1.94x (2B) the default engine at 2,048 tokens** (27.2k and 15.3k tokens/s),
+  1.29x and 1.38x the cuBLAS binary16-accumulate engine, and **2.2x llama.cpp's 6.9k on the 2B**.
+* **But per-row int8 activations do not meet the design's accuracy gate on this model.** The gate (`q8` row of docs/RUNNER.md: largest |dp| <= 0.05 and at most 1% answer flips
+  against the float32 golden) is failed by every W8A8 variant, every single group alone included: 8 to 10 flips of 512 (1.6 to 2.0%) for gate/up, down or the input projections alone,
+  26 for the output projections alone, 44 (8.6%, largest |dp| 0.15) for all four. Emulating finer activation scales (below) shows that activation outliers, not the weights, cause it;
+  the fix would be another scheme (scales per group along k, smoothing), not a tuning of this one.
+* **int8 weights with binary16 activations (W8A16, the design's `gpu-q8w`) meet the gate** (all four groups: 4 flips of 512 = 0.78%, three of them within 0.012 of p = 0.5, largest |dp| 0.039;
+  without the output projections 5 flips, 0.034), **cut the weight memory by a third** (0.8B 1,436 -> 964 MiB, 2B 3,590 -> 2,284 MiB; the embedding stays binary16) and are **not faster**: -4% (0.8B)
+  and -5% (2B) at 2,048 tokens against the default engine, -8% and -18% at 64 tokens. Worth having for memory, not for speed.
+* **Small calls** do not gain what halved weight traffic suggests: W8A8 is +22% at 64 tokens on both models (0.8B 9.3k -> 11.4k tokens/s), because those multiplies are latency-bound at that size, not
+  bandwidth-bound (our kernel reaches 200 GB/s of int8 weights on the 7,168 x 1,024 gate/up at 64 tokens, cuBLAS int8 216).
+* **Recommendation.** Keep `Int8Multiply`, off by default. Use W8A16 where weight memory decides (a model that would not otherwise fit). Do not use W8A8 as it is for the alert read-out: it buys
+  1.29 to 1.38x over cuBLAS binary16 accumulation and 1.6 to 1.9x over the default, at a largest |dp| of 0.15 and 44 flips of 512 against 2.0e-3 and 1 for the own kernel with binary16 accumulation
+  (flush 64). The owner's 2x llama.cpp on the 2B (13.8k tokens/s at 2,048 tokens) is reached by W8A8 only (15.3k); with an option that passes the gate the 2B is at 1.45x (own kernel, binary16 accumulation,
+  flush 64, 10.0k) to 1.6x (cuBLAS binary16 accumulation, 11.1k).
+
+### What HyperQwen and Strata do (read from `ref/`, nothing built or run; HyperQwen `3acb93f`, Apache-2.0; Strata `fb58e0d`, MIT)
+
+No code was taken from either repository, so `NOTICE` is unchanged. This is what their documents, patches and sources say.
+
+| | HyperQwen (vLLM patches for a 27B hybrid; RTX 3090 at 250 W) | Strata (GGUF-format prefill engine; RTX 5070) |
+|---|---|---|
+| int8 GEMM source | **none in the repo**: stock vLLM's W4A8-INT8 Marlin kernel (`VLLM_MARLIN_INPUT_DTYPE=int8`); the patches fix a sign bug in its group scales, select layers by regex (`VLLM_MARLIN_INT8_INCLUDE_RE`), relax asserts, and optionally route through an external tuned Marlin build that is not in the repo | dense layers: **no quantised GEMM**; `dequant_f16` of the whole weight into a scratch buffer, then cuBLAS `GemmEx` (fp16, fp32 accumulate) in `src/prefill/gemm.cu`. The one int8 tensor-core kernel (`mma.m16n8k32.s32.s8.s8.s32`, `src/prefill/moe_fused.cu`) is for the 2-bit routed MoE experts |
+| weights | int4 g128 symmetric (AutoRound, offline), fp16 scales; `in_proj_a / b`, MTP head, vision tower stay bf16; lm_head and embeddings int8 or int4 g128 | GGUF block formats (Q2_0 ... Q8_0, K-quants), fp16 scale per block; nothing per output channel |
+| activations | dynamic, per token (row), absmax/127 (`marlin_quant_input`, in vLLM; where it is fused is not in the repo). Batch default: MLP only; single-user default: MLP + attention + DeltaNet projections | MoE path: quantised once per token, absmax/127, one float32 scale per 32 values, fused SwiGLU epilogue that re-quantises the intermediate |
+| what they measured | prefill at 1k tokens 1,437 -> 1,638 tok/s with int8 MLP (+14%), 1,845 with all linears (+28%); +19% at 51k; batch-64 decode +24% (MLP) to +45% (all). Perplexity over 33k tokens: gate/up +0.9%, whole MLP +2.2%, all linears +3.7%; GSM8K 95.5 -> 95.0 (MLP). Per-GEMM error with int8 activations 0.9 to 1.05% against 0.26% for W4A16 on random weights. Sensitivity: one docstring line (GDN `in_proj` in early layers and `down_proj` in the last layers are worst); no per-layer numbers in the repo | prompt rate +16 to 22% from the fused int8 Q2_0 MoE path (4K: 1,294 -> 1,570 tok/s); output KL 0.009 against 0.012 for the older kernels; no dense-GEMM TFLOP/s |
+| int8-QK attention | `prefill-attn-int8.patch`, Triton, SageAttention-style (K mean-smoothing, int8 K per 64-key tile, int8 Q per row, int32 `tl.dot`, bf16 P.V), head dim 256, 16 full-attention layers; 1.27 to 1.35x over FA2 at 4k to 51k context, +2.7% / +5.3% end to end at 16k / 51k | -- |
+
+What we now do that they do: per-row dynamic int8 activations with float32 scales; int8 tensor-core multiplies with exact int32 sums; int8 selectable per group of multiplies (their regex, our
+`Int8Multiply` flags); the DeltaNet's `in_proj_a / b` kept at 16 bits (HyperQwen does too). What we do differently: weights are int8 per output channel (they are int4 per 128 along k), quantised when the engine is created
+from the checkpoint's values (they load a pre-quantised checkpoint), and the kernel is batch-invariant by construction. What we do not do: int4 weights, int8 attention or K/V, fusing the activation quantiser into the producing
+kernel, a tuned tile table, an fp16 recurrent state, smoothing. Their ranking of sensitivity is not what we see here: with per-row activations the output projections are the worst group by flips (26 of 512 alone), then down (10), and
+gate/up and the input projections the best (8 and 9), and nothing is cheap: HyperQwen's +1.5% perplexity step from the MLP to all linears is, here, the step from 14 to 44 flips.
+
+### The implementation
+
+* `launch_gemm_s8`: the structure of `gemm_kernels.cu` (cp.async pipeline, XOR-swizzled shared memory, ldmatrix) with a 64-byte k tile (two `m16n8k32` steps; a 64-byte row of int8 is what a 32-half row was, so the swizzle and the ldmatrix addressing are
+  the binary16 kernel's), int32 accumulators and `(float(sum) * sx[row]) * sw[col]` in the epilogue; six tile shapes. The integer sum is exact, so a row's bits depend on its own int8 row, the weights and K only.
+* `launch_gemm_w8a16`: the binary16 kernel with the weights as int8 in shared memory. They are stored in an order (`S8WeightLayout::Fp16Pairs`: positions 4q ... 4q+3 of every 16 hold k = 2q, 2q+1, 2q+8, 2q+9) that lets one `ldmatrix` give a thread
+  exactly the four bytes of its two B registers, which are widened to binary16 exactly (`prmt` with the exponent of 1024, subtract 1152) and multiplied with float32 accumulators; the channel scale is applied at the end.
+* `launch_quantize_rows_s8`: scale = max |x| / 127, `round-half-even(x * (127 / max))` clamped to +-127, a zero row gets scale 0. 0.04 ms for 2,048 x 2,048 (4% of its multiply), 0.16 ms for 4,096 x 3,584, the down projection's input, which is
+  36% of that multiply (0.44 ms): it is a separate pass, not fused with SwiGLU or the norm, and fusing it would recover most of that.
+* `launch_quantize_weights_s8`: the same rule per output channel. The engine does it at creation: a stacked matrix (gate|up, q|k|v, ...) is uploaded as binary16 into a scratch buffer and quantised on the device; the binary16 copy of a selected group is not kept.
+* `EngineOptions::int8_multiply = {gate_up, down, mixer_in, mixer_out, int8_activations}`. A selected group overrides `fp16_accumulate` for that group. The DeltaNet's `in_proj_b / in_proj_a` rows are stored and multiplied in binary16 (own kernel,
+  float32 accumulation) whatever is selected. The float32 path, a K that is not a multiple of 16 and widths the kernels do not take are refused at creation. Strict mode pads nothing for int8 groups; with every group on int8 (or the own kernel for
+  the rest) natural mode is batch-invariant as well. Tools: `sepal-cuda-engine-bench --int8 w8a8:all|w8a16:noout|...`, `sepal-cuda-engine-ab --options w8a8-all,w8a16-mlp,...` (groups: `gate_up`, `down`, `mixer_in`, `mixer_out`, `mlp`, `noout`, `all`).
+
+### 1. What the card does (`sepal-cuda-int8-probe`, minimum of three batches, 32 MB workspace, errors against float64 in the tool's output)
+
+Large shapes (the own binary16-accumulate figure of this run is low: the card was shared with other jobs; the shape tables below have it):
+
+| T x N x K | cuBLAS f32 acc | cuBLAS f16 acc | own W8A8 | own W8A16 | cuBLAS int8 (int32 out) | cuBLASLt int8, best of its 3 candidates |
+|---|---|---|---|---|---|---|
+| 8192 x 8192 x 4096 | 25.4 | 42.1 | 64.7 | 25.3 | 82.8 | 85.6 |
+| 4096 x 4096 x 4096 | 25.0 | 39.9 | 66.8 | 25.0 | 88.6 | 85.2 |
+| 8192 x 4096 x 8192 | 25.6 | 38.4 | 56.1 | 24.8 | 92.2 | 91.9 |
+| 2048 x 8192 x 2048 | 23.9 | 40.6 | 66.8 | 24.7 | 77.9 | 78.1 |
+
+The int8 tensor rate is twice the binary16-accumulate one (2 x 55.7 = 111 TOP/s: 28 SMs at 1.94 GHz): cuBLAS reaches 75 to 83% of it, our kernel 51 to 65% (the binary16 kernel's ablation found the same load-bound limit; no tuning of the int8 kernel beyond the
+tile shapes was done). cuBLASLt's heuristic offers nothing above `GemmEx`'s choice (its first candidate). cuBLAS int8 writes int32: the float32 dequantisation is another pass, not in its figure. At 64 tokens it is 1% to 2.1 times above our kernel (the 2B's deep
+down projection, K = 6,144: 34.5 against 16.5); at 4,096 tokens on the deep shapes (K 3,584 to 6,144) 16 to 34% above (76 to 89 against 65 to 68). W8A16 is at the float32-accumulate rate (25 TFLOP/s): the arithmetic is the binary16 multiply's, with the conversion in front.
+The quantisation error of one multiply (Gaussian operands, K 1,024 to 6,144): 1.1 to 1.3e-2 relative rms for W8A8, 0.8 to 0.9e-2 for W8A16 (weights alone), against 1.7e-6 for today's multiply.
+
+Engine shapes, TFLOP/s (TOP/s for int8), the 2B probe run shared with other jobs (a few cuBLAS cells are low, e.g. deltanet_in 1,024 tokens):
+
+*Qwen3.5-0.8B shapes, TFLOP/s (TOP/s for int8):*
+
+| shape (N x K) | tokens | cuBLAS, f32 acc (today) | cuBLAS, f16 acc | own, f16 acc, flush 128 | own W8A8 | own W8A8 + row quantisation | own W8A16 | cuBLAS int8, int32 out |
+|---|---|---|---|---|---|---|---|---|
+| mlp_gate_up (7168 x 1024) | 64 | 12.9 | 17.3 | 12.6 | 26.0 | 24.1 | 15.6 | 27.6 |
+| mlp_gate_up (7168 x 1024) | 256 | 22.1 | 33.7 | 33.4 | 53.3 | 49.4 | 21.6 | 59.2 |
+| mlp_gate_up (7168 x 1024) | 1024 | 21.9 | 43.4 | 34.8 | 62.7 | 60.1 | 24.0 | 64.8 |
+| mlp_gate_up (7168 x 1024) | 4096 | 23.2 | 45.4 | 35.0 | 66.2 | 64.1 | 23.3 | 64.7 |
+| mlp_down (1024 x 3584) | 64 | 11.9 | 15.9 | 9.2 | 17.9 | 14.9 | 8.6 | 22.1 |
+| mlp_down (1024 x 3584) | 256 | 19.5 | 31.1 | 15.7 | 27.2 | 23.5 | 13.8 | 41.2 |
+| mlp_down (1024 x 3584) | 1024 | 23.8 | 40.0 | 27.1 | 52.0 | 41.0 | 17.7 | 61.1 |
+| mlp_down (1024 x 3584) | 4096 | 24.0 | 43.2 | 36.4 | 67.9 | 50.5 | 22.7 | 83.7 |
+| deltanet_in (8224 x 1024) | 64 | 10.3 | 13.4 | 10.9 | 21.4 | 20.1 | 12.8 | 27.8 |
+| deltanet_in (8224 x 1024) | 256 | 18.0 | 32.4 | 30.2 | 51.5 | 48.3 | 21.0 | 50.0 |
+| deltanet_in (8224 x 1024) | 1024 | 22.8 | 28.6 | 35.0 | 62.7 | 60.4 | 22.7 | 61.0 |
+| deltanet_in (8224 x 1024) | 4096 | 24.4 | 34.9 | 34.6 | 65.2 | 63.4 | 22.4 | 63.8 |
+| deltanet_out (1024 x 2048) | 64 | 11.5 | 14.4 | 8.8 | 16.0 | 12.9 | 7.4 | 16.1 |
+| deltanet_out (1024 x 2048) | 256 | 17.7 | 28.1 | 15.3 | 25.1 | 21.5 | 13.3 | 38.4 |
+| deltanet_out (1024 x 2048) | 1024 | 22.5 | 38.4 | 26.4 | 49.2 | 39.3 | 17.4 | 58.0 |
+| deltanet_out (1024 x 2048) | 4096 | 21.6 | 41.5 | 32.5 | 65.2 | 47.6 | 19.2 | 75.7 |
+| attn_in (5120 x 1024) | 64 | 13.3 | 16.8 | 12.3 | 22.0 | 20.1 | 14.4 | 26.1 |
+| attn_in (5120 x 1024) | 256 | 23.2 | 31.8 | 29.4 | 44.3 | 40.7 | 20.8 | 42.9 |
+| attn_in (5120 x 1024) | 1024 | 22.4 | 42.7 | 34.4 | 60.5 | 57.1 | 22.7 | 61.5 |
+| attn_in (5120 x 1024) | 4096 | 21.8 | 45.0 | 34.8 | 65.4 | 61.8 | 22.5 | 64.5 |
+| attn_out (1024 x 2048) | 64 | 11.6 | 14.6 | 8.8 | 16.1 | 12.8 | 8.2 | 19.7 |
+| attn_out (1024 x 2048) | 256 | 17.7 | 27.9 | 15.3 | 25.5 | 21.8 | 13.3 | 38.1 |
+| attn_out (1024 x 2048) | 1024 | 22.0 | 38.2 | 26.4 | 49.0 | 39.3 | 17.4 | 57.5 |
+| attn_out (1024 x 2048) | 4096 | 21.5 | 41.6 | 35.9 | 64.1 | 50.8 | 20.8 | 74.9 |
+
+*Qwen3.5-2B shapes, TFLOP/s (TOP/s for int8):*
+
+| shape (N x K) | tokens | cuBLAS, f32 acc (today) | cuBLAS, f16 acc | own, f16 acc, flush 128 | own W8A8 | own W8A8 + row quantisation | own W8A16 | cuBLAS int8, int32 out |
+|---|---|---|---|---|---|---|---|---|
+| mlp_gate_up (12288 x 2048) | 64 | 17.8 | 17.9 | 12.8 | 24.7 | 23.9 | 11.4 | 34.3 |
+| mlp_gate_up (12288 x 2048) | 256 | 18.1 | 39.5 | 34.3 | 62.2 | 59.8 | 22.5 | 66.5 |
+| mlp_gate_up (12288 x 2048) | 1024 | 21.9 | 36.8 | 37.1 | 70.4 | 68.5 | 24.0 | 76.8 |
+| mlp_gate_up (12288 x 2048) | 4096 | 23.9 | 40.5 | 33.6 | 72.0 | 69.9 | 25.1 | 75.5 |
+| mlp_down (2048 x 6144) | 64 | 12.4 | 17.7 | 8.0 | 16.5 | 15.4 | 12.8 | 34.5 |
+| mlp_down (2048 x 6144) | 256 | 22.0 | 34.3 | 20.1 | 39.7 | 36.0 | 18.0 | 54.8 |
+| mlp_down (2048 x 6144) | 1024 | 23.3 | 43.3 | 34.5 | 66.2 | 49.2 | 19.3 | 64.2 |
+| mlp_down (2048 x 6144) | 4096 | 19.0 | 38.9 | 33.8 | 65.9 | 52.0 | 23.1 | 88.6 |
+| deltanet_in (8224 x 2048) | 64 | 11.9 | 14.1 | 11.0 | 21.4 | 20.5 | 10.1 | 28.8 |
+| deltanet_in (8224 x 2048) | 256 | 11.4 | 23.2 | 18.9 | 35.4 | 32.7 | 11.1 | 35.6 |
+| deltanet_in (8224 x 2048) | 1024 | 11.7 | 26.7 | 27.2 | 50.3 | 48.5 | 16.1 | 55.9 |
+| deltanet_in (8224 x 2048) | 4096 | 19.3 | 40.5 | 35.6 | 67.4 | 64.9 | 23.3 | 78.3 |
+| deltanet_out (2048 x 2048) | 64 | 10.8 | 16.7 | 7.7 | 14.5 | 13.2 | 12.5 | 27.8 |
+| deltanet_out (2048 x 2048) | 256 | 16.9 | 30.9 | 19.4 | 35.6 | 31.6 | 17.4 | 47.7 |
+| deltanet_out (2048 x 2048) | 1024 | 20.4 | 39.7 | 33.1 | 60.8 | 53.2 | 21.1 | 63.6 |
+| deltanet_out (2048 x 2048) | 4096 | 22.6 | 43.1 | 37.3 | 68.9 | 59.8 | 23.9 | 75.5 |
+| attn_in (5120 x 2048) | 64 | 16.1 | 18.6 | 12.7 | 22.9 | 21.4 | 12.4 | 31.9 |
+| attn_in (5120 x 2048) | 256 | 24.8 | 37.2 | 31.7 | 56.1 | 51.2 | 15.7 | 42.7 |
+| attn_in (5120 x 2048) | 1024 | 15.6 | 29.2 | 32.6 | 59.3 | 55.7 | 19.9 | 68.0 |
+| attn_in (5120 x 2048) | 4096 | 20.4 | 39.5 | 38.1 | 71.2 | 66.8 | 24.4 | 80.1 |
+| attn_out (2048 x 2048) | 64 | 10.8 | 16.7 | 7.7 | 14.6 | 13.2 | 12.4 | 27.8 |
+| attn_out (2048 x 2048) | 256 | 17.0 | 30.8 | 19.4 | 35.5 | 31.5 | 17.4 | 47.6 |
+| attn_out (2048 x 2048) | 1024 | 20.4 | 39.7 | 33.1 | 61.3 | 53.4 | 21.8 | 63.6 |
+| attn_out (2048 x 2048) | 4096 | 23.2 | 43.1 | 37.3 | 68.6 | 60.0 | 24.1 | 75.9 |
+
+
+### 2. Accuracy on the real model (`sepal_cuda_engine_tests real_int8`, `real_int8_2b`)
+
+Reference: transformers float32 hidden states (the `real_f16` goldens for the six prompts, `runs/alert-golden` for the 512 prompts of the 64-alert workload). "dp" is the probability of the first option for the 512 prompts and the
+largest over all options for the six; "flips" are answer flips (argmax); "near 0.5" counts the flips whose golden probability is within 0.01 of one half. Gate: largest |dp| <= 0.05 and flips <= 1% (5 of 512). 16 alerts per call; the
+six-prompt rows are the prompts of `real_f16`. `base` is the default engine (cuBLAS, float32 accumulation), `acc16` the own kernel with binary16 accumulation flushed every 64, for scale. All other rows have the cuBLAS path for the multiplies not on int8.
+
+The 512 prompts:
+
+| variant | dp median | dp p99 | dp max | rel L2 of hidden, median | flips | near 0.5 | gate |
+|---|---|---|---|---|---|---|---|
+| base | 2.0e-4 | 1.0e-3 | 1.9e-3 | 4.7e-4 | 0 | 0 | pass |
+| acc16 (flush 64, all four) | 3.3e-4 | 1.5e-3 | 2.0e-3 | 9.4e-4 | 1 | 1 | pass |
+| **W8A16, all four** | 6.4e-3 | 2.8e-2 | 3.9e-2 | 2.6e-2 | 4 | 3 | **pass** |
+| **W8A16, all but the output projections** | 7.1e-3 | 2.3e-2 | 3.4e-2 | 2.2e-2 | 5 | 3 | **pass** |
+| W8A8, gate/up only | 9.6e-3 | 5.4e-2 | 7.3e-2 | 3.3e-2 | 8 | 5 | fail |
+| W8A8, down only | 1.5e-2 | 5.5e-2 | 6.2e-2 | 7.7e-2 | 10 | 4 | fail |
+| W8A8, input projections only | 7.3e-3 | 4.5e-2 | 6.4e-2 | 2.7e-2 | 9 | 7 | fail |
+| W8A8, output projections only | 1.9e-2 | 9.1e-2 | 1.1e-1 | 5.4e-2 | 26 | 7 | fail |
+| W8A8, gate/up + input projections | 1.1e-2 | 5.1e-2 | 1.0e-1 | 4.3e-2 | 13 | 5 | fail |
+| W8A8, MLP (gate/up + down) | 1.7e-2 | 7.4e-2 | 1.3e-1 | 8.3e-2 | 14 | 3 | fail |
+| W8A8, all but the output projections | 1.8e-2 | 8.7e-2 | 1.3e-1 | 8.7e-2 | 15 | 5 | fail |
+| W8A8, all four | 3.1e-2 | 1.3e-1 | 1.5e-1 | 1.1e-1 | 44 | 7 | fail |
+
+The six prompts of `real_f16` (no flips in any variant; largest |dp| over all options): base 5.7e-4, acc16 6.7e-4, W8A16 all four 9.1e-3, W8A16 without output projections 1.2e-2, W8A8 gate/up 1.6e-2, down 2.8e-2, input projections 1.3e-2,
+output projections 3.3e-2, gate/up + input projections 2.1e-2, MLP 2.2e-2, all but output projections 4.1e-2, **all four 5.1e-2 (fails the gate on six prompts)**; relative L2 of the hidden state 4.2e-4 (base), 2.2e-2 (W8A16 all four), 8.0e-2 (W8A8 all four).
+
+How close to 0.5 the flips are (distance of the float32 golden's probability from 0.5): W8A16 all four 0.001, 0.005, 0.008, 0.012; W8A16 without output projections 0.001, 0.005, 0.008, 0.011, 0.012; acc16 0.001. W8A8 flips reach much further:
+gate/up up to 0.051, down 0.024, input projections 0.030, output projections 0.044, MLP 0.097, all four 0.116 (44 flips, 7 of them within 0.01 of 0.5 and 22 further than 0.03). The model is a base fine-tune whose probabilities
+sit near 0.5 on some prompts; the W8A16 flips are all in that zone, the W8A8 ones are not.
+
+Row independence on the real model, 512 prompts, one alert per call / 16 per call / states cached and the questions in a later call: bit-identical results in all three ways for the two profiles with every group on int8 (W8A8 all four, W8A16 all four).
+W8A16 without the output projections has cuBLAS multiplies left in, and the three ways differ a little (largest |dp| against the golden 0.0331, 0.0335, 0.0325).
+
+**Where the W8A8 error comes from.** Activations were quantised and dequantised in binary16 in groups along k and fed to the W8A16 multiply (a diagnostic, not kept in the code), so the weights' error is the W8A16 row's and only the activation scale changes:
+
+| activation scale | flips of 512 | largest dp | six prompts, largest dp |
+|---|---|---|---|
+| none (W8A16 all four) | 4 | 3.9e-2 | 9.1e-3 |
+| per 32 values of k | 5 | 4.0e-2 | 2.0e-2 |
+| per 128 | 6 | 6.4e-2 | 2.9e-2 |
+| per 512 | 23 | 1.1e-1 | 2.8e-2 |
+| per row (what W8A8 does; the real W8A8 kernel: 44 and 1.5e-1) | 42 | 2.6e-1 | 3.7e-2 |
+| per row, scale cut to 85% of the maximum (clipping) | 30 | 2.0e-1 | 9.7e-2 |
+| per row, cut to 70% | 35 | 4.4e-1 | 1.2e-1 |
+
+Clipping the outliers makes it worse, shrinking the group makes it better: a few large channels carry information and set the row's scale. Scales per 128 get to the weights' error only in flips; per 32 pass the gate but have no tensor-core epilogue
+that is cheap (the scales would have to be applied inside the k loop). Smoothing the large channels into the weights (folded into the RMSNorm weight for the input projections and gate/up, into the up projection's rows for down) is the usual remedy and needs activation statistics; it
+was not tried.
+
+Qwen3.5-2B-Base has no golden for the alert workload; the float32 engine is the reference, 64 prompts (8 alerts), mean relative L2 of the final hidden state: base 5.6e-4, acc16 1.0e-3, **W8A16 all four 3.4e-2**, W8A8 gate/up 5.1e-2, input projections 4.3e-2, output projections 5.6e-2,
+down 6.8e-2, MLP 8.5e-2, all but output projections 9.7e-2, all four 1.1e-1 (the same order as on the 0.8B).
+
+### 3. Speed (`sepal-cuda-engine-ab`, same process, rotating through the option sets, best of 2 or 3 rounds of 4 or 5 timed calls; tokens/s, alerts/s for the last rows)
+
+*Qwen3.5-0.8B, natural mode:*
+
+| | cuBLAS (today) | cuBLAS f16 acc, all four | own, f16 acc, flush 64 | W8A16 all four | W8A8 MLP | W8A8 all but output | W8A8 all four |
+|---|---|---|---|---|---|---|---|
+| 1 row x 64 | 9,341 | 9,974 (+7%) | 6,702 (-28%) | 8,585 (-8%) | 10,220 (+9%) | 11,383 (+22%) | 11,442 (+22%) |
+| 1 row x 600 | 15,757 | 19,795 (+26%) | 17,905 (+14%) | 15,164 (-4%) | 18,826 (+19%) | 22,859 (+45%) | 24,813 (+57%) |
+| 1 row x 2048 | 16,757 | 21,025 (+25%) | 20,218 (+21%) | 16,074 (-4%) | 20,726 (+24%) | 25,598 (+53%) | 27,188 (+62%) |
+| 1 row x 4800 | 16,741 | 18,528 (+11%) | 19,377 (+16%) | 15,944 (-5%) | 20,274 (+21%) | 24,559 (+47%) | 25,944 (+55%) |
+| 16 rows x 640 | 19,355 | 23,639 (+22%) | 23,154 (+20%) | 18,914 (-2%) | 24,563 (+27%) | 30,752 (+59%) | 32,882 (+70%) |
+| 1 alert per call [alerts/s] | 18.9 | 23.9 (+26%) | 23.3 (+23%) | 18.3 (-3%) | 23.2 (+23%) | 28.9 (+53%) | 30.3 (+60%) |
+| 16 alerts per call | 21.7 | 26.6 (+23%) | 26.3 (+21%) | 20.9 (-4%) | 27.1 (+25%) | 34.1 (+57%) | 36.5 (+68%) |
+| weights, MiB | 1,436 | 1,436 | 1,436 | 964 | not printed | not printed | 964 |
+
+*Qwen3.5-2B, natural mode (a separate session, 3 rounds; llama.cpp b11514 for scale: 3,281 / 6,342 / 6,888 tokens/s at 64 / 600 / 2,048):*
+
+| | cuBLAS (today) | cuBLAS f16 acc, all four | own, f16 acc, flush 64 | W8A16 all four | W8A8 all four |
+|---|---|---|---|---|---|
+| 1 row x 64 | 4,525 | 4,967 (+10%) | 3,374 (-25%) | 3,716 (-18%) | 5,532 (+22%) |
+| 1 row x 600 | 7,357 | 10,177 (+38%) | 9,013 (+23%) | 6,790 (-8%) | 13,921 (+89%) |
+| 1 row x 2048 | 7,872 | 11,066 (+41%) | 10,015 (+27%) | 7,461 (-5%) | 15,263 (+94%) |
+| 16 rows x 640 | 8,459 | 11,700 (+38%) | 10,103 (+19%) | 8,042 (-5%) | 16,595 (+96%) |
+| 1 alert per call [alerts/s] | 8.5 | 12.3 (+45%) | 11.3 (+33%) | 8.4 (-1%) | 17.2 (+102%) |
+| 16 alerts per call | 9.6 | 13.2 (+38%) | 11.3 (+18%) | 9.2 (-4%) | 18.7 (+95%) |
+| weights, MiB | 3,590 | 3,590 | 3,590 | 2,285 | 2,285 |
+
+
+Alerts per second with the states cached (`sepal-cuda-engine-bench --sections alerts,cached`, best of 5):
+
+| | 0.8B cuBLAS | cuBLAS f16 acc | own f16 acc | W8A16 | W8A8 | 2B cuBLAS | cuBLAS f16 acc | own f16 acc | W8A16 | W8A8 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 alert per call | 58.1 | 74.6 | 65.0 | 52.9 | 84.8 | 26.0 | 39.6 | 31.8 | 25.4 | 50.0 |
+| 16 alerts per call | 79.8 | 101.3 | 98.1 | 76.3 | 130.0 | 35.3 | 49.5 | 45.5 | 34.5 | 70.4 |
+| same, not cached: 1 / 16 alerts per call | 19.2 / 21.9 | 24.3 / 28.1 | 24.0 / 27.0 | 18.4 / 21.2 | 31.3 / 37.2 | 8.4 / 9.5 | 12.4 / 13.2 | 11.4 / 11.3 | 8.4 / 9.2 | 17.3 / 18.7 |
+
+Strict mode (`gemm_rows` 1024; the int8 groups pad nothing, the cuBLAS option pads every multiply to 1,024 rows), 0.8B:
+
+| | cuBLAS padded | own, f16 acc, flush 64 | W8A8 all four | W8A16 all four |
+|---|---|---|---|---|
+| 1 row x 64 | 1,399 | 8,121 | 11,423 | 8,576 |
+| 1 row x 600 | 10,851 | 18,431 | 24,811 | 15,459 |
+| 1 row x 2048 | 16,497 | 20,913 | 27,657 | 16,412 |
+| 16 rows x 640 | 18,401 | 24,008 | 33,608 | 18,988 |
+| 1 alert per call | 16.4 | 23.7 | 31.2 | 18.5 |
+| 16 alerts per call | 20.1 | 26.7 | 37.3 | 21.5 |
+
+Why not more: the multiplies are 60 to 75% of a 0.8B call. With the multiply 2.6 times faster than today's the call can be at most 1.6 to 1.9 times faster, and the row quantisation (one pass per int8 multiply: 5 to 16% of it at the gate/up shapes, 16% at 64 tokens, and 36% at the down projection's), the unchanged DeltaNet, attention and elementwise kernels, and the 64-token calls' latency take the rest. The speed of the W8A8 kernel itself (51 to 65% of the card's int8 peak, cuBLAS int8 75 to 83%) is the remaining headroom in the multiplies.
+
+### 4. Memory
+
+Weights (MiB, `EngineMemory::weights_bytes`): 0.8B 1,436 (binary16) -> 964 (all four groups on int8); 2B 3,590 -> 2,284. 2B by group alone: gate/up 3,015, down 3,302, input projections 3,243, output projections 3,494, MLP 2,727, all but output 2,380.
+What remains is the binary16 embedding (485 MiB at 0.8B, 970 MiB at 2B; it is also the tied head) and the float32 scales. The call buffers grow by the int8 activation buffer and the scales for W8A8 (0.8B: 962 -> 1,018 MiB at 16,384 tokens). By arithmetic and
+not run (no 9B checkpoint here): a 9B at hidden size 4,096 has about 13.8 GB of binary16 layer weights and a 2.0 GB embedding; the layers on int8 are about 7 GB, so with the embedding 9 GB, leaving about 3 GB of a 12 GiB card (before the display's share) for call buffers and snapshots,
+where binary16 (15.9 GB) cannot be loaded at all. The embedding could be stored int8 per row as well (the design's `cpu-q8` profile does); not done.
+
+### 5. Tests
+
+* `sepal_cuda_kernel_s8_tests` (CTest `cuda_s8_*`): `s8_quantize` (host oracle, bit for bit: bytes and scales, both weight layouts, K from 16 to 6,144; zero rows, a 65,504 outlier, subnormals, +-127), `s8_gemm` (the exact integer product of the
+  device's own int8 operands scaled in float32, bit for bit, five shapes; W8A16 against float64 of the dequantised weights, 1e-5; quantisation error against the unquantised product; an outlier-channel case), `s8_invariance` (six tile shapes, batches of 1 to 213, every place: bit-identical, both kernels),
+  `s8_edge` (eight tiny and ragged shapes with every tile shape, zero rows, 14 refusals: K, odd N, misaligned or null pointers, strides, unknown configuration). 465 checks.
+* `sepal_cuda_engine_tests engine_int8` (CTest `cuda_engine_engine_int8`): defaults and refusals (float32 path, H = 24), closeness to the float32 engine for seven option sets and memory below binary16's, bit-identity alone / among other rows / from a stored snapshot for four option sets in natural and strict (`gemm_rows` 16, 48)
+  modes with cuBLAS or the own kernel for the rest, strict pruned against unpruned last layer and repeated runs. 1,188 checks.
+* `real_int8`, `real_int8_2b`: the tables above (they assert finite results, the default engine's gate, and bit-identity of the all-int8 profiles across batching ways). The planted-bug check: dropping the sign flip in the W8A16 weight widening (`v ^= 0x80808080` -> `0x00808080`) fails `s8_gemm` in every shape
+  (`err < 1e-5` and `quantisation < 1.2e-2`); reverted.
+
+The whole CTest suite with all the real-model environment variables set: 67 of 67 pass (23 minutes, `real_cpu` 520 s of it), none skipped; the 60 tests that existed before still pass, strict-mode bit-identity suites included.
+
+### Not done
+
+* Tuning the W8A8 kernel (51 to 65% of the int8 peak; cuBLAS int8 is 10 to 35% faster on the deep shapes), fusing the row quantisation into SwiGLU and the norms, and split-k for small calls (the 64-token multiplies stay latency-bound).
+* A cheaper way to W8A8 that passes the gate: smoothing (needs calibration), scales per group along k in the epilogue (per 128 still fails on |dp|, per 32 is expensive), outlier channels kept in binary16. None tried beyond the emulation above.
+* int8 embedding, int8 attention or K/V, int4 weights, an int8 route for the CPU reference.
+* No 9B run; llama.cpp was not re-measured (its figures are from the earlier section).
