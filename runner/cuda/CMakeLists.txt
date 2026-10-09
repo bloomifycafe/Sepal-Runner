@@ -190,13 +190,19 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_props.cpp
   tests/test_cuda_engine_real.cpp
   tests/test_cuda_engine_diag.cpp
+  tests/test_cuda_engine_attack.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative attack_shapes attack_invariance attack_lifetime real_f32 real_f16 real_strict real_natural real_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
+# A real-model suite prints "SKIPPED: real-model ..." and exits 0 when its environment variables are not set; CTest
+# must show that as Skipped, not Passed (the parent project's `real` test does the same).
+foreach(suite real_f32 real_f16 real_strict real_natural real_2b)
+  set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 endforeach()

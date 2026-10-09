@@ -447,7 +447,7 @@ SEPAL_TEST(real_natural, drift_of_probabilities_across_batch_compositions) {
 SEPAL_TEST(real_2b, second_geometry_against_the_cpu_reference_and_float16_against_float32) {
     const auto dir = environment("SEPAL_REAL_MODEL_2B");
     if (!dir || !environment("SEPAL_REAL_GOLDEN")) {
-        std::cout << "SKIPPED: set SEPAL_REAL_MODEL_2B (a Qwen3.5-2B-Base checkpoint directory) and SEPAL_REAL_GOLDEN to run this\n";
+        std::cout << "SKIPPED: real-model test; set SEPAL_REAL_MODEL_2B (a Qwen3.5-2B-Base checkpoint directory) and SEPAL_REAL_GOLDEN to run this\n";
         return;
     }
     const LoadedModel model = LoadedModel::open(*dir);
