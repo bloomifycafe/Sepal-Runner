@@ -51,10 +51,11 @@ namespace sepal::cuda::detail {
 
 constexpr int kChunk = 16;       // tokens staged in shared memory at a time
 constexpr int kAuxThreads = 128; // threads of the aux role
-constexpr int kAuxChannels = (3 * 128 + 128 - 1) / 128; // channels per aux thread (q, k, v: 3 * 128)
+constexpr int kAuxChannels = (3 * 128 + kAuxThreads - 1) / kAuxThreads; // channels per aux thread (q, k, v: 3 * 128)
 constexpr int kMaxTaps = static_cast<int>(kDeltaNetMaxConvKernel);
 constexpr float kRescale = 9.094947017729282e-13f; // 2^-40: below this the decay scale is folded into the state
 constexpr int kKeyWidth = 128;   // key dimension padded to this
+constexpr int kAcc = 2;         // accumulators per dot product per thread (keys alternate between them)
 constexpr int kCols = 4;         // columns of the state one scan thread holds
 constexpr int kKeyLanes = 4;     // lanes of a warp that share a column quad, each with a quarter of the keys
 constexpr int kGroups = kKeyWidth / 4 / kKeyLanes; // key groups (of 4 keys) per lane: 8
@@ -150,12 +151,12 @@ struct Tile {
     float s[kCols][kGroups * 4];
 };
 struct Acc {
-    float a[kCols][2];
+    float a[kCols][kAcc];
 };
 
 // Completes one dot product: the thread's two accumulators, then the partial sums of the kKeyLanes lanes by a
 // butterfly. Every one of the lanes ends with the same bits (addition is commutative).
-__device__ __forceinline__ float finish(const float (&acc)[2]) {
+__device__ __forceinline__ float finish(const float (&acc)[kAcc]) {
     float x = __fadd_rn(acc[0], acc[1]);
     x = __fadd_rn(x, __shfl_xor_sync(0xFFFFFFFFu, x, 1));
     x = __fadd_rn(x, __shfl_xor_sync(0xFFFFFFFFu, x, 2));
@@ -184,10 +185,10 @@ __device__ __forceinline__ void token_pass(Tile& t, Acc& acc_q, Acc& acc_k, cons
             #pragma unroll
             for (int cc = 0; cc < kCols; ++cc) sv[cc] = __fmaf_rn(kk[c], corr[cc], t.s[cc][m * 4 + c]);
             #pragma unroll
-            for (int cc = 0; cc < kCols; ++cc) acc_q.a[cc][c & 1] = __fmaf_rn(qq[c], sv[cc], acc_q.a[cc][c & 1]);
+            for (int cc = 0; cc < kCols; ++cc) acc_q.a[cc][c % kAcc] = __fmaf_rn(qq[c], sv[cc], acc_q.a[cc][c % kAcc]);
             if (NEXT) {
                 #pragma unroll
-                for (int cc = 0; cc < kCols; ++cc) acc_k.a[cc][c & 1] = __fmaf_rn(xx[c], sv[cc], acc_k.a[cc][c & 1]);
+                for (int cc = 0; cc < kCols; ++cc) acc_k.a[cc][c % kAcc] = __fmaf_rn(xx[c], sv[cc], acc_k.a[cc][c % kAcc]);
             }
             #pragma unroll
             for (int cc = 0; cc < kCols; ++cc) t.s[cc][m * 4 + c] = sv[cc];
@@ -302,7 +303,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
             const float4* ks4 = reinterpret_cast<const float4*>(st + kK);
             Acc acc_k;
             #pragma unroll
-            for (int cc = 0; cc < kCols; ++cc) acc_k.a[cc][0] = acc_k.a[cc][1] = 0.0f;
+            for (int cc = 0; cc < kCols; ++cc) for (int u = 0; u < kAcc; ++u) acc_k.a[cc][u] = 0.0f;
             #pragma unroll
             for (int m = 0; m < kGroups; ++m) {
                 const float4 kq = ks4[p + kKeyLanes * m];
@@ -310,7 +311,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     #pragma unroll
-                    for (int cc = 0; cc < kCols; ++cc) acc_k.a[cc][c & 1] = __fmaf_rn(kk[c], tile.s[cc][m * 4 + c], acc_k.a[cc][c & 1]);
+                    for (int cc = 0; cc < kCols; ++cc) acc_k.a[cc][c % kAcc] = __fmaf_rn(kk[c], tile.s[cc][m * 4 + c], acc_k.a[cc][c % kAcc]);
                 }
             }
             start_token(std::integral_constant<int, 0>{}, st, 0, acc_k, corr);
@@ -334,8 +335,8 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                     Acc acc_q, acc_k;
                     #pragma unroll
                     for (int cc = 0; cc < kCols; ++cc) {
-                        acc_q.a[cc][0] = acc_q.a[cc][1] = 0.0f;
-                        acc_k.a[cc][0] = acc_k.a[cc][1] = 0.0f;
+                        for (int u = 0; u < kAcc; ++u) acc_q.a[cc][u] = 0.0f;
+                        for (int u = 0; u < kAcc; ++u) acc_k.a[cc][u] = 0.0f;
                     }
                     const float4* kn = ks4 + tt * (kKeyWidth / 4);
                     const float4* qn = qs4 + tt * (kKeyWidth / 4);
@@ -554,29 +555,38 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                 }
                 if (warp == 0) {
                     // The first warp turns the chunk's decays into the scan's scalars (see the scan role): lane t
-                    // computes token t's decay and beta, then all lanes walk the tokens in order.
+                    // computes token t's decay and beta, then every lane walks the chunk's tokens in order, through
+                    // the scale carried from the previous chunk. The first token folds the carried scale and its own
+                    // decay into the state; a later token does the same when the scale would fall below kRescale
+                    // (a very strong decay), which flags the chunk "slow". The walk is straight-line code: the decays
+                    // are fetched first, then the short chain of products runs.
                     float decay = 1.0f;
                     if (lane < count) {
                         const float g = __fmul_rn(-expf(args.a_log[head]), softplus_f(__fadd_rn(a_cur, args.dt_bias[head])));
                         decay = expf(g);
                     }
-                    float pre_l = 1.0f, inv_l = 1.0f, rs_l = args.read_scale, g_l = 1.0f;
-                    float slow = 0.0f; // 1 when a token other than the first has to fold the scale into the state
-                    for (std::uint32_t t = 0; t < count; ++t) {
-                        const float d = __shfl_sync(0xFFFFFFFFu, decay, static_cast<int>(t));
-                        const float attempt = __fmul_rn(g_run, d);
+                    float d_all[kChunk];
+                    #pragma unroll
+                    for (int t = 0; t < kChunk; ++t) d_all[t] = __shfl_sync(0xFFFFFFFFu, decay, t);
+                    float pre_l = 1.0f, g_l = 1.0f;
+                    bool slow_flag = false;
+                    #pragma unroll
+                    for (int t = 0; t < kChunk; ++t) {
+                        const bool live = static_cast<std::uint32_t>(t) < count;
+                        const float attempt = __fmul_rn(g_run, d_all[t]);
                         const bool small = attempt < kRescale;
                         const bool reset = small || t == 0; // the first token of a chunk always folds the scale in
-                        if (small && t != 0) slow = 1.0f;
-                        g_run = reset ? 1.0f : attempt;
-                        if (lane == t) {
+                        slow_flag = slow_flag || (live && small && t != 0);
+                        const float after = reset ? 1.0f : attempt;
+                        if (lane == static_cast<std::uint32_t>(t)) {
                             pre_l = reset ? attempt : 1.0f;
-                            inv_l = __frcp_rn(g_run);
-                            rs_l = __fmul_rn(args.read_scale, g_run);
-                            g_l = g_run;
+                            g_l = after;
                         }
+                        g_run = live ? after : g_run;
                     }
-                    if (lane < count) {
+                    const float inv_l = __frcp_rn(g_l);
+                    const float rs_l = __fmul_rn(args.read_scale, g_l);
+                    const float slow = slow_flag ? 1.0f : 0.0f;                    if (lane < count) {
                         sc[kPre + lane] = pre_l;
                         sc[kInv + lane] = inv_l;
                         sc[kBet + lane] = sigmoid_f(b_cur);
