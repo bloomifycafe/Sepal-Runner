@@ -158,3 +158,87 @@ SEPAL_TEST(attack_geometry, other_geometries_agree_with_the_reference_or_are_ref
     }
     std::cout << "  " << ok << " geometry runs agreed, " << refused << " were refused at creation\n";
 }
+
+// Strict mode promises that a row's bits do not depend on the other rows of the call. Last-layer pruning changes which
+// multiplies run (and, in the pruned layer, their widths) depending on how many rows are read out, so it must not change a
+// single bit. The tiny geometry cannot show a breach (its multiplies are narrow); the geometries below are wider.
+SEPAL_TEST(attack_geometry, last_layer_pruning_changes_no_bit_in_strict_mode_on_wide_geometries) {
+    struct Wide {
+        std::string name;
+        ModelConfig cfg;
+    };
+    std::vector<Wide> wide;
+    {
+        ModelConfig c = tiny_test_config();
+        c.name = "mid";
+        c.num_layers = 4;
+        c.hidden_size = 256;
+        c.intermediate_size = 768;
+        c.attn_heads = 8;
+        c.attn_kv_heads = 2;
+        c.attn_head_dim = 64;
+        c.dn_key_heads = 4;
+        c.dn_value_heads = 8;
+        c.dn_key_head_dim = 32;
+        c.dn_value_head_dim = 32;
+        wide.push_back({"hidden 256, 8 heads of 64", c});
+        c.name = "wide";
+        c.hidden_size = 512;
+        c.intermediate_size = 1792;
+        c.attn_head_dim = 256;
+        c.attn_heads = 8;
+        c.dn_key_heads = 8;
+        c.dn_value_heads = 8;
+        c.dn_key_head_dim = 64;
+        c.dn_value_head_dim = 64;
+        wide.push_back({"hidden 512, 8 heads of 256 (0.8B-like attention)", c});
+    }
+    for (const Wide& w : wide) {
+        const Weights<float> weights = random_weights<float>(w.cfg, 5);
+        for (const Precision precision : {Precision::F32, Precision::F16}) {
+            for (const std::size_t g : {std::size_t{32}, std::size_t{128}}) {
+                Knobs on;
+                on.precision = precision;
+                on.gemm_rows = g;
+                on.max_tokens = 2048;
+                on.max_rows = 64;
+                on.slots = 24;
+                on.budget_mib = 360;
+                Knobs off = on;
+                off.prune = false;
+                CudaEngine pruned(w.cfg, weights, options_of(on)), full(w.cfg, weights, options_of(off));
+                Rng rng(g + 3);
+                const std::size_t vocab = static_cast<std::size_t>(w.cfg.vocab_size);
+                std::size_t same = 0, total = 0;
+                DeviceSnapshot sp, sf;
+                for (int call = 0; call < 24; ++call) {
+                    // A state and a few branches (readouts at the ends), sometimes continuing the stored state of an earlier call:
+                    // so the number of read-out rows and of tokens varies from call to call.
+                    std::vector<EngineRow> rows;
+                    const std::size_t n_state = 20 + rng.below(300);
+                    rows.push_back(make_row(tokens(rng, n_state, vocab), {}, true));
+                    for (std::size_t b = 0, n = 1 + rng.below(6); b < n; ++b) {
+                        const std::size_t len = 1 + rng.below(30);
+                        rows.push_back(child_of(make_row(tokens(rng, len, vocab), {len - 1}, b == 0), 0));
+                    }
+                    std::vector<EngineRow> rows_p = rows, rows_f = rows;
+                    if (sp.valid() && rng.chance(50)) {
+                        rows_p[0].parent = sp;
+                        rows_f[0].parent = sf;
+                        rows_p[0].readout_offsets = {0};
+                        rows_f[0].readout_offsets = {0};
+                    }
+                    const auto rp = run(pruned, rows_p), rf = run(full, rows_f);
+                    for (std::size_t i = 0; i < rows.size(); ++i) {
+                        ++total;
+                        same += same_bits(rp[i].hidden, rf[i].hidden) ? 1 : 0;
+                    }
+                    sp = rp[1].snapshot;
+                    sf = rf[1].snapshot;
+                }
+                std::cout << "  " << w.name << ", " << name_of(precision) << " strict " << g << ": " << same << " of " << total << " rows bit-identical, pruned vs full last layer\n";
+                CHECK_EQ(same, total);
+            }
+        }
+    }
+}

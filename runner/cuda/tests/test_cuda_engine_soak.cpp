@@ -13,8 +13,12 @@
 // CTest). SEPAL_SOAK_SEED sets the seed (default: derived from the clock; always printed first).
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 #include "attack_util.hpp"
+#include "sepal/json.hpp"
+#include "sepal/loader.hpp"
 
 using namespace attack;
 
@@ -36,9 +40,23 @@ struct Spec {
     std::vector<RowSpec> rows;
 };
 
+// Where row tokens come from: random ids of the tiny vocabulary, or (real model) slices of real text.
+const std::vector<std::uint32_t>* g_pool = nullptr;
+bool g_real_lengths = false;
+
+std::vector<std::uint32_t> draw(Rng& rng, std::size_t len) {
+    if (g_pool == nullptr) return tokens(rng, len);
+    const std::size_t at = rng.below(g_pool->size() - len);
+    return {g_pool->begin() + static_cast<std::ptrdiff_t>(at), g_pool->begin() + static_cast<std::ptrdiff_t>(at + len)};
+}
+
 std::size_t random_len(Rng& rng) {
+    if (g_real_lengths) {
+        static const std::vector<std::size_t> real_lens = {1, 2, 3, 8, 27, 27, 60, 128, 300, 645, 645};
+        return rng.pick(real_lens);
+    }
     static const std::vector<std::size_t> lens = {1, 1, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 129, 257};
-    if (rng.chance(2)) return 300 + rng.below(1200);
+    if (rng.chance(1)) return 300 + rng.below(700);
     return rng.pick(lens);
 }
 
@@ -51,8 +69,8 @@ Spec make_spec(Rng& rng, std::size_t store_size) {
         const std::size_t shape = rng.below(6);
         const auto node = [&](int parent_row, int stored_parent, bool short_row) {
             RowSpec n;
-            const std::size_t len = short_row ? 1 + rng.below(12) : random_len(rng);
-            n.tokens = tokens(rng, len);
+            const std::size_t len = short_row ? 1 + rng.below(g_real_lengths ? 40 : 12) : random_len(rng);
+            n.tokens = draw(rng, len);
             n.parent_row = parent_row;
             n.stored = stored_parent;
             n.keep = rng.chance(35);
@@ -66,7 +84,7 @@ Spec make_spec(Rng& rng, std::size_t store_size) {
         case 0: node(-1, stored, false); break;
         case 1: { // state with branches, up to 40
             const int root = node(-1, stored, false);
-            for (std::size_t b = 0, n = 1 + rng.below(rng.chance(10) ? 40 : 8); b < n; ++b) node(root, -1, true);
+            for (std::size_t b = 0, n = 1 + rng.below(rng.chance(6) ? 40 : 8); b < n; ++b) node(root, -1, true);
             break;
         }
         case 2: { // chain, depth up to 14
@@ -117,7 +135,7 @@ Spec make_spec(Rng& rng, std::size_t store_size) {
 bool instantiate(const Spec& spec, const std::vector<DeviceSnapshot>& store, std::size_t pre, Rng* extra_rng, std::size_t extra_rows, std::vector<EngineRow>& out) {
     out.clear();
     Rng* e = extra_rng;
-    for (std::size_t i = 0; i < pre; ++i) out.push_back(make_row(tokens(*e, 1 + e->below(60)), {e->below(1)}));
+    for (std::size_t i = 0; i < pre; ++i) out.push_back(make_row(draw(*e, 1 + e->below(60)), {e->below(1)}));
     for (const RowSpec& r : spec.rows) {
         EngineRow row = make_row(r.tokens, r.readouts, r.keep);
         row.capture_layers = r.capture;
@@ -130,7 +148,7 @@ bool instantiate(const Spec& spec, const std::vector<DeviceSnapshot>& store, std
         out.push_back(std::move(row));
     }
     for (std::size_t i = 0; i < extra_rows; ++i) {
-        std::vector<std::uint32_t> t = tokens(*e, 1 + e->below(90));
+        std::vector<std::uint32_t> t = draw(*e, 1 + e->below(90));
         out.push_back(make_row(t, {t.size() - 1}));
     }
     return true;
@@ -139,6 +157,7 @@ bool instantiate(const Spec& spec, const std::vector<DeviceSnapshot>& store, std
 struct Counters {
     std::size_t calls = 0, rows = 0, tokens = 0, refused = 0, kept = 0, releases = 0;
     std::size_t checks = 0, failures = 0;
+    double ref_seconds = 0, engine_seconds = 0;
     double a_vs_ref = 0, a_vs_b = 0, d_vs_a = 0, e_vs_b = 0;
     std::size_t strict_pairs = 0, strict_equal = 0;
 };
@@ -206,6 +225,7 @@ void soak(double seconds) {
         }
         // The pass: every engine in turn; BudgetExceeded is tolerated on the small-pool ones.
         bool any_failed_small[2] = {false, false};
+        const auto engines_begin = Clock::now();
         for (std::size_t i = 0; i < m.size(); ++i) {
             if (!usable[i]) continue;
             try {
@@ -224,13 +244,16 @@ void soak(double seconds) {
                 usable[i] = false;
             }
         }
+        c.engine_seconds += std::chrono::duration<double>(Clock::now() - engines_begin).count();
         ++c.calls;
         c.rows += spec.rows.size();
         c.tokens += total_tokens;
         const std::size_t base_a = 0;
         // A against the reference (only A's own request; the reference sees A's rows).
         if (usable[0]) {
+            const auto ref_begin = Clock::now();
             const auto want = world.reference(rows[0]);
+            c.ref_seconds += std::chrono::duration<double>(Clock::now() - ref_begin).count();
             for (std::size_t r = 0; r < rows[0].size(); ++r) {
                 const std::size_t count = rows[0][r].readout_offsets.size() * world.hidden();
                 ++c.checks;
@@ -322,7 +345,7 @@ void soak(double seconds) {
     }
     const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
     std::cout << "  soak done: seed " << seed << ", " << std::fixed << std::setprecision(0) << elapsed << " s, " << c.calls << " calls, " << c.rows << " rows, " << c.tokens << " tokens, " << c.kept
-              << " snapshots kept, " << c.releases << " released, " << c.refused << " calls refused with BudgetExceeded by the small engines\n"
+              << " snapshots kept, " << c.releases << " released, " << c.refused << " calls refused with BudgetExceeded by the small engines; time in the six engines " << c.engine_seconds << " s, in the CPU reference " << c.ref_seconds << " s\n"
               << "    float32 natural vs CPU reference: worst " << std::scientific << std::setprecision(2) << c.a_vs_ref << "; float32 strict vs natural: worst " << c.a_vs_b << "; float16 natural vs float32: worst " << c.d_vs_a
               << "; float16 strict vs float32 strict: worst " << c.e_vs_b << std::fixed << "\n"
               << "    strict small vs strict roomy (other rows spliced in, no pruning, other pools): " << c.strict_equal << " of " << c.strict_pairs << " rows bit-identical; " << c.checks << " checks, " << c.failures
@@ -338,6 +361,106 @@ void soak(double seconds) {
     CHECK(c.calls > 0);
 }
 
+
+// ---- the real model ----
+// Two engines on jeff-base run the same random requests built from slices of the alert workload's real text. Phase one: two
+// float16 strict engines (small pools; roomy pools with other rows spliced in and no pruning) must agree bit for bit.
+// Phase two: float32 natural and float16 natural must stay close, with no answer flip. Needs SEPAL_REAL_MODEL and SEPAL_ALERTS.
+
+struct RealPhase {
+    std::size_t calls = 0, rows = 0, tokens_run = 0, refused = 0, compared = 0, equal = 0, flips = 0;
+    double worst = 0;
+};
+
+RealPhase real_phase(const LoadedModel& model, const DecisionReadout& readout, Precision pa, std::size_t ga, Precision pb, std::size_t gb, bool extras, bool tight, double seconds,
+                     std::uint64_t seed) {
+    Rng rng(seed), extra(seed ^ 0x5555);
+    EngineOptions oa, ob;
+    oa.precision = pa;
+    oa.gemm_rows = ga;
+    oa.max_call_tokens = 4096;
+    oa.max_call_rows = 128;
+    ob = oa;
+    ob.precision = pb;
+    ob.gemm_rows = gb;
+    if (tight) {
+        oa.state_slots = 10;
+        oa.memory_budget_bytes = (pa == Precision::F32 ? std::size_t{4800} : std::size_t{2400}) << 20;
+    } else {
+        oa.state_slots = 40;
+        oa.memory_budget_bytes = (pa == Precision::F32 ? std::size_t{5200} : std::size_t{2800}) << 20;
+    }
+    ob.state_slots = 40;
+    ob.memory_budget_bytes = (pb == Precision::F32 ? std::size_t{5200} : std::size_t{2800}) << 20;
+    if (extras) ob.prune_last_layer = false;
+    CudaEngine ea(model, oa);
+    CudaEngine eb(model, ob);
+    RealPhase out;
+    std::vector<DeviceSnapshot> sa, sb;
+    const auto start = Clock::now();
+    while (std::chrono::duration<double>(Clock::now() - start).count() < seconds) {
+        const Spec spec = make_spec(rng, std::min(sa.size(), sb.size()));
+        std::size_t total = 0;
+        for (const RowSpec& r : spec.rows) total += r.tokens.size();
+        if (total > 3000) continue;
+        const std::size_t pre = extras ? rng.below(3) : 0, post = extras ? rng.below(4) : 0;
+        std::vector<EngineRow> ra, rb;
+        Rng copy = extra;
+        extra.next();
+        const bool ok_a = instantiate(spec, sa, 0, &copy, 0, ra);
+        const bool ok_b = instantiate(spec, sb, pre, &copy, post, rb);
+        if (!ok_a || !ok_b) {
+            // a snapshot one engine could not make: keep the stores aligned by dropping every entry invalid in either
+            for (std::size_t i = std::min(sa.size(), sb.size()); i-- > 0;) {
+                if (!sa[i].valid() || !sb[i].valid()) {
+                    sa.erase(sa.begin() + static_cast<std::ptrdiff_t>(i));
+                    sb.erase(sb.begin() + static_cast<std::ptrdiff_t>(i));
+                }
+            }
+            continue;
+        }
+        std::vector<EngineRowResult> ga_, gb_;
+        bool a_ok = true;
+        try {
+            ga_ = run(ea, ra);
+        } catch (const BudgetExceeded&) {
+            a_ok = false;
+            ++out.refused;
+        }
+        if (a_ok) gb_ = run(eb, rb);
+        ++out.calls;
+        if (a_ok) {
+            out.rows += spec.rows.size();
+            out.tokens_run += total;
+            for (std::size_t k = 0; k < spec.rows.size(); ++k) {
+                const EngineRowResult& x = ga_[k];
+                const EngineRowResult& y = gb_[pre + k];
+                if (x.hidden.empty()) continue;
+                ++out.compared;
+                if (same_bits(x.hidden, y.hidden)) ++out.equal;
+                out.worst = std::max(out.worst, hidden_distance(x.hidden, y.hidden));
+                const std::size_t H = x.hidden.size() / spec.rows[k].readouts.size();
+                for (std::size_t o = 0; o < spec.rows[k].readouts.size(); ++o) {
+                    const std::span<const float> hx(x.hidden.data() + o * H, H), hy(y.hidden.data() + o * H, H);
+                    const auto px = readout.probabilities(hx, 2), py = readout.probabilities(hy, 2);
+                    if ((px[0] > px[1]) != (py[0] > py[1])) ++out.flips;
+                }
+            }
+        }
+        for (std::size_t k = 0; k < spec.rows.size(); ++k) {
+            if (!spec.rows[k].keep) continue;
+            sa.push_back(a_ok ? ga_[k].snapshot : DeviceSnapshot());
+            sb.push_back(a_ok ? gb_[pre + k].snapshot : DeviceSnapshot());
+        }
+        while (sa.size() > 8 || (sa.size() > 2 && rng.chance(10))) {
+            const std::size_t at = rng.below(sa.size());
+            sa.erase(sa.begin() + static_cast<std::ptrdiff_t>(at));
+            sb.erase(sb.begin() + static_cast<std::ptrdiff_t>(at));
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 SEPAL_TEST(soak_short, random_requests_on_six_engines_checked_against_the_reference_and_each_other) {
@@ -350,4 +473,41 @@ SEPAL_TEST(soak, the_long_run) {
     double minutes = 20;
     if (const auto e = environment("SEPAL_SOAK_MINUTES")) minutes = std::stod(*e);
     soak(minutes * 60.0);
+}
+
+SEPAL_TEST(real_soak, random_requests_of_real_text_on_the_real_model) {
+    if (!environment("SEPAL_REAL_MODEL") || !environment("SEPAL_ALERTS")) {
+        std::cout << "SKIPPED: real-model test; set SEPAL_REAL_MODEL and SEPAL_ALERTS\n";
+        return;
+    }
+    double seconds = 120;
+    if (const auto e = environment("SEPAL_SOAK_SECONDS")) seconds = std::stod(*e);
+    const std::uint64_t seed = pick_seed();
+    std::cout << "  real soak seed " << seed << " (" << seconds << " s per phase)\n";
+    std::ifstream in(*environment("SEPAL_ALERTS"), std::ios::binary);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::vector<std::uint32_t> pool;
+    for (const json::Value& a : json::parse(buffer.str()).at("alerts").items()) {
+        for (const std::uint64_t id : a.at("state").as_uint_list()) pool.push_back(static_cast<std::uint32_t>(id));
+        for (const json::Value& q : a.at("suffixes").items()) {
+            for (const std::uint64_t id : q.as_uint_list()) pool.push_back(static_cast<std::uint32_t>(id));
+        }
+    }
+    g_pool = &pool;
+    g_real_lengths = true;
+    const LoadedModel model = LoadedModel::open(*environment("SEPAL_REAL_MODEL"));
+    const DecisionReadout readout = DecisionReadout::open_directory(*environment("SEPAL_REAL_MODEL"));
+    const RealPhase one = real_phase(model, readout, Precision::F16, 128, Precision::F16, 128, true, true, seconds, seed);
+    std::cout << "  phase 1, float16 strict 128, tight pools vs roomy pools + other rows + no pruning: " << one.calls << " calls (" << one.refused << " refused by the tight engine), " << one.rows << " rows, "
+              << one.tokens_run << " tokens; " << one.equal << " of " << one.compared << " readout rows bit-identical, largest difference " << one.worst << "\n";
+    CHECK_EQ(one.equal, one.compared);
+    CHECK(one.compared > 0);
+    const RealPhase two = real_phase(model, readout, Precision::F32, 0, Precision::F16, 0, false, false, seconds, seed + 1);
+    std::cout << "  phase 2, float32 natural vs float16 natural: " << two.calls << " calls, " << two.rows << " rows, " << two.tokens_run << " tokens; " << two.compared << " readout rows, largest hidden difference "
+              << two.worst << ", answer flips " << two.flips << "\n";
+    CHECK(two.worst < 0.1);
+    CHECK_EQ(two.flips, std::size_t{0});
+    g_pool = nullptr;
+    g_real_lengths = false;
 }

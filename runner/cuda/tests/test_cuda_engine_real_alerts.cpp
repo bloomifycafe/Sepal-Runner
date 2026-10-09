@@ -424,3 +424,59 @@ SEPAL_TEST(real_alerts, the_64_alert_workload_in_every_way_against_transformers_
         report("float16 engine (natural, alone) vs CPU float32 reference", compare(ours16, cpu));
     }
 }
+
+// Diagnostic for the strict-mode finding: the same branches in a call with their state and continuing a stored snapshot
+// of it. Sweeps the state length, gemm_rows and last-layer pruning on the float32 engine.
+SEPAL_TEST(real_diag, strict_float32_state_in_the_call_versus_stored) {
+    if (skipped()) return;
+    const std::vector<Alert> alerts = load_alerts(2);
+    for (const bool prune : {true, false}) {
+        for (const std::size_t g : {std::size_t{8}, std::size_t{128}}) {
+            EngineOptions o = options(Precision::F32, g);
+            o.prune_last_layer = prune;
+            o.max_call_tokens = 2048;
+            o.memory_budget_bytes = std::size_t{4800} << 20;
+            o.state_slots = 8;
+            CudaEngine engine(real().model, o);
+            for (const std::size_t len : {std::size_t{1}, std::size_t{27}, std::size_t{64}, std::size_t{100}, std::size_t{200}, std::size_t{400}, std::size_t{645}}) {
+                Alert a = alerts[0];
+                a.state.resize(std::min(len, a.state.size()));
+                std::vector<EngineRow> in_call = {state_row(a, true)};
+                for (std::size_t q = 0; q < 3; ++q) {
+                    EngineRow r = question_row(a, q);
+                    r.parent = ParentRow{0};
+                    in_call.push_back(r);
+                }
+                const auto together = run(engine, in_call);
+                std::vector<EngineRow> only_state = {state_row(a, true)};
+                const auto first = run(engine, only_state);
+                std::vector<EngineRow> later;
+                for (std::size_t q = 0; q < 3; ++q) {
+                    EngineRow r = question_row(a, q);
+                    r.parent = first[0].snapshot;
+                    later.push_back(r);
+                }
+                const auto stored = run(engine, later);
+                // And the same stored snapshot used again, and the state's snapshot from the in-call run.
+                std::vector<EngineRow> later2;
+                for (std::size_t q = 0; q < 3; ++q) {
+                    EngineRow r = question_row(a, q);
+                    r.parent = together[0].snapshot;
+                    later2.push_back(r);
+                }
+                const auto stored2 = run(engine, later2);
+                std::size_t eq = 0, eq2 = 0;
+                double worst = 0;
+                for (std::size_t q = 0; q < 3; ++q) {
+                    eq += same_bits(together[1 + q].hidden, stored[q].hidden) ? 1 : 0;
+                    eq2 += same_bits(together[1 + q].hidden, stored2[q].hidden) ? 1 : 0;
+                    worst = std::max(worst, max_abs_diff(together[1 + q].hidden.data(), stored[q].hidden.data(), real().hidden));
+                }
+                CHECK_EQ(eq, std::size_t{3});
+                CHECK_EQ(eq2, std::size_t{3});
+                std::cout << "  strict " << g << (prune ? "" : " no-prune") << ", state of " << a.state.size() << " tokens: in-call vs stored-from-own-call " << eq << "/3 identical (worst " << std::scientific
+                          << std::setprecision(2) << worst << "), vs snapshot taken in the same call " << eq2 << "/3" << std::fixed << "\n";
+            }
+        }
+    }
+}

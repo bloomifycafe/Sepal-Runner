@@ -368,6 +368,71 @@ SEPAL_TEST(attack_shapes, a_call_at_exactly_the_limits_runs_and_one_over_is_refu
     }
 }
 
+// ---- very long rows ----
+
+SEPAL_TEST(attack_shapes, rows_of_8k_and_16k_tokens_against_the_reference_and_split_in_pieces) {
+    for (const std::size_t total : {std::size_t{8192}, std::size_t{16384}}) {
+        Knobs k;
+        k.max_tokens = 16384;
+        k.max_rows = 8;
+        k.slots = 16;
+        k.budget_mib = 256;
+        auto e32 = make_engine(k);
+        k.precision = Precision::F16;
+        auto e16 = make_engine(k);
+        World world;
+        Rng rng(total);
+        const auto all = tokens(rng, total);
+        std::vector<std::size_t> at;
+        for (std::size_t i = 0; i < 12; ++i) at.push_back(rng.below(total));
+        at.push_back(0);
+        at.push_back(total - 1);
+        at.push_back(total / 2);
+        const EngineRow one = make_row(all, at);
+        const World::Checked c = world.run_checked(*e32, {one}, false);
+        // The same tokens in pieces of 4096 / 1000 continuing snapshots, readouts at the same offsets.
+        for (const std::size_t piece : {std::size_t{4096}, std::size_t{1000}}) {
+            for (CudaEngine* e : {e32.get(), e16.get()}) {
+                std::vector<std::vector<float>> got(at.size());
+                DeviceSnapshot prev;
+                for (std::size_t from = 0; from < total; from += piece) {
+                    const std::size_t to = std::min(total, from + piece);
+                    std::vector<std::size_t> local, which;
+                    for (std::size_t i = 0; i < at.size(); ++i) {
+                        if (at[i] >= from && at[i] < to) {
+                            local.push_back(at[i] - from);
+                            which.push_back(i);
+                        }
+                    }
+                    EngineRow r = make_row({all.begin() + static_cast<std::ptrdiff_t>(from), all.begin() + static_cast<std::ptrdiff_t>(to)}, local, to < total);
+                    if (prev.valid()) r.parent = prev;
+                    const auto res = run(*e, {r});
+                    for (std::size_t j = 0; j < which.size(); ++j) {
+                        got[which[j]].assign(res[0].hidden.begin() + static_cast<std::ptrdiff_t>(j * 24), res[0].hidden.begin() + static_cast<std::ptrdiff_t>((j + 1) * 24));
+                    }
+                    prev = res[0].snapshot;
+                }
+                double worst = 0;
+                for (std::size_t i = 0; i < at.size(); ++i) {
+                    worst = std::max(worst, hidden_distance(got[i], std::vector<float>(c.got[0].hidden.begin() + static_cast<std::ptrdiff_t>(i * 24), c.got[0].hidden.begin() + static_cast<std::ptrdiff_t>((i + 1) * 24))));
+                }
+                std::cout << "  " << total << " tokens, " << name_of(e == e32.get() ? Precision::F32 : Precision::F16) << " in pieces of " << piece << " vs the float32 one-shot row: largest difference " << worst << "\n";
+                CHECK(worst <= (e == e32.get() ? 5e-4 : kF16Bar));
+            }
+        }
+        std::cout << "  " << total << " tokens, float32 one row vs the CPU reference at " << at.size() << " positions: " << c.worst << "\n";
+        CHECK(c.worst <= kF32Bar);
+        const auto g16 = run(*e16, {one});
+        double d16 = 0;
+        for (std::size_t i = 0; i < at.size(); ++i) {
+            d16 = std::max(d16, hidden_distance(std::vector<float>(g16[0].hidden.begin() + static_cast<std::ptrdiff_t>(i * 24), g16[0].hidden.begin() + static_cast<std::ptrdiff_t>((i + 1) * 24)),
+                                                std::vector<float>(c.got[0].hidden.begin() + static_cast<std::ptrdiff_t>(i * 24), c.got[0].hidden.begin() + static_cast<std::ptrdiff_t>((i + 1) * 24))));
+        }
+        std::cout << "  " << total << " tokens, float16 one row vs float32 one row: " << d16 << "\n";
+        CHECK(d16 <= kF16Bar);
+    }
+}
+
 // ---- positions ----
 
 SEPAL_TEST(attack_shapes, start_positions_far_out_restarting_and_at_the_edge_of_the_range) {

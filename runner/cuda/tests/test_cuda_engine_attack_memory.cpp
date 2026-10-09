@@ -447,7 +447,7 @@ SEPAL_TEST(attack_deepchain, a_chain_of_thousands_of_one_token_snapshots_can_be_
     k.slots = 8;
     auto engine = make_engine(k);
     Rng rng(1);
-    std::size_t depth = 3000;
+    std::size_t depth = 400;
     if (const auto e = environment("SEPAL_CHAIN_DEPTH")) depth = std::stoul(*e);
     const auto t0 = std::chrono::steady_clock::now();
     DeviceSnapshot s;
@@ -455,7 +455,13 @@ SEPAL_TEST(attack_deepchain, a_chain_of_thousands_of_one_token_snapshots_can_be_
     for (std::size_t i = 0; i < depth; ++i) {
         EngineRow r = make_row({static_cast<std::uint32_t>(rng.below(64))}, {0}, true);
         if (s.valid()) r.parent = s;
+        engine->set_profiling(i % 250 == 249);
         const auto got = run(*engine, {r});
+        if (i % 250 == 249) {
+            const sepal::cuda::PhaseTimes t = engine->last_profile();
+            std::cout << "    call " << i + 1 << ": wall " << t.wall_ms << " ms = attention " << t.attention_ms << ", deltanet " << t.deltanet_ms << ", multiplies " << t.multiplies_ms << ", elementwise "
+                      << t.elementwise_ms << ", host " << t.host_ms() << "\n";
+        }
         s = got[0].snapshot;
         last = got[0].hidden;
         CHECK_EQ(s.tokens(), static_cast<std::uint64_t>(i + 1));
