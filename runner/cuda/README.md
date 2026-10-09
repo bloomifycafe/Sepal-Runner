@@ -393,6 +393,17 @@ No row is an outlier (the largest |Δp| is under 2.2 times the 99th percentile i
 differences sit at question 1 of a few alerts in every configuration: those are the prompts nearest the decision boundary. The
 CPU float32 reference, on alerts 0 and 63 (1,723 tokens, 528 s, 0.31 s per token): 1.7e-6 from transformers in probability,
 3.1e-5 in hidden state; the float32 engine is 2.1e-6 / 3.3e-5 from it and the float16 engine 9.6e-4 / 7.8e-3.
+Soaks (seeded; the seed is printed first and `SEPAL_SOAK_SEED` replays the requests). Tiny geometry, six engines on the same
+random requests (parent rows in any order, stored snapshots, explicit positions, readouts, captures, kept and released
+snapshots, small-pool engines that now and then refuse a call): 22 minutes, seed 20261010, 20,195 calls, 205,388 rows,
+3,484,404 tokens, 71,513 snapshots kept: 0 failures; the float32 engine is within 3.7e-3 of the CPU reference (rows of one to a
+few tokens through random weights amplify rounding; the engine and the reference are equally far from float64 there) and the
+two strict engines (small pools against roomy pools, other rows spliced in, last-layer pruning off) are bit-identical on all
+120,444 compared rows. A first run (seed 20261009, 21,129 calls) agreed on every strict row (126,082 of 126,082). On the real model
+(`real_soak`, requests cut from the workload's own text, seed 778, 150 s per phase): 3,204 calls, 10,315 rows, 699,275 tokens
+with the float16 strict engines bit-identical on 7,704 of 7,704 read-out rows (1,345 calls refused by the small-pool engine);
+then 759 calls, 7,516 rows, 470,635 tokens float32 against float16 natural, 5,622 read-outs, largest hidden difference 8.6e-2
+and 2 answer flips, both at p = 0.5 within 4e-4.
 Rows of 8,192 and 16,384 tokens, whole against pieces of 1,024 to 4,096 tokens continuing snapshots, twelve read-outs each:
 float32 within 6.7e-5, float16 within 1.5e-2 (|Δp| 6.6e-4); float16 against float32 at 8,192 tokens within 1.4e-3 relative L2.
 
