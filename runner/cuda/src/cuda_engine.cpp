@@ -282,6 +282,7 @@ struct CudaEngine::Impl {
     char* q = nullptr;       // normed, rotated queries [cap, attn_width], K/V type
     char* a1c = nullptr;     // the last layer's norm output for the rows that are read out [cap_compact, H], operand type
     float* xc = nullptr;     // their residual stream [cap_compact, H]
+    float* qg = nullptr;     // strict mode: their queries and gates, gathered from the full multiply [cap_compact, 2 * attn_width]
     std::size_t cap_compact = 0;
     char* tables = nullptr;  // row tables of one call
 
@@ -446,6 +447,7 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
     take(cap_rows * std::max<std::size_t>(attn_width, 8) * elem_bytes, q);
     take(cap_compact * H * elem_bytes, a1c);
     take(cap_compact * H * 4, xc);
+    take(options.gemm_rows != 0 && attn_layers != 0 ? cap_compact * 2 * attn_width * 4 : 0, qg);
     take(kTableBytes, tables);
     used += kCublasWorkspace; // taken last: its address is call_memory + used - workspace
     return used;
@@ -986,15 +988,21 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             const AttentionRows full_rows{d_spans, d_descs, reinterpret_cast<const KvSegment*>(tables + off_segments[w.kind_index]),
                                           nullptr, u32(rows.size()), max_row_tokens};
             const AttentionRows u_rows{d_spans_u, d_descs_u, d_segs_u, nullptr, u32(ru), 1};
-            const char* w_kv = static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes;
+            // Strict mode: the multiply must be the very one the full pass runs (same width), because a multiply's bits can depend on
+            // its width and a row's bits must not depend on whether the pass is pruned (which depends on the other rows of the call).
+            // So all of q, gate, k and v are multiplied for every token and only the rows that are read out are kept (gathered below).
+            // Natural mode multiplies keys and values only here and the queries and gates of the read-out tokens further down.
+            const bool strict = options.gemm_rows != 0;
+            const char* w_kv = static_cast<const char*>(w.mixer_in) + (strict ? 0 : 2 * attn_width * H * elem_bytes);
+            const std::size_t kv_at = strict ? 2 * attn_width : 0; // column of the keys in the multiply's output
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded); // keys and values of every token
+                gemm(a1, H, w_kv, strict ? attn_in_width : 2 * attn_kv_width, H, p, p_width, padded); // keys and values of every token
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
-                launch_attention_prepare(attn_shape, full_rows, attn_elem, FloatBand{nullptr, 0}, FloatBand{p, p_width},
-                                         FloatBand{p + attn_kv_width, p_width}, w.q_norm, w.k_norm, ElemMatrix{nullptr, 0}, stream,
+                launch_attention_prepare(attn_shape, full_rows, attn_elem, FloatBand{nullptr, 0}, FloatBand{p + kv_at, p_width},
+                                         FloatBand{p + kv_at + attn_kv_width, p_width}, w.q_norm, w.k_norm, ElemMatrix{nullptr, 0}, stream,
                                          PreparePart::KeysValuesOnly);
             }
             {
@@ -1005,14 +1013,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                     check_cuda(cudaMemsetAsync(a3 + ru * I * elem_bytes, 0, (padded_u - ru) * I * elem_bytes, stream), "cudaMemsetAsync");
                 }
                 launch_gather_rows(a1, H * elem_bytes, d_upos, ru, H * elem_bytes, a1c, H * elem_bytes, stream);
+                if (strict) launch_gather_rows(p, p_width * 4, d_upos, ru, 2 * attn_width * 4, qg, 2 * attn_width * 4, stream);
             }
-            {
+            if (!strict) {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u); // queries and gates of the read-out tokens
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
-                const FloatBand q_gate{p, p_width};
+                const FloatBand q_gate = strict ? FloatBand{qg, 2 * attn_width} : FloatBand{p, p_width};
                 launch_attention_prepare(attn_shape, u_rows, attn_elem, q_gate, FloatBand{nullptr, 0}, FloatBand{nullptr, 0}, w.q_norm,
                                          w.k_norm, ElemMatrix{q, attn_width}, stream, PreparePart::QueriesOnly);
                 launch_attention(attn_shape, u_rows, attn_elem, AttentionPath::Auto, ConstElemMatrix{q, attn_width}, q_gate,
