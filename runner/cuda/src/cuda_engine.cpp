@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -211,6 +212,7 @@ using TensorSource = std::function<HostTensor(const std::string&)>;
 struct Q8Matrix {
     const signed char* w = nullptr;
     const float* scale = nullptr;
+    const float* smooth = nullptr; // 1 / s[k] per input channel (Int8Smoothing), or null
 };
 
 // The device copy of every tensor, as pointers into one allocation.
@@ -308,6 +310,26 @@ struct CudaEngine::Impl {
     std::size_t aq_width = 0;
     DeviceBuffer<char> q8_scratch; // binary16 copy of one matrix while it is quantised at creation
     std::size_t q8_scratch_bytes = 0;
+    bool smoothing = false;        // q8.smoothing is active
+    // Calibration (EngineOptions::collect_activation_stats): per layer and group, K floats of largest |x| and 2K doubles of sums.
+    bool collecting = false;
+    struct StatSlot {
+        std::size_t k = 0, amax_at = 0, sums_at = 0;
+        std::uint64_t rows = 0;
+    };
+    std::vector<std::array<StatSlot, ActivationStats::kGroups>> stat_slots;
+    DeviceBuffer<float> stat_amax;
+    DeviceBuffer<double> stat_sums;
+    std::size_t group_k(std::size_t layer, std::size_t group) const {
+        return group == 0 || group == 2 ? H : group == 1 ? I : (config.is_full_attention(layer) ? attn_width : value_dim);
+    }
+    void observe(std::size_t layer, std::size_t group, const void* in, std::size_t ld, std::size_t rows) {
+        if (!collecting || rows == 0) return;
+        StatSlot& slot = stat_slots[layer][group];
+        launch_channel_stats(in, ld, rows, slot.k, stat_amax.data() + slot.amax_at, stat_sums.data() + slot.sums_at, stream);
+        slot.rows += rows;
+    }
+    std::vector<float> smoothing_factors(std::size_t layer, std::size_t group, std::size_t rows, std::size_t K);
     static bool own_kernel_takes(std::size_t n, std::size_t k, std::size_t ld_in, std::size_t ld_out) { return gemm_nt_supports(n, k, ld_in, k, ld_out); }
 
     std::shared_ptr<Pools> pools;
@@ -433,9 +455,10 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
 
     // Several tensors stacked row after row into one [rows, K] matrix and quantised to int8 per row (Int8Multiply).
     const S8WeightLayout q8_layout = q8.int8_activations ? S8WeightLayout::Plain : S8WeightLayout::Fp16Pairs;
-    const auto put_q8 = [&](const std::vector<std::string>& names, std::size_t rows, std::size_t K) {
+    const auto put_q8 = [&](const std::vector<std::string>& names, std::size_t rows, std::size_t K, std::size_t layer, std::size_t group) {
         char* wq = carve.take(rows * K);
         char* sc = carve.take(rows * 4);
+        char* sm = smoothing ? carve.take(K * 4) : nullptr;
         std::size_t at = 0;
         for (const std::string& name : names) {
             const HostTensor t = source(name);
@@ -445,10 +468,22 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         if (at != rows * K) throw std::invalid_argument("weights: tensors " + names.front() + " ... have " + std::to_string(at) + " elements, expected " +
                                                          std::to_string(rows * K));
         if (!dry) {
-            launch_quantize_weights_s8(q8_scratch.data(), K, wq, reinterpret_cast<float*>(sc), rows, K, q8_layout, stream);
+            if (smoothing) {
+                // s[k] from the calibration statistics and this matrix's column maxima; the weights are scaled by s, the activations by 1 / s.
+                const std::vector<float> s_k = smoothing_factors(layer, group, rows, K);
+                std::vector<float> inv(K);
+                for (std::size_t k = 0; k < K; ++k) inv[k] = 1.0f / s_k[k];
+                // In stream order: a copy from pageable memory on the legacy stream may still be in flight when a kernel of this stream starts.
+                const DeviceBuffer<float> d_s(K);
+                check_cuda(cudaMemcpyAsync(d_s.data(), s_k.data(), K * 4, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync", "smoothing factors");
+                check_cuda(cudaMemcpyAsync(sm, inv.data(), K * 4, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync", "smoothing factors");
+                launch_quantize_weights_s8(q8_scratch.data(), K, wq, reinterpret_cast<float*>(sc), rows, K, q8_layout, stream, d_s.data());
+            } else {
+                launch_quantize_weights_s8(q8_scratch.data(), K, wq, reinterpret_cast<float*>(sc), rows, K, q8_layout, stream);
+            }
             check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "weight quantisation");
         }
-        return Q8Matrix{reinterpret_cast<const signed char*>(wq), reinterpret_cast<const float*>(sc)};
+        return Q8Matrix{reinterpret_cast<const signed char*>(wq), reinterpret_cast<const float*>(sc), reinterpret_cast<const float*>(sm)};
     };
 
     weights.embedding = put({std::string(embedding_name)}, operand, dim(config.vocab_size) * H);
@@ -464,9 +499,9 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         if (w.attention) {
             const std::string a = pre + "self_attn.";
             w.kind_index = attn_seen++;
-            if (q8.mixer_in) w.q_mixer_in = put_q8({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, attn_in_width, H);
+            if (q8.mixer_in) w.q_mixer_in = put_q8({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, attn_in_width, H, l, 2);
             else w.mixer_in = put({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, operand, attn_in_width * H);
-            if (q8.mixer_out) w.q_mixer_out = put_q8({a + "o_proj.weight"}, H, attn_width);
+            if (q8.mixer_out) w.q_mixer_out = put_q8({a + "o_proj.weight"}, H, attn_width, l, 3);
             else w.mixer_out = put({a + "o_proj.weight"}, operand, H * attn_width);
             w.q_norm = reinterpret_cast<const float*>(put({a + "q_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
             w.k_norm = reinterpret_cast<const float*>(put({a + "k_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
@@ -474,13 +509,13 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
             const std::string d = pre + "linear_attn.";
             w.kind_index = dn_seen++;
             if (q8.mixer_in) {
-                w.q_mixer_in = put_q8({d + "in_proj_qkv.weight", d + "in_proj_z.weight"}, conv_dim + value_dim, H);
+                w.q_mixer_in = put_q8({d + "in_proj_qkv.weight", d + "in_proj_z.weight"}, conv_dim + value_dim, H, l, 2);
                 w.dn_ba = put({d + "in_proj_b.weight", d + "in_proj_a.weight"}, operand, 2 * dim(config.dn_value_heads) * H);
             } else {
                 w.mixer_in = put({d + "in_proj_qkv.weight", d + "in_proj_z.weight", d + "in_proj_b.weight", d + "in_proj_a.weight"},
                                  operand, dn_in_width * H);
             }
-            if (q8.mixer_out) w.q_mixer_out = put_q8({d + "out_proj.weight"}, H, value_dim);
+            if (q8.mixer_out) w.q_mixer_out = put_q8({d + "out_proj.weight"}, H, value_dim, l, 3);
             else w.mixer_out = put({d + "out_proj.weight"}, operand, H * value_dim);
             w.deltanet.conv = reinterpret_cast<const float*>(put({d + "conv1d.weight"}, DType::F32, conv_dim * dim(config.conv_kernel)));
             w.deltanet.a_log = reinterpret_cast<const float*>(put({d + "A_log"}, DType::F32, dim(config.dn_value_heads)));
@@ -488,9 +523,9 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
             w.deltanet.norm = reinterpret_cast<const float*>(put({d + "norm.weight"}, DType::F32, dim(config.dn_value_head_dim)));
         }
         const std::string mlp = pre + "mlp.";
-        if (q8.gate_up) w.q_gate_up = put_q8({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, 2 * I, H);
+        if (q8.gate_up) w.q_gate_up = put_q8({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, 2 * I, H, l, 0);
         else w.gate_up = put({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, operand, 2 * I * H);
-        if (q8.down) w.q_down = put_q8({mlp + "down_proj.weight"}, H, I);
+        if (q8.down) w.q_down = put_q8({mlp + "down_proj.weight"}, H, I, l, 1);
         else w.down = put({mlp + "down_proj.weight"}, operand, H * I);
     }
     used = carve.used();
@@ -556,6 +591,27 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
         if (fa.flush_k % 32 != 0) throw std::invalid_argument("EngineOptions: fp16_accumulate.flush_k must be a multiple of 32");
         // int8 multiplies (Int8Multiply): the float16 path only, and the kernels' shape requirements for every group chosen.
         q8 = options.int8_multiply;
+        smoothing = q8.smoothing.active();
+        collecting = options.collect_activation_stats;
+        if (smoothing) {
+            const Int8Smoothing& sm = q8.smoothing;
+            if (!q8.any() || !q8.int8_activations) throw std::invalid_argument("EngineOptions: int8_multiply.smoothing needs int8 activations (W8A8) and a group");
+            if (!(sm.alpha >= 0.0f && sm.alpha <= 1.0f)) throw std::invalid_argument("EngineOptions: int8_multiply.smoothing.alpha must be in [0, 1]");
+            if (sm.stats->layers.size() != layers || sm.stats->tokens.size() != layers) {
+                throw std::invalid_argument("EngineOptions: int8_multiply.smoothing: the statistics are for " + std::to_string(sm.stats->layers.size()) + " layers, the model has " +
+                                            std::to_string(layers));
+            }
+            for (std::size_t l = 0; l < layers; ++l) {
+                for (std::size_t g = 0; g < ActivationStats::kGroups; ++g) {
+                    const ChannelStats& c = sm.stats->layers[l][g];
+                    if (c.amax.size() != group_k(l, g) || c.mean_abs.size() != c.amax.size() || c.rms.size() != c.amax.size()) {
+                        throw std::invalid_argument("EngineOptions: int8_multiply.smoothing: the statistics of layer " + std::to_string(l) + " group " + std::to_string(g) +
+                                                    " have the wrong number of channels for this model");
+                    }
+                }
+            }
+        }
+        if (collecting && !half) throw std::invalid_argument("EngineOptions: collect_activation_stats needs the float16 path");
         if (q8.any()) {
             if (!half) throw std::invalid_argument("EngineOptions: int8_multiply needs the float16 path");
             const auto check_shape = [&](bool on, std::size_t n_, std::size_t k_, std::size_t ld_in, std::size_t ld_out, const char* what) {
@@ -702,6 +758,22 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     const std::size_t kv_bytes = (remaining - slot_pool_bytes) / kAlign * kAlign;
 
     pools = std::make_shared<Pools>();
+    if (collecting) {
+        stat_slots.assign(layers, {});
+        std::size_t stat_total = 0;
+        for (std::size_t l = 0; l < layers; ++l) {
+            for (std::size_t g = 0; g < ActivationStats::kGroups; ++g) {
+                stat_slots[l][g].k = group_k(l, g);
+                stat_slots[l][g].amax_at = stat_total;
+                stat_slots[l][g].sums_at = 2 * stat_total;
+                stat_total += group_k(l, g);
+            }
+        }
+        stat_amax = DeviceBuffer<float>(stat_total);
+        stat_sums = DeviceBuffer<double>(2 * stat_total);
+        check_cuda(cudaMemsetAsync(stat_amax.data(), 0, stat_total * sizeof(float), stream), "cudaMemsetAsync", "statistics");
+        check_cuda(cudaMemsetAsync(stat_sums.data(), 0, 2 * stat_total * sizeof(double), stream), "cudaMemsetAsync", "statistics");
+    }
     {
         DeviceBuffer<char> staging(kUploadChunk);
         weight_memory = DeviceBuffer<char>(weights_bytes);
@@ -745,6 +817,25 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
 }
 
+// The smoothing factors of one matrix, whose binary16 weights ([rows, K]) are in q8_scratch: s[k] = a[k]^alpha / w[k]^(1 - alpha).
+std::vector<float> CudaEngine::Impl::smoothing_factors(std::size_t layer, std::size_t group, std::size_t rows, std::size_t K) {
+    const Int8Smoothing& sm = q8.smoothing;
+    const ChannelStats& c = sm.stats->layers[layer][group];
+    const std::vector<float>& a = sm.statistic == Int8Smoothing::Statistic::Max ? c.amax : sm.statistic == Int8Smoothing::Statistic::MeanAbs ? c.mean_abs : c.rms;
+    DeviceBuffer<float> wmax(K);
+    launch_column_absmax(q8_scratch.data(), K, wmax.data(), rows, K, stream);
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "column maxima");
+    const std::vector<float> w = wmax.download();
+    std::vector<float> out(K, 1.0f);
+    const double alpha = static_cast<double>(sm.alpha);
+    for (std::size_t k = 0; k < K; ++k) {
+        if (!(a[k] > 0.0f) || !(w[k] > 0.0f) || !std::isfinite(a[k])) continue;
+        const double v = std::pow(static_cast<double>(a[k]), alpha) / std::pow(static_cast<double>(w[k]), 1.0 - alpha);
+        if (v > 1e-6 && v < 1e6) out[k] = static_cast<float>(v);
+    }
+    return out;
+}
+
 // Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: `rows` is a multiple of
 // gemm_rows and the multiply is cut into blocks of exactly that many rows (the call buffers hold zero rows up to the
 // next multiple, so the last block is a full one).
@@ -756,7 +847,7 @@ void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, st
         const signed char* wq = qm->w + q_row0 * k;
         const float* sw = qm->scale + q_row0;
         if (q8.int8_activations) {
-            launch_quantize_rows_s8(in, ld_in, aq, k, asc, rows, k, stream);
+            launch_quantize_rows_s8(in, ld_in, aq, k, asc, rows, k, stream, qm->smooth);
             launch_gemm_s8(aq, k, asc, wq, k, sw, out, ld_out, out_half, rows, n, k, -1, stream);
         } else {
             launch_gemm_w8a16(in, ld_in, wq, k, sw, out, ld_out, out_half, rows, n, k, -1, stream);
@@ -1180,6 +1271,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             const char* w_kv = w.mixer_in != nullptr ? static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes : nullptr;
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 2, a1, H, n);
                 gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded, false, fa.mixer_in, qp(w.q_mixer_in), 2 * attn_width); // keys and values of every token
             }
             {
@@ -1211,6 +1303,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 3, a2, mix_width, ru);
                 gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, false, fa.mixer_out, qp(w.q_mixer_out));
             }
             {
@@ -1220,6 +1313,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 0, a1c, H, ru);
                 gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up, fa.gate_up, qp(w.q_gate_up));
             }
             {
@@ -1228,6 +1322,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 1, a3, I, ru);
                 gemm(a3, I, w.down, H, I, m, H, padded_u, false, fa.down, qp(w.q_down));
             }
             {
@@ -1239,6 +1334,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         if (!w.attention) {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 2, a1, H, n);
                 if (w.q_mixer_in.w != nullptr) {
                     // int8: [mixed, z]; the b and a rows stay binary16 (own kernel, float32 accumulators)
                     gemm(a1, H, nullptr, conv_dim + value_dim, H, p, p_width, padded, false, false, &w.q_mixer_in);
@@ -1263,11 +1359,13 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 3, a2, mix_width, n);
                 gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, false, fa.mixer_out, qp(w.q_mixer_out));
             }
         } else {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 2, a1, H, n);
                 if (options.gemm_rows != 0 && !invariant_all && l + 1 == layers) {
                     // Strict mode, last layer, which a pruned call computes as two multiplies (keys and values of every token; queries
                     // and gates of the read-out tokens): an unpruned call must run the very same multiplies, or the keys and values it
@@ -1295,6 +1393,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
+                observe(l, 3, a2, mix_width, n);
                 gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, false, fa.mixer_out, qp(w.q_mixer_out));
             }
         }
@@ -1304,6 +1403,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
+            observe(l, 0, a1, H, n);
             gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up, fa.gate_up, qp(w.q_gate_up));
         }
         {
@@ -1312,6 +1412,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
+            observe(l, 1, a3, I, n);
             gemm(a3, I, w.down, H, I, m, H, padded, false, fa.down, qp(w.q_down));
         }
         {
@@ -1482,11 +1583,13 @@ SnapshotIdentity CudaEngine::Impl::identity() {
     }
     id.weight_fp = *weight_fp_cache;
     const Fp16Accumulate& fa = options.fp16_accumulate;
-    const std::vector<std::uint64_t> compute = {options.gemm_rows, options.fp16_gate_up ? 1u : 0u, static_cast<std::uint64_t>(options.multiply_path),
-                                                options.prune_last_layer ? 1u : 0u, fa.gate_up ? 1u : 0u, fa.down ? 1u : 0u,
-                                                fa.mixer_in ? 1u : 0u, fa.mixer_out ? 1u : 0u, fa.flush_k,
-                                                q8.gate_up ? 1u : 0u, q8.down ? 1u : 0u, q8.mixer_in ? 1u : 0u, q8.mixer_out ? 1u : 0u,
-                                                q8.int8_activations ? 1u : 0u};
+    std::vector<std::uint64_t> compute = {options.gemm_rows, options.fp16_gate_up ? 1u : 0u, static_cast<std::uint64_t>(options.multiply_path),
+                                            options.prune_last_layer ? 1u : 0u, fa.gate_up ? 1u : 0u, fa.down ? 1u : 0u,
+                                            fa.mixer_in ? 1u : 0u, fa.mixer_out ? 1u : 0u, fa.flush_k,
+                                            q8.gate_up ? 1u : 0u, q8.down ? 1u : 0u, q8.mixer_in ? 1u : 0u, q8.mixer_out ? 1u : 0u,
+                                            q8.int8_activations ? 1u : 0u};
+    // Smoothing changes the numbers: the factors themselves are in the weight memory (weight fingerprint); this says how they are applied.
+    if (smoothing) compute.insert(compute.end(), {1u, static_cast<std::uint64_t>(q8.smoothing.statistic), bits_of(static_cast<double>(q8.smoothing.alpha))});
     id.compute_fp = fingerprint_of(compute, 0xC0FFEEull);
     id.precision = half ? 0u : 1u;
     id.state_format = options.half_state ? 1u : 0u;
@@ -1668,6 +1771,35 @@ DeviceSnapshot CudaEngine::load(const std::filesystem::path& path) { return to_d
 std::uint64_t CudaEngine::state_saturations() const {
     std::lock_guard<std::mutex> lock(impl_->run_mutex);
     return impl_->saturations_seen;
+}
+
+ActivationStats CudaEngine::activation_stats() {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex);
+    Impl& e = *impl_;
+    if (!e.collecting) throw std::logic_error("CudaEngine::activation_stats: EngineOptions::collect_activation_stats is off");
+    check_cuda(cudaSetDevice(e.options.device), "cudaSetDevice");
+    check_cuda(cudaStreamSynchronize(e.stream), "cudaStreamSynchronize");
+    const std::vector<float> amax = e.stat_amax.download();
+    const std::vector<double> sums = e.stat_sums.download();
+    ActivationStats out;
+    out.layers.resize(e.layers);
+    out.tokens.resize(e.layers);
+    for (std::size_t l = 0; l < e.layers; ++l) {
+        for (std::size_t g = 0; g < ActivationStats::kGroups; ++g) {
+            const Impl::StatSlot& slot = e.stat_slots[l][g];
+            ChannelStats& c = out.layers[l][g];
+            const double n = static_cast<double>(std::max<std::uint64_t>(slot.rows, 1));
+            c.amax.assign(amax.begin() + static_cast<std::ptrdiff_t>(slot.amax_at), amax.begin() + static_cast<std::ptrdiff_t>(slot.amax_at + slot.k));
+            c.mean_abs.resize(slot.k);
+            c.rms.resize(slot.k);
+            for (std::size_t k = 0; k < slot.k; ++k) {
+                c.mean_abs[k] = static_cast<float>(sums[slot.sums_at + k] / n);
+                c.rms[k] = static_cast<float>(std::sqrt(sums[slot.sums_at + slot.k + k] / n));
+            }
+            out.tokens[l][g] = slot.rows;
+        }
+    }
+    return out;
 }
 
 std::uint64_t CudaEngine::weight_fingerprint() {

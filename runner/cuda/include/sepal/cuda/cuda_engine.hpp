@@ -50,6 +50,7 @@
 // strict mode then needs no padding (any gemm_rows > 0 just means strict), and natural mode is invariant too.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -90,6 +91,40 @@ struct Fp16Accumulate {
     unsigned flush_k = 128; // own kernel only: a multiple of 32
 };
 
+/// What the activations that feed the four multiply groups look like, channel by channel, over the tokens an engine has run
+/// (EngineOptions::collect_activation_stats, CudaEngine::activation_stats): the input of the MLP's gate/up (group 0), of its
+/// down projection (1), of the mixers' input projections (2) and of their output projections (3), for every layer. Calibration
+/// data for Int8Smoothing; from a model's float16 engine run over prompts that are not the ones it is judged on.
+struct ChannelStats {
+    std::vector<float> amax;     // largest |x| of the channel
+    std::vector<float> mean_abs; // mean |x|
+    std::vector<float> rms;      // root of the mean of x^2
+};
+struct ActivationStats {
+    static constexpr std::size_t kGroups = 4; // gate_up, down, mixer_in, mixer_out
+    std::vector<std::array<ChannelStats, kGroups>> layers;
+    std::vector<std::array<std::uint64_t, kGroups>> tokens; // rows the statistics of each (layer, group) are over
+};
+
+/// The statistics as a file (a header, the numbers and a hash over them). `save` writes under a temporary name and renames;
+/// `load` treats the file as untrusted and throws std::invalid_argument for anything wrong with it, std::runtime_error for I/O.
+void save_activation_stats(const ActivationStats& stats, const std::filesystem::path& path);
+ActivationStats load_activation_stats(const std::filesystem::path& path);
+
+/// Static per-input-channel smoothing of the int8-activation multiplies (SmoothQuant): a fixed factor s[k] per input channel k of
+/// each multiply; the activation is divided by it before it is quantised and the weight column multiplied by it before the
+/// weights are, so the product is unchanged and the large channels no longer set every row's scale. s[k] = a[k]^alpha / w[k]^(1 -
+/// alpha), a[k] the chosen statistic of the channel over the calibration tokens, w[k] the largest |weight| of the column
+/// (a channel with a zero statistic gets s = 1). The factors are derived when the engine is created, are kept in the weight
+/// memory (so the weight fingerprint covers them) and cost the multiply nothing: the division is part of the row-quantise pass.
+struct Int8Smoothing {
+    enum class Statistic { Max, MeanAbs, Rms };
+    std::shared_ptr<const ActivationStats> stats; // null: no smoothing
+    float alpha = 0.5f;
+    Statistic statistic = Statistic::Max;
+    bool active() const { return stats != nullptr; }
+};
+
 /// Which multiplies of the float16 path run on int8 weights (README.md, "int8 multiplies"). The weights of a selected group
 /// are quantised when the engine is created, per output channel and symmetrically (scale = max |w| / 127), straight from the
 /// checkpoint's values; the binary16 copy is not kept, so those weights take half the memory. The engine's own kernels do the
@@ -107,6 +142,7 @@ struct Int8Multiply {
     bool mixer_in = false;  // the DeltaNet and attention input projections (not in_proj_b / in_proj_a)
     bool mixer_out = false; // the DeltaNet and attention output projections
     bool int8_activations = true;
+    Int8Smoothing smoothing; // W8A8 only
     bool any() const { return gate_up || down || mixer_in || mixer_out; }
 };
 
@@ -139,6 +175,9 @@ struct EngineOptions {
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;
+    /// Float16 path only: keep the per-channel statistics of the activations of the four multiply groups while calls run
+    /// (CudaEngine::activation_stats). Calibration for Int8Smoothing; slows a call down. Off by default.
+    bool collect_activation_stats = false;
     /// Compute the last layer's queries, attention, output projection and MLP only for the tokens that are read out
     /// (its keys and values are still computed for every token). The last layer is always a full-attention layer.
     bool prune_last_layer = true;
@@ -336,6 +375,9 @@ public:
     /// Hash of the weights as they sit on the device (what goes into a snapshot file as the weight fingerprint). Computed on
     /// first use, a few milliseconds.
     std::uint64_t weight_fingerprint();
+    /// The statistics collected so far (EngineOptions::collect_activation_stats; std::logic_error when it is off). Deterministic:
+    /// the same calls give the same bits.
+    ActivationStats activation_stats();
 
     /// While on, every phase of a call is timed with the stream synchronised around it (which slows the call
     /// down); last_profile() then has the times of the last call. Off by default.

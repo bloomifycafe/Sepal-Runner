@@ -302,4 +302,27 @@ std::vector<BasicTensor<T>> reference_ladder(const ModelConfig& config, const We
     return ladder;
 }
 
+/// Calibration statistics of an engine's float16 run over random tokens (EngineOptions::collect_activation_stats): what
+/// Int8Smoothing needs for a geometry that has no real calibration set. `salt` changes the tokens.
+inline std::shared_ptr<const sepal::cuda::ActivationStats> collect_stats(const ModelConfig& config, const Weights<float>& weights, std::uint64_t salt = 1,
+                                                                         std::size_t rows = 6, std::size_t length = 90) {
+    sepal::cuda::EngineOptions o;
+    o.precision = sepal::cuda::Precision::F16;
+    o.collect_activation_stats = true;
+    o.memory_budget_bytes = std::size_t{192} << 20;
+    o.max_call_tokens = 4096;
+    o.max_call_rows = 64;
+    o.state_slots = 64;
+    sepal::cuda::CudaEngine engine(config, weights, o);
+    Rng rng(salt * 7919 + 13);
+    std::vector<sepal::cuda::EngineRow> request(rows);
+    for (auto& r : request) {
+        r.token_ids.resize(length);
+        for (auto& t : r.token_ids) t = static_cast<std::uint32_t>(rng.below(static_cast<std::size_t>(config.vocab_size)));
+        r.readout_offsets = {length - 1};
+    }
+    (void)engine.run(std::span<const sepal::cuda::EngineRow>(request));
+    return std::make_shared<const sepal::cuda::ActivationStats>(engine.activation_stats());
+}
+
 } // namespace engine_test

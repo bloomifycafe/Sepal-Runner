@@ -726,3 +726,45 @@ SEPAL_TEST(snap_default_big, pool_snapshots_zero_takes_most_of_the_free_memory_a
     CHECK(m.reserved_bytes() <= m.device_free_at_start / 100 * 85);
     std::cout << "  pool_snapshots 0: reserved " << m.reserved_bytes() / (1 << 20) << " MiB of " << m.device_free_at_start / (1 << 20) << " MiB free, " << m.slots_total << " slots\n";
 }
+
+// Smoothing changes the numbers (the factors are in the weight memory, how they are applied is in the compute fingerprint): a snapshot
+// of a smoothed engine is refused by an engine with other statistics, another alpha or statistic, or none, and accepted by the same.
+SEPAL_TEST(snap_tiers, smoothed_int8_engines_do_not_mix_with_other_smoothing) {
+    ModelConfig cfg = tiny_test_config();
+    cfg.name = "tiny-int8-smooth";
+    cfg.dn_key_head_dim = 8;
+    cfg.dn_value_head_dim = 8;
+    cfg.hidden_size = 32;
+    cfg.intermediate_size = 48;
+    const Weights<float> weights = random_weights<float>(cfg, 6);
+    const auto stats = collect_stats(cfg, weights, 1);
+    const auto other_stats = collect_stats(cfg, weights, 2);
+    using sepal::cuda::Int8Smoothing;
+    const auto make = [&](const std::shared_ptr<const sepal::cuda::ActivationStats>& s, float alpha, Int8Smoothing::Statistic statistic) {
+        Knobs k;
+        k.precision = Precision::F16;
+        k.gemm_rows = 8;
+        k.slots = 32;
+        k.budget_mib = 96;
+        k.max_tokens = 1024;
+        EngineOptions o = options_of(k);
+        o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
+        o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+        o.int8_multiply.smoothing.stats = s;
+        o.int8_multiply.smoothing.alpha = alpha;
+        o.int8_multiply.smoothing.statistic = statistic;
+        return std::make_unique<CudaEngine>(cfg, weights, o);
+    };
+    const fs::path file = scratch_dir() / "smooth.snap";
+    const auto a = make(stats, 0.5f, Int8Smoothing::Statistic::Rms);
+    const DeviceSnapshot original = make_chain(*a, 3, 12);
+    const auto want = probe(*a, original, 4);
+    a->save(original, file);
+    CHECK(same_hidden(want, probe(*a, a->load(file), 4)));
+    CHECK(make(stats, 0.5f, Int8Smoothing::Statistic::Rms)->load(file).valid());         // the same smoothing: accepted
+    CHECK_THROWS(make(other_stats, 0.5f, Int8Smoothing::Statistic::Rms)->load(file), SnapshotFileError); // other statistics: other factors in the weights
+    CHECK_THROWS(make(stats, 0.6f, Int8Smoothing::Statistic::Rms)->load(file), SnapshotFileError);       // other alpha
+    CHECK_THROWS(make(stats, 0.5f, Int8Smoothing::Statistic::Max)->load(file), SnapshotFileError);       // other statistic
+    CHECK_THROWS(make(nullptr, 0.5f, Int8Smoothing::Statistic::Rms)->load(file), SnapshotFileError);     // none
+    fs::remove(file);
+}
