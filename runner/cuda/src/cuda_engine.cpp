@@ -544,7 +544,10 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     memory_stats.device_total = total;
     memory_stats.device_free_at_start = free_now;
     memory_stats.device_free_min = free_now;
-    std::size_t budget = options.memory_budget_bytes != 0 ? options.memory_budget_bytes : free_now / 100 * 85;
+    // No budget given: at most 85% of the free memory, and (pool_snapshots != 0) no more than the weights, the call buffers and
+    // pools for `pool_snapshots` snapshots need; that is settled below, once the weights and buffers are sized.
+    const bool auto_budget = options.memory_budget_bytes == 0;
+    std::size_t budget = !auto_budget ? options.memory_budget_bytes : free_now / 100 * 85;
     if (budget > free_now) {
         throw BudgetExceeded("the memory budget of " + mib(budget) + " is more than the " + mib(free_now) +
                              " free on the device");
@@ -571,12 +574,27 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
                              ") and the buffers of a call of " + std::to_string(options.max_call_tokens) + " tokens (" +
                              mib(call_needed) + "); raise the budget or lower max_call_tokens");
     }
+    const std::size_t slot_bytes_each = dn_layers * (state_conv_floats * state_elem + state_recurrent_floats * state_elem);
+    // Default sizing (no budget given, pool_snapshots != 0): pools for that many snapshots of pool_snapshot_tokens tokens, not for
+    // everything the card has free. state_slots, when given, replaces the count.
+    const bool sized_pools = auto_budget && options.pool_snapshots != 0;
+    if (sized_pools) {
+        const std::size_t n = std::max<std::size_t>(options.state_slots != 0 ? options.state_slots : options.pool_snapshots, 2);
+        const std::size_t slot_pool = dn_layers == 0 ? 0 : dn_layers * (align_up(n * state_conv_floats * state_elem) + align_up(n * state_recurrent_floats * state_elem));
+        const std::size_t wanted = floor_needed + slot_pool + n * kv_block_bytes(options.pool_snapshot_tokens) + kAlign;
+        budget = std::min(budget, wanted);
+        memory_stats.budget_bytes = budget;
+        if (floor_needed >= budget) {
+            throw BudgetExceeded("the free memory of the device (" + mib(free_now) + ") cannot hold the weights (" + mib(weights_bytes) + ") and the buffers of a call of " +
+                                 std::to_string(options.max_call_tokens) + " tokens (" + mib(call_needed) + "); lower max_call_tokens");
+        }
+    }
     // Pools: slots first (fixed size), the heap gets the rest.
     const std::size_t remaining = budget - floor_needed;
-    const std::size_t slot_bytes_each = dn_layers * (state_conv_floats * state_elem + state_recurrent_floats * state_elem);
     std::size_t slots = 0;
     if (dn_layers != 0) {
         slots = options.state_slots != 0 ? options.state_slots
+                : sized_pools            ? options.pool_snapshots
                                          : std::min<std::size_t>((remaining / 10 * 4) / std::max<std::size_t>(slot_bytes_each, 1), 4096);
         slots = std::max<std::size_t>(slots, 2);
     }
@@ -596,7 +614,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
         DeviceBuffer<char> staging(kUploadChunk);
         weight_memory = DeviceBuffer<char>(weights_bytes);
         // The padding between tensors is zero, so that the weights' fingerprint (snapshot files) is a function of the weights.
-        check_cuda(cudaMemset(weight_memory.data(), 0, weights_bytes), "cudaMemset", "weight memory");
+        // On the engine's stream, in front of the uploads: cudaMemset runs on the legacy stream, which a non-blocking stream does not wait for.
+        check_cuda(cudaMemsetAsync(weight_memory.data(), 0, weights_bytes, stream), "cudaMemsetAsync", "weight memory");
         std::size_t used = 0;
         place_weights(source, weight_memory.data(), staging, used);
     }
@@ -607,7 +626,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     call_bytes = call_needed;
     if (options.half_state) {
         saturation_counter = DeviceBuffer<unsigned>(1);
-        saturation_counter.zero();
+        check_cuda(cudaMemsetAsync(saturation_counter.data(), 0, sizeof(unsigned), stream), "cudaMemsetAsync", "saturation counter");
     }
     pools->slot_memory = DeviceBuffer<char>(slot_pool_bytes);
     pools->kv_memory = DeviceBuffer<char>(kv_bytes);
@@ -1216,7 +1235,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         unsigned count = 0;
         check_cuda(cudaMemcpy(&count, saturation_counter.data(), sizeof count, cudaMemcpyDeviceToHost), "cudaMemcpy", "saturation counter");
         saturations_seen += count;
-        if (count != 0) saturation_counter.zero();
+        if (count != 0) check_cuda(cudaMemsetAsync(saturation_counter.data(), 0, sizeof(unsigned), stream), "cudaMemsetAsync", "saturation counter");
     }
 
     // ---- results ----

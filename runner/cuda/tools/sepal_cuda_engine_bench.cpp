@@ -52,6 +52,7 @@ struct Options {
     std::size_t max_call_tokens = 16384;
     std::size_t budget_mib = 0;
     std::size_t state_slots = 0;
+    bool half_state = false;
     bool prune_last_layer = true;
     bool fp16_gate_up = true;
     sepal::cuda::Fp16Accumulate fp16_accumulate;
@@ -100,6 +101,8 @@ Options parse(int argc, char** argv) {
             o.budget_mib = std::stoul(value);
         } else if (flag == "--state-slots") {
             o.state_slots = std::stoul(value);
+        } else if (flag == "--half-state") { // keep the DeltaNet state of snapshots in binary16
+            o.half_state = value != "0";
         } else if (flag == "--fp16-gate-up") {
             o.fp16_gate_up = value != "0";
         } else if (flag == "--multiply-path") { // cublas (default) or invariant (the engine's own batch-invariant kernel)
@@ -289,6 +292,7 @@ int main(int argc, char** argv) {
         eo.max_call_rows = 16 * 9 + 16;
         eo.memory_budget_bytes = opt.budget_mib << 20;
         eo.state_slots = opt.state_slots;
+        eo.half_state = opt.half_state;
         eo.prune_last_layer = opt.prune_last_layer;
         eo.fp16_gate_up = opt.fp16_gate_up;
         eo.fp16_accumulate = opt.fp16_accumulate;

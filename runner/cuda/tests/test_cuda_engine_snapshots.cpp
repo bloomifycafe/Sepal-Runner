@@ -631,3 +631,51 @@ SEPAL_TEST(snap_fuzz, garbage_and_odd_files) {
         CHECK(f.refused(bad));
     }
 }
+
+// ---- snap_default: what the engine reserves when no budget is given ----
+
+SEPAL_TEST(snap_default, the_default_pools_hold_pool_snapshots_and_the_next_one_is_refused) {
+    for (const bool half_state : {false, true}) {
+        EngineOptions o; // all defaults but the storage: no budget, no slot count
+        o.half_state = half_state;
+        o.max_call_tokens = 4096;
+        CudaEngine engine(tiny_test_config(), tiny_weights(31), o);
+        const EngineMemory m = engine.memory();
+        CHECK_EQ(m.slots_total, std::size_t{64});
+        CHECK(m.reserved_bytes() < m.device_free_at_start / 2);
+        std::cout << "  " << (half_state ? "binary16" : "float32") << " state: reserved " << m.reserved_bytes() / 1024 << " KiB of " << m.device_free_at_start / (1 << 20)
+                  << " MiB free (budget " << m.budget_bytes / 1024 << " KiB)\n";
+        Rng rng(5);
+        std::vector<DeviceSnapshot> held;
+        for (int i = 0; i < 64; ++i) held.push_back(run(engine, {make_row(tokens(rng, 1000), {}, true)})[0].snapshot); // 1000 <= pool_snapshot_tokens
+        CHECK_THROWS(run(engine, {make_row(tokens(rng, 1000), {}, true)}), BudgetExceeded);
+        held.pop_back();
+        CHECK(run(engine, {make_row(tokens(rng, 1000), {}, true)})[0].snapshot.valid());
+        // A bigger count asked for explicitly.
+        EngineOptions big = o;
+        big.pool_snapshots = 200;
+        CudaEngine more(tiny_test_config(), tiny_weights(31), big);
+        CHECK_EQ(more.memory().slots_total, std::size_t{200});
+        // state_slots replaces the count.
+        EngineOptions few = o;
+        few.state_slots = 7;
+        CudaEngine seven(tiny_test_config(), tiny_weights(31), few);
+        CHECK_EQ(seven.memory().slots_total, std::size_t{7});
+        CHECK(seven.memory().reserved_bytes() < m.reserved_bytes());
+    }
+}
+
+SEPAL_TEST(snap_default_big, pool_snapshots_zero_takes_most_of_the_free_memory_as_before) {
+    if (!environment("SEPAL_BIG_ENGINE_TEST")) {
+        std::cout << "SKIPPED: real-model test; this engine takes 85% of the free device memory: set SEPAL_BIG_ENGINE_TEST=1 and hold the GPU lock\n";
+        return;
+    }
+    EngineOptions o;
+    o.pool_snapshots = 0;
+    o.max_call_tokens = 1024;
+    CudaEngine engine(tiny_test_config(), tiny_weights(31), o);
+    const EngineMemory m = engine.memory();
+    CHECK(m.reserved_bytes() > m.device_free_at_start / 100 * 80);
+    CHECK(m.reserved_bytes() <= m.device_free_at_start / 100 * 85);
+    std::cout << "  pool_snapshots 0: reserved " << m.reserved_bytes() / (1 << 20) << " MiB of " << m.device_free_at_start / (1 << 20) << " MiB free, " << m.slots_total << " slots\n";
+}

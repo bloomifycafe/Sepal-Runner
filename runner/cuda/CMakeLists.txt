@@ -238,18 +238,19 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_soak.cpp
   tests/test_cuda_engine_real_alerts.cpp
   tests/test_cuda_engine_snapshots.cpp
+  tests/test_cuda_engine_real_snapshots.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests src)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz snap_default snap_default_big real_half_state real_tiers soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
 # A real-model suite prints "SKIPPED: real-model ..." and exits 0 when its environment variables are not set; CTest
 # must show that as Skipped, not Passed (the parent project's `real` test does the same).
-foreach(suite real_long real_cpu real_diag real_soak real_alerts real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b)
   set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 endforeach()

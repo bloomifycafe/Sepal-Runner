@@ -15,7 +15,9 @@
 // keys and values of rows. `run` allocates nothing on the device; it takes slots and heap blocks from the pools and
 // gives them back, and when a call needs more than is free it throws BudgetExceeded before any work is done, and
 // the engine stays usable. Snapshots keep their slot and their keys and values (and, through the keys and values,
-// the rows they continue) alive; the last handle's destruction returns the memory.
+// the rows they continue) alive; the last handle's destruction returns the memory. Without a `memory_budget_bytes` the
+// engine takes the weights, the call buffers and pools for `pool_snapshots` snapshots (EngineOptions), not the free
+// memory of the card.
 //
 // Threads. `run` may be called from any number of threads on one engine: an internal mutex serialises the calls (one
 // call at a time uses the device; a second caller waits for the first and its results do not depend on the wait).
@@ -103,7 +105,8 @@ enum class MultiplyPath {
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
-    /// Device memory the engine may take altogether, weights included. 0 takes 85% of the memory free at creation.
+    /// Device memory the engine may take altogether, weights included. 0 sizes the pools for `pool_snapshots` snapshots (see
+    /// there) within 85% of the memory free at creation.
     std::size_t memory_budget_bytes = 0;
     /// 0 natural, T > 0 strict: see the header comment. In strict mode T should be a multiple of 8.
     std::size_t gemm_rows = 0;
@@ -133,6 +136,14 @@ struct EngineOptions {
     /// state see the rounding. README.md, "Snapshot density", has the measured cost. Off by default. Snapshot files record this
     /// setting and are refused by an engine with the other one.
     bool half_state = false;
+    /// What the engine reserves when `memory_budget_bytes` is 0: the weights, the call buffers, and pools for this many
+    /// snapshots of `pool_snapshot_tokens` tokens (a state slot and the keys and values of that many tokens each), but never
+    /// more than 85% of the free memory. A workload that needs more resident snapshots raises this, sets `state_slots`
+    /// or gives a budget; a call that does not fit still throws BudgetExceeded. 0 restores the earlier behaviour: take 85%
+    /// of the free memory (slots 40% of what is left after weights and buffers, keys and values the rest), whatever the
+    /// workload. Ignored when `memory_budget_bytes` is set. (With `state_slots` set and no budget, the count here is `state_slots`.)
+    std::size_t pool_snapshots = 64;
+    std::size_t pool_snapshot_tokens = 1024;
 };
 
 /// A parent that is another row of the same call, by its index in the call.
