@@ -296,13 +296,19 @@ struct CudaEngine::Impl {
     PhaseTimes profile;
     cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
 
-    ~Impl() {
+    // The stream, events and cuBLAS handle. Also called when the constructor fails: a destructor does not run for an
+    // object whose constructor threw, and the handle alone holds megabytes of device memory.
+    void release_handles() noexcept {
         if (stream != nullptr) cudaStreamSynchronize(stream);
         if (ev_start != nullptr) cudaEventDestroy(ev_start);
         if (ev_stop != nullptr) cudaEventDestroy(ev_stop);
         if (blas != nullptr) cublasDestroy(blas);
         if (stream != nullptr) cudaStreamDestroy(stream);
+        ev_start = ev_stop = nullptr;
+        blas = nullptr;
+        stream = nullptr;
     }
+    ~Impl() { release_handles(); }
 
     Impl(const ModelConfig& cfg, const TensorSource& source, const EngineOptions& opts);
 
@@ -508,6 +514,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     memory_stats.budget_bytes = budget;
 
+    try {
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
     check_cuda(cudaEventCreate(&ev_start), "cudaEventCreate");
     check_cuda(cudaEventCreate(&ev_stop), "cudaEventCreate");
@@ -576,6 +583,10 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     memory_stats.slot_bytes = slot_bytes_each;
     check_cuda(cudaMemGetInfo(&free_now, &total), "cudaMemGetInfo");
     memory_stats.device_free_min = std::min(memory_stats.device_free_min, free_now);
+    } catch (...) {
+        release_handles();
+        throw;
+    }
 }
 
 // Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: `rows` is a multiple of
