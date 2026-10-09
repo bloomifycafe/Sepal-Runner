@@ -185,13 +185,14 @@ target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
 add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine.cpp
   tests/test_cuda_engine_props.cpp
+  tests/test_cuda_engine_real.cpp
   tests/test_cuda_engine_diag.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative real_f32 real_f16 real_strict real_natural)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
