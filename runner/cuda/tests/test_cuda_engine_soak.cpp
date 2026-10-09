@@ -374,8 +374,10 @@ struct RealPhase {
     double worst = 0;
 };
 
+// `b_fp32_accumulate`: engine b multiplies on cuBLAS with float32 accumulators (the engine's default before MultiplyPath::Auto) instead of
+// the default, so that a comparison with the float32 engine measures the float16 operands and nothing else.
 RealPhase real_phase(const LoadedModel& model, const DecisionReadout& readout, Precision pa, std::size_t ga, Precision pb, std::size_t gb, bool extras, bool tight, double seconds,
-                     std::uint64_t seed) {
+                     std::uint64_t seed, bool b_fp32_accumulate = false) {
     Rng rng(seed), extra(seed ^ 0x5555);
     EngineOptions oa, ob;
     oa.precision = pa;
@@ -385,6 +387,7 @@ RealPhase real_phase(const LoadedModel& model, const DecisionReadout& readout, P
     ob = oa;
     ob.precision = pb;
     ob.gemm_rows = gb;
+    if (b_fp32_accumulate) ob.multiply_path = sepal::cuda::MultiplyPath::Cublas;
     if (tight) {
         oa.state_slots = 10;
         oa.memory_budget_bytes = (pa == Precision::F32 ? std::size_t{4800} : std::size_t{2400}) << 20;
@@ -525,12 +528,20 @@ SEPAL_TEST(real_soak, random_requests_of_real_text_on_the_real_model) {
               << one.tokens_run << " tokens; " << one.equal << " of " << one.compared << " readout rows bit-identical, largest difference " << one.worst << "\n";
     CHECK_EQ(one.equal, one.compared);
     CHECK(one.compared > 0);
-    const RealPhase two = real_phase(model, readout, Precision::F32, 0, Precision::F16, 0, false, false, seconds, seed + 1);
-    std::cout << "  phase 2, float32 natural vs float16 natural: " << two.calls << " calls, " << two.rows << " rows, " << two.tokens_run << " tokens; " << two.compared << " readout rows, largest hidden difference "
+    const RealPhase two = real_phase(model, readout, Precision::F32, 0, Precision::F16, 0, false, false, seconds, seed + 1, /*b_fp32_accumulate=*/true);
+    std::cout << "  phase 2, float32 natural vs float16 natural (float32 accumulators): " << two.calls << " calls, " << two.rows << " rows, " << two.tokens_run << " tokens; " << two.compared << " readout rows, largest hidden difference "
               << two.worst << ", answer flips " << two.flips << " (" << two.hard_flips << " away from a tie)\n";
     for (const std::string& note : two.flip_notes) std::cout << "    flip: " << note << "\n";
     CHECK(two.worst < 0.1);
     CHECK_EQ(two.hard_flips, std::size_t{0}); // random slices of text often sit near p = 0.5, where a float16 rounding flips the answer
+    // The default (cuBLAS with binary16 accumulators in natural mode) on the same kind of requests: farther from float32 in the hidden state, and (measured: largest
+    // 0.53 where float32 accumulation gave 0.09, 40 flips of 5,053 read-outs, all within 0.01 of p = 0.5) the same decisions away from a tie.
+    const RealPhase three = real_phase(model, readout, Precision::F32, 0, Precision::F16, 0, false, false, seconds, seed + 2);
+    std::cout << "  phase 3, float32 natural vs the float16 default (binary16 accumulators): " << three.calls << " calls, " << three.rows << " rows, " << three.tokens_run << " tokens; " << three.compared
+              << " readout rows, largest hidden difference " << three.worst << ", answer flips " << three.flips << " (" << three.hard_flips << " away from a tie)\n";
+    for (const std::string& note : three.flip_notes) std::cout << "    flip: " << note << "\n";
+    CHECK(three.worst < 1.5);
+    CHECK_EQ(three.hard_flips, std::size_t{0});
     g_pool = nullptr;
     g_real_lengths = false;
 }
