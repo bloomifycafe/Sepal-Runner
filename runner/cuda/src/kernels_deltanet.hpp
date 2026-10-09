@@ -22,14 +22,17 @@
 // A row whose parent is a row of the same pass goes in a later wave, after the launch that wrote the parent's
 // outgoing slot.
 //
-// Numbers. Every arithmetic step is an explicit round-to-nearest intrinsic (`__fmaf_rn`, `__fmul_rn`, ...), so the
-// compiler cannot contract or reassociate anything; the fused multiply-adds are where the code says so. Every
-// sum has one fixed order per output element, independent of the other rows, the wave, the launch, the chunking of
-// tokens and the thread mapping: the dot products over the key dimension use 16 interleaved accumulators that are
-// combined by a fixed binary tree, whatever `lanes_per_column` is. So a row's results are bit-identical alone or
-// in any batch, in one row or continued across rows, and under every thread mapping.
-//
-// Limits: key and value head dimensions at most 128, at most 16 conv taps.
+// Numbers. The convolution, SiLU, normalisation and gated norm are the reference's formulas in float32; the recurrence
+// keeps its state scaled by the cumulative decay (see kernels_deltanet.cu) and the multiply-adds are explicit
+// round-to-nearest intrinsics (`__fmaf_rn`, `__fmul_rn`, ...), so the compiler cannot contract or reassociate
+// anything. Every sum has one fixed order per output element, independent of the other rows, the wave and the
+// launch. A row's results are therefore bit-identical alone or in any batch and at any place of a pass. A row that is
+// cut in two (the second part continuing the first part's stored state) agrees with the uncut row to float32 rounding
+// but not in every bit, because the scale restarts at the cut; the engine always cuts at the same places, and two
+// runs of the same cut are bit-identical. The reciprocals and the exponentials of the SiLU and the norms use the
+// hardware approximations (2 ulp) rather than correctly rounded division; measured against the float64 reference the
+// whole chain stays within the bounds of the tests (about 1e-5 of the rms of the output after 4096 tokens).
+//// Limits: key and value head dimensions at most 128, at most 16 conv taps.
 #pragma once
 
 #include <cstddef>
@@ -116,8 +119,9 @@ struct DeltaNetTaps {
 };
 
 struct DeltaNetOptions {
-    /// Threads cooperating on one column of the recurrent state (splitting the dot product over the key
-    /// dimension): 0 chooses by the size of the wave, or 1, 2, 4 or 8. It changes speed, never the results.
+    /// Formerly the threads cooperating on one column of the recurrent state. There is one thread mapping now (four
+    /// columns per thread, four threads per column quad); 0, 1, 2, 4 and 8 are accepted and all mean that. It never
+    /// changed the results.
     int lanes_per_column = 0;
     DeltaNetTaps taps;
 };
