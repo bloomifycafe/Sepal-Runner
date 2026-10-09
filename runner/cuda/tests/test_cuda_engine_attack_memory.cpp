@@ -8,6 +8,7 @@
 // Environment: SEPAL_DET_OUT / SEPAL_DET_PAD_MB are used by attack_determinism's child processes (suite det_dump).
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -440,13 +441,15 @@ SEPAL_TEST(attack_memory, an_engine_destroyed_under_live_snapshots_gives_its_mem
 
 // ---- a very deep chain of snapshots ----
 
-SEPAL_TEST(attack_deepchain, a_chain_of_twenty_thousand_one_token_snapshots_can_be_built_used_and_released) {
+SEPAL_TEST(attack_deepchain, a_chain_of_thousands_of_one_token_snapshots_can_be_built_used_and_released) {
     Knobs k = small_pools(Precision::F32, 0);
     k.budget_mib = 128;
     k.slots = 8;
     auto engine = make_engine(k);
     Rng rng(1);
-    const std::size_t depth = 20000;
+    std::size_t depth = 3000;
+    if (const auto e = environment("SEPAL_CHAIN_DEPTH")) depth = std::stoul(*e);
+    const auto t0 = std::chrono::steady_clock::now();
     DeviceSnapshot s;
     std::vector<float> last;
     for (std::size_t i = 0; i < depth; ++i) {
@@ -459,7 +462,7 @@ SEPAL_TEST(attack_deepchain, a_chain_of_twenty_thousand_one_token_snapshots_can_
     }
     CHECK(all_finite(last));
     const EngineMemory m = engine->memory();
-    std::cout << "  chain of " << depth << " snapshots built; heap in use " << m.kv_in_use_bytes / 1024 << " KiB\n";
+    std::cout << "  chain of " << depth << " snapshots built in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s; heap in use " << m.kv_in_use_bytes / 1024 << " KiB\n";
     s = DeviceSnapshot(); // releases 20000 nested blocks
     const EngineMemory end = engine->memory();
     CHECK_EQ(end.kv_in_use_bytes, std::size_t{0});

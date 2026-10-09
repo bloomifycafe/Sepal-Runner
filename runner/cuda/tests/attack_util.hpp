@@ -143,6 +143,7 @@ inline std::uint64_t digest(const std::vector<EngineRowResult>& results, std::ui
 class World {
 public:
     explicit World(std::uint64_t weight_seed = 31) : cfg_(tiny_test_config()), weights_(tiny_weights(weight_seed)) {}
+    World(const ModelConfig& cfg, const Weights<float>& weights) : cfg_(cfg), weights_(weights) {}
 
     const ModelConfig& config() const { return cfg_; }
     std::size_t hidden() const { return ref::dim(cfg_.hidden_size); }
@@ -181,20 +182,32 @@ public:
     /// Runs the reference alone.
     std::vector<ref::RowResult<float>> reference(const std::vector<EngineRow>& rows) const { return run_reference(cfg_, weights_, convert(rows)); }
 
-    /// Remembers the reference snapshots of the rows that kept one on the device.
+    /// Remembers the reference snapshots of the rows that kept one on the device. The device snapshots are not kept alive
+    /// by the world: an entry whose device snapshot is gone is dropped.
     void adopt(const std::vector<EngineRow>& rows, const std::vector<EngineRowResult>& got, const std::vector<ref::RowResult<float>>& want) {
         std::vector<ref::Row<float>> converted = convert(rows);
         for (std::size_t i = 0; i < rows.size(); ++i) {
             if (!rows[i].keep_snapshot) continue;
-            snapshots_[got[i].snapshot.data().get()] = {want[i].snapshot, converted[i].start_position + rows[i].token_ids.size()};
-            keepalive_.push_back(got[i].snapshot);
+            const auto& data = got[i].snapshot.data();
+            snapshots_[data.get()] = {want[i].snapshot, converted[i].start_position + rows[i].token_ids.size()};
+            alive_[data.get()] = data;
+        }
+        if (snapshots_.size() > 64) {
+            for (auto it = alive_.begin(); it != alive_.end();) {
+                if (it->second.expired()) {
+                    snapshots_.erase(it->first);
+                    it = alive_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
     }
 
-    /// Forgets snapshots (so a test that releases handles also releases the reference's copies).
+    /// Forgets snapshots.
     void forget_all() {
         snapshots_.clear();
-        keepalive_.clear();
+        alive_.clear();
     }
 
     struct Checked {
@@ -222,7 +235,7 @@ private:
     ModelConfig cfg_;
     const Weights<float>& weights_;
     std::map<const void*, std::pair<ref::SnapshotPtr<float>, std::uint64_t>> snapshots_;
-    std::vector<DeviceSnapshot> keepalive_; // keeps the keys of `snapshots_` from being reused
+    std::map<const void*, std::weak_ptr<const DeviceSnapshot::Data>> alive_; // tells whether a key still names a snapshot
 };
 
 /// Free device memory, for before/after comparisons.
