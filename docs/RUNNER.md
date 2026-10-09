@@ -420,7 +420,7 @@ POST /v1/systemone
 | Attention q/k/v/o, DeltaNet `in_proj_qkv / z` | int8 + dynamic int8, pending ablation | int8 -> fp16 | fp16 |
 | DeltaNet `out_proj` (`ssm_out`), `in_proj_a / b` | fp16 stored, fp32 compute | fp16 | fp16 |
 | `A_log`, `dt_bias`, norms, conv | fp32 | fp32 | fp32 |
-| Recurrent state | fp32 | fp16 after experiment | fp32, fp16 opt-in |
+| Recurrent state | fp32 | fp16 after experiment (measured on the GPU engine: `EngineOptions::half_state`, `runner/cuda/README.md` "Snapshot density and tiers": no flips in 512 prompts, |Δp| at most 1.3e-3 against float32 state) | fp32, fp16 opt-in |
 | K/V | fp16 | fp16; int8 opt-in | fp16 |
 | Head | fp32 | fp32 | fp32 |
 

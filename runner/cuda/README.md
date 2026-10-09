@@ -407,7 +407,8 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
   the call, or nothing; rows sharing a parent never see each other; positions are explicit or follow the parent).
 - **Device snapshots** (`DeviceSnapshot`): immutable, reference counted; own a DeltaNet state slot and the row's keys
   and values (one heap block, all attention layers) and keep the parent's keys and values alive. Memory is taken at
-  creation out of `memory_budget_bytes` (weights, call buffers for `max_call_tokens`, a slot pool, a key/value heap);
+  creation out of `memory_budget_bytes` (weights, call buffers for `max_call_tokens`, a slot pool, a key/value heap; without a budget, pools for
+  `pool_snapshots` snapshots, see "Snapshot density and tiers");
   `run` allocates nothing on the device, throws `BudgetExceeded` before doing any work when a call does not fit, and the
   engine stays usable.
 - **Multiply batching.** `gemm_rows = 0` is natural (one multiply over all tokens). `gemm_rows = T` is strict: every
@@ -798,3 +799,193 @@ In strict mode the own kernel removes the padding: a 64-token call goes from 1,3
 is 8,500) and from 524 to 3,016 on the 2B (5.8x), a single alert from 14.0 to 14.7 alerts/s (float32 accumulators) or 19.2 (binary16, flush 64)
 on the 0.8B and from 6.7 to 7.4 or 10.4 on the 2B, while a row's bits still do not depend on the call. The 2B strict rows were measured
 with the other jobs on the card at their noisiest; read them to within 10%.
+
+## Snapshot density and tiers
+
+What a snapshot costs, how to make it cheaper, and how to move it off the device. API: `include/sepal/cuda/cuda_engine.hpp`
+(`EngineOptions::half_state`, `pool_snapshots`; `CudaEngine::to_host`, `to_device`, `save`, `load_host`, `load`, `state_saturations`;
+`HostSnapshot`, `SnapshotFileError`). Files: `src/snapshot_file.{hpp,cpp}` (format, hash, reader). Tests: `test_cuda_engine_snapshots.cpp`
+(`snap_half`, `snap_tiers`, `snap_fuzz`, `snap_default`, `snap_default_big`), `test_cuda_engine_real_snapshots.cpp` (`real_half_state`,
+`real_tiers`), the kernel tests `cuda_deltanet_storage`.
+
+### Bytes per snapshot
+
+A 645-token alert state (alert 0 of the workload), measured by `real_tiers` from `EngineMemory::slot_bytes` and
+`DeviceSnapshot::own_bytes()`. The 0.8B and the 2B have the same DeltaNet and attention geometry (18 DeltaNet layers of
+16 x 128 x 128 state, 3 x 6,144 conv tail; 6 attention layers with 2 key/value heads of 256), so the snapshot is the same size.
+
+| | float32 state (default) | binary16 state (`half_state`) |
+|---|---|---|
+| slot (recurrent state + conv tail, 18 layers) | 19.27 MiB | 9.63 MiB |
+| keys and values of 645 tokens (binary16, 6 layers) | 7.56 MiB | 7.56 MiB |
+| **one 645-token alert** | **26.82 MiB** | **17.19 MiB (-36%)** |
+| alerts resident on a 12 GB card, 0.8B (weights 1,436 MiB, call buffers of 4,096 tokens 275 MiB, 600 MiB left to the driver) | 371 | **580 (+56%)** |
+| the same, 2B (weights 3,590 MiB, call buffers 404 MiB) | 286 | **447 (+56%)** |
+
+**Slot right-sizing: nothing to fix.** The pool bytes per slot equal the slot (19.27 MiB; the 256-byte alignment of each layer's
+region is below 0.01%), the slot holds exactly the conv tail and the recurrent state, and the keys and values of a snapshot are
+padded to 256 bytes per layer and kind (1.5 KiB per snapshot). The earlier "19.3 MiB slot" is the state itself. The levers
+are the element size (this option) and what is kept at all, not slack.
+
+### binary16 state (`EngineOptions::half_state`, off by default)
+
+Both arrays of a slot (the recurrent state and the conv tail) are binary16; the DeltaNet kernels widen what they load and round to
+nearest even what they store, all arithmetic stays float32 (`kernels_deltanet.hpp`, `DeltaNetStates::half_storage`).
+
+**Determinism.** A row's state reaches a child row (in the same call, or from a stored snapshot) through the slot, and only
+through the slot, so both paths read the same rounded values: with the option on, a branch continued from a stored snapshot and
+the same branch run in the call of its state agree bit for bit in strict mode (`snap_half`: 44 continuations, float32 and
+float16 paths, `gemm_rows` 8 and 24, plus a four-deep chain in one call against four calls). The row's own outputs (including a
+row that has no stored parent) never see the rounding and are bit-identical to the float32-state engine's. The kernel test
+(`cuda_deltanet_storage`) checks the stores are exactly the float32 results rounded to nearest even, and that a row run from
+binary16 slots gives the bits that float32 slots holding the widened values give.
+
+**Range.** A value beyond +-65504 is clamped (never infinity) and counted in a device counter (`CudaEngine::state_saturations()`).
+Measured on the real model (float32 snapshots of alert states 0-11, case iv, an 8,000-token row and the end of a 30-link
+chain): the largest |recurrent state| is 14.1 (per layer 0.85 to 14.1) and the largest |conv tail| 34.6, four orders of magnitude
+inside the range; the binary16 runs counted 0 saturations in all the runs below. Of the nonzero state values 9.95% are below 2^-14
+(binary16 subnormals, fewer mantissa bits) and 0.007% below 2^-25 (round to zero); their absolute error is at most 3e-8.
+
+**Accuracy cost** (`real_half_state`, jeff-base, float16 engine in natural mode; every pair is the same engine with float32 state
+against binary16 state, so the difference is the state rounding alone):
+
+| Prompts | |Δp| median / p99 / max | |Δh|inf median / max | relative L2 median / max | flips |
+|---|---|---|---|---|
+| the 6 prompts of `real_f16`: cases i-iii (no stored parent) | bit-identical | | | 0 |
+| case iv, 3 branches from a stored state | max 5.4e-4 | max 5.2e-3 | | 0 |
+| 512 prompts of the alert workload from stored states | 2.4e-4 / 1.0e-3 / 1.3e-3 | 5.8e-3 / 1.3e-2 | 5.6e-4 / 9.5e-4 | 0 |
+| 8,000-token row, 8 questions after it | 4.2e-4 / - / 6.3e-4 | 6.0e-3 / 1.1e-2 | 6.1e-4 / 7.7e-4 | 0 |
+| chain of 1, 2, 5, 10, 20, 30 links of 64 tokens, 8 questions each | max 8.3e-4 (any depth) | max 1.5e-2 | 5.6e-4 to 7.1e-4 | 0 |
+
+For scale, the float16 engine with float32 state against the transformers float32 golden on the same 512 prompts: |Δp| median 1.9e-4,
+p99 7.5e-4, max 1.1e-3, relative L2 4.7e-4 median; with binary16 state: 2.0e-4, 8.8e-4, 1.7e-3, 4.8e-4. The binary16 state adds about as
+much as the float16 weights and activations already do, it does not compound: the 30-link chain is 7.1e-4 against 6.2e-4 after one link (the
+state forgets as fast as the rounding accumulates). No answer flips in 512 prompts, and none in the chain.
+
+**Speed.** The DeltaNet kernels load and store the state half as wide; `sepal-cuda-engine-bench --half-state 1` against `0`, two alternating
+rounds of 5 repetitions, the 64-alert workload on the 0.8B (float16, natural): the 16-alert state-cached call 80.6 and 79.3 alerts/s with float32 state
+against 78.7 and 78.6 with binary16 state (-1.5%); 1 alert per call 57.4 and 56.3 against 55.8 and 57.4; the state passes themselves
+(16 alerts per call, no cache) 21.9 and 21.8 against 21.6 and 21.5 (-1%). The difference is inside the run-to-run spread (about 2%): the state is not what
+limits the scan, and the scattered 2-byte loads and the conversions cost about what the halved traffic saves.
+
+### Host and file tiers
+
+```cpp
+HostSnapshot host = engine.to_host(snapshot, HostMemory::Pinned);   // copy device -> host (the whole chain's keys and values)
+DeviceSnapshot back = engine.to_device(host);                       // host -> device: a new slot and heap blocks; BudgetExceeded if full
+engine.save(snapshot, "alert-17.snap");                             // device (or HostSnapshot) -> file, atomic rename
+DeviceSnapshot loaded = engine.load("alert-17.snap");               // file -> validated -> device, usable as a parent
+HostSnapshot h = engine.load_host("alert-17.snap");                 // file -> host only
+```
+
+Every step is a byte copy of what the engine stores, so a promoted snapshot continues with the very bits the original does (tested
+for float32 and binary16 state, both precisions, chains of 1 to 5 snapshots with gaps in the positions). A chain (a snapshot whose
+keys and values continue its parent's) is saved with all of its ancestors' keys and values, block by block, with each block's start
+position, and comes back as the same chain (the attention kernel sees the same segments, hence the same bits); a chain saved
+and loaded is not shared with the other snapshots that had the same ancestors (the copy is self-contained). `save(load(save(x)))`
+is the same file as `save(x)`: padding is not stored. Handles outlive things as before: a loaded snapshot keeps the pools alive
+after its engine is gone, a `HostSnapshot` is independent of the engine and the device.
+
+**File format** (`src/snapshot_file.hpp` has the byte table): header of 168 bytes (magic `SEPALSNP`, version 1, fingerprints of the
+geometry, of the weights as they sit on the device (a hash kernel over the weight allocation, padding zeroed, a few ms, cached) and of
+the compute options that change bits (gemm rows, multiply path, binary16 accumulation, gate/up precision, last-layer pruning), precision,
+state format, layer counts, element counts, bytes per key/value token, token count, end position, block count, sizes, a hash of the header);
+a block table of 24 bytes per block; the payload (state, then each block's keys and values per attention layer, unpadded); a trailer of the hash
+of table and payload and an end marker. The hash is our own 64-bit multiply-rotate hash: it finds truncation and corruption, it does not
+authenticate.
+
+**Untrusted input.** The loader checks, in this order and before allocating anything from a header value: the file is a regular file and
+at least header + trailer long; magic; the header hash; version and header size; reserved fields zero; every identity field against the
+reading engine's own (a refusal names the field: model geometry, weights, precision, state format (`half_state`), layer counts, element
+counts, key/value size, compute options); block count in [1, 65536]; state size equals the engine's own figure; the file size equals
+exactly header + table + payload + trailer (all products and sums overflow-checked), so the only allocation, the payload, is bounded by the
+size of the file on disk; per block: tokens > 0, positions below 2^32, key/value bytes equal to what the tokens need; the blocks add up
+to the header's token and byte counts and the last block ends at the end position; then the payload is read in 4 MiB pieces and hashed,
+and the payload hash and end marker verified. Only then does `to_device` touch the device. Nothing is allocated on the device for a
+refused file; a `to_device` that finds the pools full throws `BudgetExceeded` and leaves them as they were.
+
+`snap_fuzz` on a two-block file of 8,888 bytes: every one of 1,952 truncations (all lengths below 400 and above n-400, every 7th between)
+and one trailing byte; every one of the 8,888 single-bit flips; 300 random multi-byte smashes; 293 headers and block tables with
+extreme values (0, 1, 2^31-1, 2^32-1, 2^63, 2^64-1 and more) in every field with the hashes made valid again; 200 random files, half of them
+with the right magic: all refused with `SnapshotFileError`, none crashed, none threw `bad_alloc`. (One entry is deliberately accepted:
+the start position of the first block is free, a gap in positions is legal.)
+
+**Times** (`real_tiers`: RTX 3060, a 645-token alert state, best of 7 after a warm-up, float16 engine; the file tier is read through the
+operating system's cache: a cold read depends on the disk and is not measured here; the host figures include the allocation of the host
+buffer, which for pinned memory is most of the difference to pageable at this size):
+
+| ms | recompute the state | to_host pageable | to_host pinned | to_device | save (device -> file) | load_host (file -> host) | load (file -> device) |
+|---|---|---|---|---|---|---|---|
+| 0.8B, float32 state (26.8 MiB) | 44.9 | 5.5 | 4.7 | 3.1 | 15.7 | 18.9 | 18.8 |
+| 0.8B, binary16 state (17.2 MiB) | 45.9 | 3.8 | 3.1 | 2.5 | 10.2 | 13.5 | 12.6 |
+| 2B, float32 state | 102.7 | 5.5 | 4.6 | 3.1 | 15.2 | 18.2 | 19.0 |
+| 2B, binary16 state | 102.2 | 3.7 | 3.1 | 2.5 | 10.9 | 13.5 | 13.3 |
+
+So the host tier pays at once (a demote plus a promote is 6 to 8 ms against 45 ms of recompute on the 0.8B and 100 ms on the 2B),
+and a file in the operating system's cache pays too (a load of 13 to 19 ms is 2.4 to 3.5 times faster than the 0.8B recompute and 5 to
+8 times than the 2B's; saving costs 10 to 16 ms once). The warm load is bound by the host (reading, hashing and copying 17 to 27 MiB, about
+1.3 to 1.5 GB/s), so a cold file pays as long as the disk delivers the file in less than recompute minus upload: on the 0.8B the disk must
+read about 0.4 GB/s with binary16 state (0.7 GB/s with float32), on the 2B about 0.2 GB/s (0.3). A SATA SSD is marginal for the 0.8B, an NVMe
+drive is far inside. The state is bytes, not compute, so the cost does not grow with the model: the 2B's tier times equal the 0.8B's,
+while its recompute is 2.3 times longer. No automatic policy is implemented: the calls are explicit.
+
+### The default reservation
+
+Before, an engine created without a budget took 85% of the free device memory (about 9.5 GB on the 12 GB card, mostly empty pools: the
+16-alert workload peaks at 2.9 GB in total). Now `memory_budget_bytes = 0` means: the weights, the call buffers, and pools for
+`pool_snapshots` (default 64) snapshots of `pool_snapshot_tokens` (default 1,024) tokens, within 85% of the free memory.
+On the 0.8B with the bench's settings (call buffers for 16,384 tokens) that is 4,399 MiB with float32 state (weights 1,436, call buffers 962,
+64 slots of 19.3 MiB 1,233, key/value heap 768) and 3,783 MiB with binary16 state, against about 9.5 GB; the call buffers are now the largest
+item after the weights and `max_call_tokens` is their lever (275 MiB at 4,096 tokens). The 16-alert cached bench runs unchanged in it.
+`pool_snapshots = 0` restores the old behaviour; a given budget or `state_slots` works as before. `BudgetExceeded` is thrown by `run`
+exactly as before when a call needs more than is free; what changes is the size of "free": a workload that keeps more than 64 snapshots
+at the default has to ask (`pool_snapshots`, `state_slots` or a budget), with the message that says so.
+
+Not done: pools that grow on demand. The slot pool is addressed by the DeltaNet kernels as one base pointer plus a slot index, so growing
+needs either an indirection table in the kernels or CUDA virtual memory management (`cuMemAddressReserve`/`cuMemMap`: reserve the
+address range of the budget, commit physical pages as slots and heap blocks are used). The latter keeps the kernels unchanged, but a
+committed page is not given back when the last snapshot goes (or needs `cuMemUnmap` bookkeeping), which would change the
+"device memory after equals before" guarantee the memory tests rely on, and it needs the driver API (`cuda.lib`) in the build. It is
+the right next step if the default is still too large for a small card.
+
+### Checked by breaking it on purpose
+
+Three deliberate bugs, one build: the binary16 store rounding toward zero instead of to nearest (the kernel test `half_slots_are_the_float_result_rounded_at_the_store`
+fails 6 checks; the engine-level hit = miss tests cannot see it, both sides round the same way); the payload hash not enforced on load
+(`snap_fuzz.every_flipped_byte_is_refused` fails 8,961 of 9,174 checks); the values of attention layer 0 not uploaded by `to_device` (4 of the 6
+`snap_tiers` cases fail, 35 checks). The tests also caught a real bug of the first version of this change: zeroing the weight allocation with
+`cudaMemset`, which runs on the legacy stream and does not wait for, nor is waited for by, the engine's non-blocking stream, raced with the weight
+upload and zeroed part of the vocabulary and wide-geometry weights (`attack_geometry`: 2 failures); it is now `cudaMemsetAsync` on the engine's stream.
+
+### What the two reference projects do
+
+*HyperQwen* (Apache-2.0, vLLM-based, 64-layer 27B model with 48 DeltaNet layers, one RTX 3090): the "16-bit recurrent state" is only
+the stock vLLM flag `--mamba-ssm-cache-dtype float16` (`docs/optimizations.md` item 3, `batch/start_qwen.sh`): fp16, not bf16, "10 mantissa
+bits"; no scaling, clamping or range analysis, and the widening/rounding happens inside vLLM's kernels, not in their repository.
+Reported: with `--max-num-seqs 64`, 37 requests actually ran with the float32 state (about 150 MB per request) and all 64 with fp16;
+perplexity 8.045 against 8.044 on 33k tokens; GSM8K 95.5%; 516 to 707 tokens/s at 64 concurrent (also with an int8 lm_head step). The measured
+quantity is perplexity over a decode, which never hands a rounded state to a prefill; our measurement is the hidden-state and probability
+difference of a continuation. Their KVarN backend (a port of Huawei CSL's, `kvarn/`, `docs/long-context.md`) stores keys at 4 bits and values
+at 2 bits per element (Hadamard rotation, 128-token tiles with iterative variance normalisation, fp16 scales, the first 128 tokens kept
+fp16), about 840 bytes per token and layer against 2,048 for fp8; perplexity 8.223 against 8.236, needle-in-a-haystack correct to 240k tokens,
+100k-context decoding 1.22 times faster, but 2.13 times slower with 3-token speculation at 112k. It is a lossy cache by their own account.
+We did not port it: our K/V is binary16 (2,048 bytes per token and layer for keys and values together) and is 44% of an alert snapshot
+(7.6 of 17.2 MiB) once the state is halved; int8 with per-token-per-head scales (not implemented) would save 3.8 MiB (22% of the snapshot),
+a 4-bit key / 2-bit value scheme about 6 MiB (35%) before scales, at an accuracy cost nobody has measured on this model.
+
+*Strata* (MIT): `docs/DETAILS.md` has the measurements. Session files (`conversation_file.hpp`): little-endian, a 64-byte header (magic
+`STRSESS\x01`, version, model and config fingerprints, payload length, a header hash), a payload with every array count-prefixed, and a
+trailer hash and end marker; read fail-closed in a fixed order (regular file with one hard link and no symlink, size bounds, magic, header hash,
+version, fingerprints before the payload is parsed, payload length against file size, RAM preflight, every count against the remaining bytes
+and the runtime's limits before allocation, payload hash), all before any device write; written to a hidden temporary file and renamed. The
+hash is "xxHash64-style", it detects accidents and does not authenticate. The file holds the recurrent state and the key/value of the whole
+conversation (about 1.2 GB for 63k tokens), only the deepest checkpoint. Tiers: up to 6 RAM checkpoints of about 118 MB, taken at each new
+turn and every 16K prompt tokens, LRU with the root pinned; optional host "parking"; an explicit disk save/restore without automatic spilling.
+Measured on an RTX 4070 Ti 12 GB, NVMe: a 63,025-token conversation, file 1.20 GB, save 0.65 s, restore 1.05 s in a new process, next
+32-token turn 1.14 s against 25.5 s cold. Their `MESSAGE_BOUNDARY_CACHE` (an extra checkpoint at the previous turn boundary, opt-in, for
+prefixes of 8,192 tokens or more) is reported at 17.2 s to 11.5 s for the first edit of 100 records, in a comparison that also changes the
+chunk size and so is not an isolated gain; `KV_PREFETCH` (uploading the next layer's key/value during prefill) measured 5.3% at 32K and 4.1% at 64K,
+from timings the document itself calls historical; `VRAM_ELASTIC` is about resizing the expert cache and has nothing to do with conversation
+state. Our format shares their order of checks and the fail-closed stance; it differs in verifying the identity from the engine's own
+geometry and a hash of the device weights (theirs hashes the first and last MiB of the model files), and in refusing a file whose size does not
+equal what the header derives, which bounds every allocation.
