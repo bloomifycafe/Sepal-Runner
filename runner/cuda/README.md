@@ -1055,6 +1055,8 @@ where binary16 (15.9 GB) cannot be loaded at all. The embedding could be stored 
 * `real_int8`, `real_int8_2b`: the tables above (they assert finite results, the default engine's gate, and bit-identity of the all-int8 profiles across batching ways). The planted-bug check: dropping the sign flip in the W8A16 weight widening (`v ^= 0x80808080` -> `0x00808080`) fails `s8_gemm` in every shape
   (`err < 1e-5` and `quantisation < 1.2e-2`); reverted.
 
+The whole CTest suite with all the real-model environment variables set: 67 of 67 pass (23 minutes, `real_cpu` 520 s of it), none skipped; the 60 tests that existed before still pass, strict-mode bit-identity suites included.
+
 ### Not done
 
 * Tuning the W8A8 kernel (51 to 65% of the int8 peak; cuBLAS int8 is 10 to 35% faster on the deep shapes), fusing the row quantisation into SwiGLU and the norms, and split-k for small calls (the 64-token multiplies stay latency-bound).
