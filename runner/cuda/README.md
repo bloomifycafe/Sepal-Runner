@@ -445,6 +445,10 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
 | memory | 3,000 calls creating and releasing snapshots: device memory before and after identical, pools back to zero use, heap fully merged; budget overrun fails with `BudgetExceeded`, nothing is leaked, the next call gives the same bits; snapshots outlive their parents' handles and the engine |
 | refusals | bad token ids, empty rows, readouts out of range, cyclic or dangling parents, empty handle, snapshot of another engine or geometry, too many rows/tokens: `std::invalid_argument`, nothing left allocated |
 
+The float16 rows of this table, and the adversarial review and soak figures below, were measured with cuBLAS and float32 accumulators, the engine's default before
+`MultiplyPath::Auto`; "The default multiply configuration" below has the same checks for the default (and `real_long`, `real_soak`, `real_2b`, `real_half_state` now run
+the float16 comparisons that measure something other than accumulation on that earlier configuration, and the default with bounds of its own).
+
 The real-model suites (`real_f32`, `real_f16`, `real_strict`, `real_natural`, `real_2b`, `real_alerts`, `real_cpu`, `real_long`,
 `real_soak`, `real_diag`) print `SKIPPED: real-model ...` unless `SEPAL_REAL_MODEL` (checkpoint directory), `SEPAL_REAL_GOLDEN`
 (`tools/export_real_golden.py` output) and, for `real_2b`, `SEPAL_REAL_MODEL_2B` are set (`real_alerts`, `real_cpu`, `real_long`,
@@ -835,7 +839,8 @@ tokens (0.8B, 9.9k against 8.1k tokens/s; the 2B 1.53x), 1.18x at 600 and 1.06x 
 float32 accumulation at every size (+12% at 64 tokens, +36% at 600, +34% at 2,048 on the 0.8B; +12%, +43%, +45% on the 2B). `CudaEngine::options()` returns what `Auto` resolved to, `fp16_accumulate` must be left alone with `Auto`
 (the engine throws rather than ignore it), and the snapshot files' compute fingerprint is made from the resolved values: a file from the default engine
 loads in an engine that spells out the same multiplies (`multiply_path = Cublas`, all four groups) and in no other (test `snap_tiers`,
-`the_default_multiply_options_are_part_of_the_snapshot_kind`).
+`the_default_multiply_options_are_part_of_the_snapshot_kind`). So snapshot files written before this change (cuBLAS, float32 accumulators) are refused by the default engine
+("compute options") and load in an engine created with `multiply_path = Cublas` and no `fp16_accumulate`; the stored states are different numbers, not another encoding of the same ones.
 
 **Accuracy** (`sepal_cuda_engine_tests real_int8` with `SEPAL_INT8_VARIANTS=...`; jeff-base, 64 alerts x 8 questions = 512 prompts, 16 alerts per call, against
 the transformers float32 hidden states and probabilities; the gate is max |Δp| <= 0.05 and at most 1% flips, 5 of 512; `docs/RUNNER.md` holds `gpu-f16` to 0.03, p99 0.01 and
@@ -861,6 +866,21 @@ one (4.8e-3 against 4.7e-4 relative L2) as the float32-accumulate engine's, whic
 decision read-out is the one in the middle column, and an application that reads the hidden state itself should know this. **Not verified:** the 2B model has no
 read-out head in its checkpoint and no golden, so only the hidden state could be compared (256 prompts, mean relative L2 against the float32 engine: float32-accumulate
 5.6e-4, natural default 5.7e-3, strict default 1.0e-3, own kernel flush 32 / 128 8.7e-4 / 1.3e-3); the |Δp| and flip figures above are the 0.8B's.
+
+**Where the natural default is noisier than the engine before it** (real-model suites; the float32-accumulate figures are the same tests on `multiply_path = Cublas`, which those
+tests now use where they measure something else, such as the cost of a binary16 state):
+
+| Test | float32 accumulators | binary16 accumulators (default) |
+|---|---|---|
+| `real_long`: an 8,192-token row against the same tokens in pieces of 4,096 / 1,024, largest hidden difference (|Δp|, flips) | 1.5e-2 / 8.6e-3 (3.8e-4; 0) | 0.19 / 0.24 (3.8e-3; 1 flip of 12 read-outs, 1.6e-3; 0) |
+| the same, 16,384 tokens in pieces of 4,096 / 2,048 | 1.5e-2 / 1.5e-2 (3.0e-4; 0) | 0.19 / 0.15 (3.8e-3; 1 flip, 7.5e-3; 0) |
+| `real_long`: 8,192 tokens, float16 against the float32 engine, relative L2 of the hidden state at 12 read-outs | 3.8e-4 to 5.8e-4 (worst 1.3e-3, at offset 0) | 4e-3 to 5.9e-3 (worst 1.9e-2, at offset 0) |
+| `real_soak` phase 2 / 3: random slices of the workload's text, read out at random places, against the float32 engine: largest hidden difference, flips (of read-outs) | 0.078, 6 of 4,941 | 0.74 (0.53 in another run), 36 of 5,258 |
+| `real_2b`: 51 tokens in four rows, largest hidden difference from the float32 engine | 1.4e-2 | 0.17 |
+
+Every flip of the soak is a read-out whose probability is within 0.01 of one half in the float32 or the float16 engine (the test asserts none away from a tie), but the near-tie
+flips are six times as many: 0.7% of random slices of text against 0.1%. On the alert prompts, which are not random slices, the figure is 2 of 512.
+The first row of the hidden-state differences in these tests is the first token of a row, whose hidden state has the largest values (up to 33).
 
 **Speed of the groups** (`sepal-cuda-engine-ab`, same process, best of 2 rounds x 5 calls, tokens/s; the first column is the engine before `Auto`):
 
