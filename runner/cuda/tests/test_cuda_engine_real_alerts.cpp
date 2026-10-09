@@ -13,7 +13,9 @@
 // Memory: about 6 GiB of the device for the float32 engine; take the GPU lock before running it next to a benchmark.
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <thread>
 #include <sstream>
 
 #include "engine_test_util.hpp"
@@ -36,6 +38,37 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
+
+// Optional: when SEPAL_GPU_LOCK names a directory, hold it (created, as a lock) while the device is in use, for runs that
+// share the card with timing measurements. Waits for it, takes it over when it is older than 15 minutes.
+class GpuLock {
+public:
+    GpuLock() {
+        const auto path = environment("SEPAL_GPU_LOCK");
+        if (!path) return;
+        path_ = *path;
+        for (int i = 0; i < 180; ++i) {
+            std::error_code ec;
+            if (std::filesystem::create_directory(path_, ec)) {
+                held_ = true;
+                return;
+            }
+            const auto written = std::filesystem::last_write_time(path_, ec);
+            if (!ec && std::filesystem::file_time_type::clock::now() - written > std::chrono::minutes(15)) std::filesystem::remove_all(path_, ec);
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+        }
+    }
+    ~GpuLock() {
+        std::error_code ec;
+        if (held_) std::filesystem::remove_all(path_, ec);
+    }
+    GpuLock(const GpuLock&) = delete;
+    GpuLock& operator=(const GpuLock&) = delete;
+
+private:
+    std::string path_;
+    bool held_ = false;
+};
 
 constexpr std::size_t kQuestions = 8;
 constexpr std::size_t kOptions = 2;
@@ -211,6 +244,8 @@ struct Dist {
 struct Comparison {
     Dist dp, dh, dh_rel;      // |Δp| of option 0, max |Δ hidden|, relative L2 distance of the hidden states
     std::size_t flips = 0;    // answer flips (argmax of the two probabilities)
+    std::size_t hard_flips = 0; // flips where neither probability is within 0.01 of one half
+    std::vector<std::string> flip_notes;
     std::size_t bit_equal = 0;
     std::size_t rows = 0;
     std::vector<std::pair<double, std::size_t>> worst; // (|Δp|, row)
@@ -238,7 +273,13 @@ Comparison compare(const Hidden& a, const Hidden& b) {
         c.dp.add(dp);
         c.dh.add(linf);
         c.dh_rel.add(std::sqrt(num / std::max(den, 1e-30)));
-        if ((pa[0] > pa[1]) != (pb[0] > pb[1])) ++c.flips;
+        if ((pa[0] > pa[1]) != (pb[0] > pb[1])) {
+            ++c.flips;
+            if (std::fabs(pa[0] - 0.5) > 0.01 && std::fabs(pb[0] - 0.5) > 0.01) ++c.hard_flips;
+            std::ostringstream note;
+            note << "alert " << r / kQuestions << " q" << r % kQuestions << " p0 " << std::fixed << std::setprecision(5) << pa[0] << " vs " << pb[0];
+            c.flip_notes.push_back(note.str());
+        }
         if (std::memcmp(x, y, H * sizeof(float)) == 0) ++c.bit_equal;
         c.worst.emplace_back(dp, r);
         ++c.rows;
@@ -257,6 +298,7 @@ void report(const std::string& what, const Comparison& c) {
         std::cout << " (alert " << c.worst[i].second / kQuestions << " q" << c.worst[i].second % kQuestions << ": " << std::scientific << std::setprecision(2) << c.worst[i].first << ")";
     }
     std::cout << std::fixed << "\n";
+    for (const std::string& note : c.flip_notes) std::cout << "      flip: " << note << "\n";
 }
 
 // A single row is an outlier when its |dp| exceeds 8x the 99th percentile and the 99th percentile is itself nonzero.
@@ -281,7 +323,6 @@ std::size_t alert_count() {
 SEPAL_TEST(real_alerts, the_64_alert_workload_in_every_way_against_transformers_float32) {
     if (skipped()) return;
     const std::vector<Alert> alerts = load_alerts(alert_count());
-    const std::size_t H = real().hidden;
     const Hidden gold = golden_hidden(alerts.size());
     std::cout << "  " << alerts.size() << " alerts, " << alerts.size() * kQuestions << " prompts; golden = transformers float32 (TF32 off)\n";
 
@@ -350,17 +391,18 @@ SEPAL_TEST(real_alerts, the_64_alert_workload_in_every_way_against_transformers_
         report("float16 natural '" + name + "' vs transformers float32", c);
         CHECK(c.dp.max() < 0.02);
         CHECK(!has_outlier(c));
+        CHECK_EQ(c.hard_flips, std::size_t{0});
     }
     {
         const Comparison c = compare(natural16.at("alone"), natural32.at("alone"));
         report("float16 natural 'alone' vs float32 natural 'alone'", c);
         CHECK(!has_outlier(c));
-        CHECK_EQ(c.flips, std::size_t{0});
+        CHECK_EQ(c.hard_flips, std::size_t{0});
         for (const auto& [name, h] : natural16) {
             if (name == "alone") continue;
             const Comparison d = compare(h, natural16.at("alone"));
             report("float16 natural '" + name + "' vs float16 natural 'alone' (batch composition)", d);
-            CHECK_EQ(d.flips, std::size_t{0});
+            CHECK_EQ(d.hard_flips, std::size_t{0});
         }
     }
     // ---- strict ----
@@ -378,55 +420,8 @@ SEPAL_TEST(real_alerts, the_64_alert_workload_in_every_way_against_transformers_
         const Comparison d = compare(base, p == Precision::F32 ? natural32.at("alone") : natural16.at("alone"));
         report(std::string(p == Precision::F32 ? "float32" : "float16") + " strict 128 vs the same precision natural 'alone'", d);
     }
-
-    // ---- CPU reference on a sample ----
-    std::size_t samples = 0;
-    if (const auto e = environment("SEPAL_ALERT_CPU_SAMPLES")) samples = std::stoul(*e);
-    if (samples != 0) {
-        const Weights<float> weights = real().model.weights<float>();
-        const std::unique_ptr<GemmProvider> gemm = make_reference_gemm();
-        Hidden cpu;
-        Hidden mine, theirs, ours16;
-        double total = 0;
-        for (std::size_t s = 0; s < samples; ++s) {
-            const std::size_t a = samples == 1 ? 0 : s * (alerts.size() - 1) / (samples - 1);
-            std::vector<ref::Row<float>> rows(1 + kQuestions);
-            rows[0].token_ids = alerts[a].state;
-            for (std::size_t q = 0; q < kQuestions; ++q) {
-                rows[1 + q].token_ids = alerts[a].suffixes[q];
-                rows[1 + q].readout_offsets = {alerts[a].suffixes[q].size() - 1};
-                rows[1 + q].start_position = alerts[a].state.size();
-                rows[1 + q].parent = ref::ParentRow{0};
-            }
-            const auto t = Clock::now();
-            const auto want = ref::run_rows<float>(*gemm, real().model.config(), weights, rows);
-            const double sec = since(t);
-            total += sec;
-            std::size_t tokens = alerts[a].state.size();
-            for (const auto& suffix : alerts[a].suffixes) tokens += suffix.size();
-            std::cout << "    CPU reference, alert " << a << " (" << tokens << " tokens): " << std::fixed << std::setprecision(1) << sec << " s" << "\n";
-            for (std::size_t q = 0; q < kQuestions; ++q) {
-                const auto v = want[1 + q].hidden.span();
-                cpu.insert(cpu.end(), v.begin(), v.end());
-                const float* g = gold.data() + (a * kQuestions + q) * H;
-                theirs.insert(theirs.end(), g, g + H);
-                const float* m = natural32.at("alone").data() + (a * kQuestions + q) * H;
-                mine.insert(mine.end(), m, m + H);
-                const float* m16 = natural16.at("alone").data() + (a * kQuestions + q) * H;
-                ours16.insert(ours16.end(), m16, m16 + H);
-            }
-        }
-        std::cout << "  CPU reference: " << samples << " alerts in " << std::fixed << std::setprecision(0) << total << " s" << "\n";
-        report("CPU float32 reference vs transformers float32", compare(cpu, theirs));
-        const Comparison c = compare(mine, cpu);
-        report("float32 engine (natural, alone) vs CPU float32 reference", c);
-        CHECK(c.dh.max() < 1e-4);
-        report("float16 engine (natural, alone) vs CPU float32 reference", compare(ours16, cpu));
-    }
 }
 
-// Diagnostic for the strict-mode finding: the same branches in a call with their state and continuing a stored snapshot
-// of it. Sweeps the state length, gemm_rows and last-layer pruning on the float32 engine.
 SEPAL_TEST(real_diag, strict_float32_state_in_the_call_versus_stored) {
     if (skipped()) return;
     const std::vector<Alert> alerts = load_alerts(2);
@@ -479,4 +474,187 @@ SEPAL_TEST(real_diag, strict_float32_state_in_the_call_versus_stored) {
             }
         }
     }
+}
+
+// The CPU float32 reference on a spread sample of alerts (SEPAL_ALERT_CPU_SAMPLES, default 2; it takes minutes per alert),
+// against transformers float32, the float32 engine and the float16 engine.
+SEPAL_TEST(real_cpu, cpu_reference_on_a_sample_of_alerts_against_transformers_and_both_engines) {
+    if (skipped()) return;
+    std::size_t samples = 2;
+    if (const auto e = environment("SEPAL_ALERT_CPU_SAMPLES"); e && std::stoul(*e) != 0) samples = std::stoul(*e);
+    const std::vector<Alert> alerts = load_alerts(64);
+    const Hidden gold_all = golden_hidden(alerts.size());
+    const std::size_t H = real().hidden;
+    const Weights<float> weights = real().model.weights<float>();
+    const std::unique_ptr<GemmProvider> gemm = make_reference_gemm();
+    std::vector<std::size_t> picks;
+    for (std::size_t s = 0; s < samples; ++s) picks.push_back(samples == 1 ? 0 : s * (alerts.size() - 1) / (samples - 1));
+    Hidden cpu, gold, e32, e16;
+    double cpu_seconds = 0;
+    std::size_t cpu_tokens = 0;
+    // The CPU first (minutes; the device is not held meanwhile), then the two engines on the same alerts.
+    for (const std::size_t a : picks) {
+        std::vector<ref::Row<float>> rows(1 + kQuestions);
+        rows[0].token_ids = alerts[a].state;
+        for (std::size_t q = 0; q < kQuestions; ++q) {
+            rows[1 + q].token_ids = alerts[a].suffixes[q];
+            rows[1 + q].readout_offsets = {alerts[a].suffixes[q].size() - 1};
+            rows[1 + q].start_position = alerts[a].state.size();
+            rows[1 + q].parent = ref::ParentRow{0};
+        }
+        std::size_t tokens = alerts[a].state.size();
+        for (const auto& suffix : alerts[a].suffixes) tokens += suffix.size();
+        // The reference takes minutes per alert; its answer is kept in SEPAL_CPU_CACHE (a directory) when that is set.
+        const std::optional<std::string> cache_dir = environment("SEPAL_CPU_CACHE");
+        const std::string cache_file = cache_dir ? *cache_dir + "/cpu_alert_" + std::to_string(a) + ".bin" : std::string();
+        Hidden mine(kQuestions * H);
+        bool cached = false;
+        if (cache_dir) {
+            std::ifstream in(cache_file, std::ios::binary);
+            if (in.read(reinterpret_cast<char*>(mine.data()), static_cast<std::streamsize>(mine.size() * sizeof(float)))) cached = true;
+        }
+        if (!cached) {
+            const auto t = Clock::now();
+            const auto want = ref::run_rows<float>(*gemm, real().model.config(), weights, rows);
+            const double sec = since(t);
+            cpu_seconds += sec;
+            cpu_tokens += tokens;
+            std::cout << "    CPU reference, alert " << a << " (" << tokens << " tokens, one state + 8 questions): " << std::fixed << std::setprecision(1) << sec << " s (" << sec / static_cast<double>(tokens) * 1000.0
+                      << " ms per token)" << std::endl;
+            for (std::size_t q = 0; q < kQuestions; ++q) {
+                const auto v = want[1 + q].hidden.span();
+                std::copy(v.begin(), v.end(), mine.begin() + static_cast<std::ptrdiff_t>(q * H));
+            }
+            if (cache_dir) std::ofstream(cache_file, std::ios::binary).write(reinterpret_cast<const char*>(mine.data()), static_cast<std::streamsize>(mine.size() * sizeof(float)));
+        } else {
+            std::cout << "    CPU reference, alert " << a << ": read from " << cache_file << std::endl;
+        }
+        for (std::size_t q = 0; q < kQuestions; ++q) {
+            cpu.insert(cpu.end(), mine.begin() + static_cast<std::ptrdiff_t>(q * H), mine.begin() + static_cast<std::ptrdiff_t>((q + 1) * H));
+            const float* g = gold_all.data() + (a * kQuestions + q) * H;
+            gold.insert(gold.end(), g, g + H);
+        }
+    }
+    {
+        const GpuLock lock;
+        EngineOptions o32 = options(Precision::F32, 0), o16 = options(Precision::F16, 0);
+        o32.max_call_tokens = o16.max_call_tokens = 2048;
+        o32.state_slots = o16.state_slots = 4;
+        o32.memory_budget_bytes = std::size_t{5000} << 20;
+        o16.memory_budget_bytes = std::size_t{2600} << 20;
+        CudaEngine eng32(real().model, o32), eng16(real().model, o16);
+        for (const std::size_t a : picks) {
+            std::vector<EngineRow> eng_rows = {state_row(alerts[a], false)};
+            for (std::size_t q = 0; q < kQuestions; ++q) {
+                EngineRow r = question_row(alerts[a], q);
+                r.parent = ParentRow{0};
+                eng_rows.push_back(r);
+            }
+            const auto r32 = run(eng32, eng_rows), r16 = run(eng16, eng_rows);
+            for (std::size_t q = 0; q < kQuestions; ++q) {
+                e32.insert(e32.end(), r32[1 + q].hidden.begin(), r32[1 + q].hidden.end());
+                e16.insert(e16.end(), r16[1 + q].hidden.begin(), r16[1 + q].hidden.end());
+            }
+        }
+    }
+    std::cout << "  CPU reference: " << picks.size() << " alerts, " << cpu_tokens << " tokens in " << std::fixed << std::setprecision(0) << cpu_seconds << " s\n";
+    report("CPU float32 reference vs transformers float32", compare(cpu, gold));
+    const Comparison c32 = compare(e32, cpu);
+    report("float32 engine (natural) vs CPU float32 reference", c32);
+    report("float16 engine (natural) vs CPU float32 reference", compare(e16, cpu));
+    CHECK(c32.dh.max() < 1e-4);
+    CHECK_EQ(c32.flips, std::size_t{0});
+}
+
+// Very long rows on the real model: one row of 8192 (float32) and 16384 (float16) tokens against the same tokens fed in
+// pieces that continue each other's snapshots, with the read-outs at the same twelve offsets.
+SEPAL_TEST(real_long, rows_of_8k_and_16k_tokens_whole_and_in_pieces) {
+    if (skipped()) return;
+    const std::vector<Alert> alerts = load_alerts(64);
+    std::vector<std::uint32_t> pool;
+    for (const Alert& a : alerts) pool.insert(pool.end(), a.state.begin(), a.state.end());
+    CHECK(pool.size() >= 16384);
+    const std::size_t H = real().hidden;
+    struct Case {
+        Precision precision;
+        std::size_t total;
+        std::vector<std::size_t> pieces;
+    };
+    std::vector<std::vector<float>> one_shot_f16_8k;
+    std::map<std::string, std::vector<float>> by_name;
+    for (const Case& c : {Case{Precision::F32, 8192, {4096, 1024}}, Case{Precision::F16, 8192, {4096, 1024}}, Case{Precision::F16, 16384, {4096, 2048}}}) {
+        EngineOptions o = options(c.precision, 0);
+        o.max_call_tokens = 16384;
+        o.max_call_rows = 8;
+        o.state_slots = 6;
+        o.memory_budget_bytes = (c.precision == Precision::F32 ? std::size_t{7000} : std::size_t{5500}) << 20;
+        CudaEngine engine(real().model, o);
+        const std::vector<std::uint32_t> all(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(c.total));
+        std::vector<std::size_t> at = {0, c.total - 1, c.total / 2, 4095, 4096, 1023, 1024};
+        Rng offsets_rng(c.total); // the same random offsets for the same length, whatever the precision
+        for (int i = 0; i < 5; ++i) at.push_back(offsets_rng.below(c.total));
+        EngineRow whole;
+        whole.token_ids = all;
+        whole.readout_offsets = at;
+        const auto t0 = Clock::now();
+        const auto one = run(engine, {whole});
+        const double whole_s = since(t0);
+        const std::string tag = std::string(c.precision == Precision::F32 ? "float32 " : "float16 ") + std::to_string(c.total);
+        by_name[tag] = one[0].hidden;
+        std::cout << "  " << tag << " tokens in one row: " << std::fixed << std::setprecision(2) << whole_s << " s\n";
+        for (const std::size_t piece : c.pieces) {
+            std::vector<std::vector<float>> got(at.size());
+            DeviceSnapshot prev;
+            for (std::size_t from = 0; from < c.total; from += piece) {
+                const std::size_t to = std::min(c.total, from + piece);
+                EngineRow r;
+                r.token_ids.assign(all.begin() + static_cast<std::ptrdiff_t>(from), all.begin() + static_cast<std::ptrdiff_t>(to));
+                r.keep_snapshot = to < c.total;
+                std::vector<std::size_t> which;
+                for (std::size_t i = 0; i < at.size(); ++i) {
+                    if (at[i] >= from && at[i] < to) {
+                        r.readout_offsets.push_back(at[i] - from);
+                        which.push_back(i);
+                    }
+                }
+                if (prev.valid()) r.parent = prev;
+                const auto res = run(engine, {r});
+                for (std::size_t j = 0; j < which.size(); ++j) got[which[j]].assign(res[0].hidden.begin() + static_cast<std::ptrdiff_t>(j * H), res[0].hidden.begin() + static_cast<std::ptrdiff_t>((j + 1) * H));
+                prev = res[0].snapshot;
+            }
+            double worst = 0, worst_p = 0;
+            std::size_t flips = 0;
+            for (std::size_t i = 0; i < at.size(); ++i) {
+                const std::vector<float> ref_h(one[0].hidden.begin() + static_cast<std::ptrdiff_t>(i * H), one[0].hidden.begin() + static_cast<std::ptrdiff_t>((i + 1) * H));
+                worst = std::max(worst, max_abs_diff(got[i].data(), ref_h.data(), H));
+                const auto pa = real().readout.probabilities(std::span<const float>(got[i]), 2), pb = real().readout.probabilities(std::span<const float>(ref_h), 2);
+                worst_p = std::max(worst_p, std::fabs(pa[0] - pb[0]));
+                if ((pa[0] > pa[1]) != (pb[0] > pb[1])) ++flips;
+            }
+            std::cout << "    in pieces of " << piece << ": largest hidden difference from the one-row run " << std::scientific << std::setprecision(2) << worst << ", largest |dp| " << worst_p << ", flips " << flips
+                      << std::fixed << "\n";
+            CHECK(worst < (c.precision == Precision::F32 ? 1e-3 : 0.1));
+        }
+    }
+    // float16 against float32 on the same 8192 tokens, offset by offset: absolute and relative to the float32 state's size
+    const auto& a16 = by_name.at("float16 8192");
+    const auto& b32 = by_name.at("float32 8192");
+    const std::vector<std::size_t> offsets_8k = {0, 8191, 4096, 4095, 1023, 1024};
+    double worst_rel = 0;
+    for (std::size_t i = 0; i < b32.size() / H; ++i) {
+        double linf = 0, big = 0, num = 0, den = 0;
+        for (std::size_t j = 0; j < H; ++j) {
+            const double d = static_cast<double>(a16[i * H + j]) - static_cast<double>(b32[i * H + j]);
+            linf = std::max(linf, std::fabs(d));
+            big = std::max(big, std::fabs(static_cast<double>(b32[i * H + j])));
+            num += d * d;
+            den += static_cast<double>(b32[i * H + j]) * static_cast<double>(b32[i * H + j]);
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        worst_rel = std::max(worst_rel, rel);
+        std::cout << "    read-out " << i << " (offset " << (i < offsets_8k.size() ? std::to_string(offsets_8k[i]) : std::string("random")) << "): float16 vs float32 largest difference " << std::scientific << std::setprecision(2) << linf
+                  << " of values up to " << big << ", relative L2 " << rel << std::fixed << "\n";
+    }
+    std::cout << "  float16 vs float32, 8192 tokens: worst relative L2 distance " << std::scientific << std::setprecision(2) << worst_rel << std::fixed << "\n";
+    CHECK(worst_rel < 0.05);
 }

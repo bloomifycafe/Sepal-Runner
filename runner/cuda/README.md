@@ -319,7 +319,7 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
 - **Residual ladder**: `EngineRow::capture_layers` returns every layer's output for that row.
 - **Tuning that is on by default**: the last layer's queries, attention, `o_proj` and MLP are computed for the tokens
   that are read out only (`prune_last_layer`; its keys and values are still stored for every token; bit-identical to
-  the full pass in strict mode); on the float16 path the MLP's gate and up multiply writes binary16 (`fp16_gate_up`).
+  the full pass in strict mode, which needed a fix, see the adversarial review below); on the float16 path the MLP's gate and up multiply writes binary16 (`fp16_gate_up`).
   Measured on the same session, both off then on: 16 rows x 640 16.3k -> 17.2k tokens/s, 4800 tokens 12.7k -> 13.3k, 16
   alerts per call 18.9 -> 19.8 alerts/s, 16 alerts with the states cached 72 -> 75 alerts/s.
 
@@ -336,9 +336,65 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
 | memory | 3,000 calls creating and releasing snapshots: device memory before and after identical, pools back to zero use, heap fully merged; budget overrun fails with `BudgetExceeded`, nothing is leaked, the next call gives the same bits; snapshots outlive their parents' handles and the engine |
 | refusals | bad token ids, empty rows, readouts out of range, cyclic or dangling parents, empty handle, snapshot of another engine or geometry, too many rows/tokens: `std::invalid_argument`, nothing left allocated |
 
-The real-model suites (`real_f32`, `real_f16`, `real_strict`, `real_natural`, `real_2b`) print SKIPPED unless
-`SEPAL_REAL_MODEL` (checkpoint directory), `SEPAL_REAL_GOLDEN` (`tools/export_real_golden.py` output) and, for `real_2b`,
-`SEPAL_REAL_MODEL_2B` are set.
+The real-model suites (`real_f32`, `real_f16`, `real_strict`, `real_natural`, `real_2b`, `real_alerts`, `real_cpu`, `real_long`,
+`real_soak`, `real_diag`) print `SKIPPED: real-model ...` unless `SEPAL_REAL_MODEL` (checkpoint directory), `SEPAL_REAL_GOLDEN`
+(`tools/export_real_golden.py` output) and, for `real_2b`, `SEPAL_REAL_MODEL_2B` are set (`real_alerts`, `real_cpu`, `real_long`,
+`real_soak` need `SEPAL_ALERTS` = `runs/alert_workload.json` and `SEPAL_ALERT_GOLDEN` instead of `SEPAL_REAL_GOLDEN`); CTest
+shows them as Skipped (`SKIP_REGULAR_EXPRESSION`), not Passed. `SEPAL_GPU_LOCK` (a directory) makes `real_cpu` take a lock
+around its use of the device; `SEPAL_CPU_CACHE` (a directory) keeps the CPU reference's answers between runs.
+Long runs: `sepal_cuda_engine_tests soak` (`SEPAL_SOAK_MINUTES`, `SEPAL_SOAK_SEED`) is not in CTest.
+
+### Adversarial review (a second reviewer who did not write the engine)
+
+Tests: `test_cuda_engine_attack.cpp` (suites `attack_shapes`, `attack_invariance`, `attack_lifetime`),
+`test_cuda_engine_attack_memory.cpp` (`attack_memory`, `attack_deepchain`, `attack_determinism`, `attack_concurrency`),
+`test_cuda_engine_attack_geometry.cpp` (`attack_geometry`), `test_cuda_engine_soak.cpp` (`soak_short` in CTest; `soak` and
+`real_soak`), `test_cuda_engine_real_alerts.cpp` (`real_alerts`, `real_cpu`, `real_long`, `real_diag`); helpers in
+`tests/attack_util.hpp`. `tools/export_alert_golden.py` writes the float32 transformers hidden state of all 512 prompts of the
+alert workload (`runs/alert-golden/alert_golden.safetensors`), which `real_alerts` compares the engine with.
+
+What was found and fixed:
+
+1. **Strict mode was not batch-invariant with `prune_last_layer` on.** In the pruned last layer the multiply of the queries
+   and gates and the one of the keys and values were narrower than the full pass's single `q|gate|k|v` multiply, and a
+   multiply's bits can depend on its width. Whether a call is pruned depends on the other rows of the call (the number of
+   read-out rows against the number of tokens), so a row's bits depended on its neighbours. It showed on the real model in float32
+   (a state in the call versus the same state stored: 0 of 3 branches identical for states of 64 tokens and more at
+   `gemm_rows` 128; with pruning off 3 of 3) and on a 256-wide geometry in float32 and float16 (16 of 110 rows identical).
+   Strict mode now multiplies the full width for every token in that layer and gathers the read-out rows afterwards (one more
+   call buffer, `2 * attn_width` floats per read-out row: 16 MiB at 0.8B), so pruning changes no bit; natural mode keeps the
+   narrow multiplies.
+2. A failed `CudaEngine` construction (budget too small, weights of another geometry, budget above the card) leaked the cuBLAS
+   handle, the stream and the events: 5.6 MiB of device memory per failure. They are released now.
+3. Float16 with an odd hidden size threw from `gather_rows` in the middle of a call when pruning was on; pruning is switched off
+   for such a geometry.
+4. Threads: `run` is serialised by a mutex (documented in the header); `run` now sets its device, and `memory()` and
+   `last_profile()` no longer race with other calls.
+
+Not changed, but true and worth knowing:
+
+* Attention locates each key by scanning the segment list (`locate_key`), so one query over a chain of S snapshot links costs
+  O(S^2): the attention phase of a one-token call takes 3.8 ms at 250 links, 15 ms at 500, 33 ms at 750 and 60 ms at 1000.
+  `KvBlock` destruction recurses along the chain; chains deeper than 400 were not released in a test (building one is too slow).
+* `run` refuses a start position whose `start + chain tokens` reaches 2^32 in `check_attention_rows`, after the call's memory
+  was taken (it is given back), not at admission.
+* More than `max_call_tokens` read-outs of a single row (repeated offsets) are refused even though they are not extra tokens.
+
+Measured on the 64-alert workload (jeff-base, 512 prompts, transformers float32 as the reference; `real_alerts`):
+
+| engine and way of running | |Δp| median / p99 / max | max abs Δhidden | answer flips |
+|---|---|---|---|
+| float32 natural, alone / 16 per call / reversed / states cached / questions split / one question per call | 5e-7 / 3.5e-6 / 4.2e-6 (alone); worst of the six 5.6e-6 | 4.4e-5 (worst of the six 5.6e-5) | 0 |
+| float32 strict 128, all six ways | 4.9e-7 / 2.8e-6 / 4.9e-6; the six ways are bit-identical | 3.6e-5 | 0 |
+| float16 natural, six ways | 2.0e-4 / 9.3e-4 / 1.7e-3 | 1.1e-2 (1.5e-2 worst way) | 0 against float32; 1 between two float16 batch compositions (alert 11 q2, p = 0.49975 against 0.50055) |
+| float16 strict 128, six ways | 1.9e-4 / 8.9e-4 / 1.2e-3; the six ways are bit-identical | 1.4e-2 | 0 |
+
+No row is an outlier (the largest |Δp| is under 2.2 times the 99th percentile in every row of the table), and the largest
+differences sit at question 1 of a few alerts in every configuration: those are the prompts nearest the decision boundary. The
+CPU float32 reference, on alerts 0 and 63 (1,723 tokens, 528 s, 0.31 s per token): 1.7e-6 from transformers in probability,
+3.1e-5 in hidden state; the float32 engine is 2.1e-6 / 3.3e-5 from it and the float16 engine 9.6e-4 / 7.8e-3.
+Rows of 8,192 and 16,384 tokens, whole against pieces of 1,024 to 4,096 tokens continuing snapshots, twelve read-outs each:
+float32 within 6.7e-5, float16 within 1.5e-2 (|Δp| 6.6e-4); float16 against float32 at 8,192 tokens within 1.4e-3 relative L2.
 
 ### Speed (RTX 3060 12 GB, driver 591.86, CUDA 13.1, cuBLAS 13.2.1, float16; best of 7 runs; llama.cpp b11514 for comparison)
 
