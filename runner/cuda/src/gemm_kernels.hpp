@@ -24,7 +24,7 @@ enum class GemmAccumulate {
 /// summed by tensor-core steps in binary16 accumulators that are added to float32 ones after every `flush_k` values of k
 /// (a multiple of 32; 0 never flushes, so the whole sum is accumulated in binary16). A row's bits depend on its own X row,
 /// W, K, the mode and flush_k only: not on T, N, the other rows, the row's place in the batch, or the tile shape picked for
-/// the call (`config` < 0 picks one by T; 0 to 3 force 128x128, 64x128, 32x128 and 128x64 tiles, for tests).
+/// the call (`config` < 0 picks one by T and N; 0 to 5 force 128x128, 64x128, 32x128, 64x64, 32x64 and 32x32 tiles, for tests).
 /// Requires K and the strides of X and W multiples of 8 with 16-byte aligned pointers, N and the stride of Y even.
 /// Enqueued on `stream`; throws std::invalid_argument for a violated requirement and std::runtime_error when the launch fails.
 void launch_gemm_nt(const void* x, std::size_t ld_x, const void* w, std::size_t ld_w, void* y, std::size_t ld_y, bool y_half, std::size_t t,

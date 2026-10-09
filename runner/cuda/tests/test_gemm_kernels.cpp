@@ -182,7 +182,7 @@ SEPAL_TEST(gemmk_invariance, a_rows_bits_do_not_depend_on_the_tile_shape_the_bat
             for (const Problem* q : {&p, &tail}) {
                 const std::vector<float> all = q->run(0, q->t, mode, flush, -1);
                 // Every tile shape gives the same bits.
-                for (int config = 0; config <= 3; ++config) {
+                for (int config = 0; config <= 5; ++config) {
                     const std::vector<float> other = q->run(0, q->t, mode, flush, config);
                     CHECK(same_bits(all.data(), other.data(), all.size()));
                 }
@@ -209,7 +209,7 @@ SEPAL_TEST(gemmk_edge, tiny_shapes_and_refused_arguments) {
     for (const S s : {S{1, 2, 32}, S{1, 130, 64}, S{129, 2, 96}, S{127, 258, 32}, S{2, 6, 160}, S{3, 4, 8}, S{17, 10, 40}}) {
         const Problem p(s.t, s.n, s.k, 21);
         const std::vector<double> want = reference(p.x, p.w, s.t, s.n, s.k);
-        for (int config = -1; config <= 3; ++config) {
+        for (int config = -1; config <= 5; ++config) {
             CHECK(relative_rms_error(p.run(0, s.t, GemmAccumulate::Float16Flush, 64, config), want) <= 1.5e-3);
             CHECK(relative_rms_error(p.run(0, s.t, GemmAccumulate::Float32, 0, config), want) <= 1e-5);
         }

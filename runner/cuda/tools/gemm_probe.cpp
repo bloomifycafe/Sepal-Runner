@@ -50,6 +50,7 @@ cublasHandle_t g_blas = nullptr;
 cublasLtHandle_t g_lt = nullptr;
 cudaStream_t g_stream = nullptr;
 void* g_workspace = nullptr;
+int g_batches = 3; // batches of back-to-back calls timed; the minimum is reported
 int g_config = -1; // tile configuration of the custom kernel: -1 picks by T
 constexpr std::size_t kWorkspace = std::size_t{32} << 20;
 
@@ -73,7 +74,7 @@ double time_ms(const std::function<void()>& fn, int reps) {
     for (int i = 0; i < 3; ++i) fn();
     CK(cudaStreamSynchronize(g_stream));
     double best = 1e30;
-    for (int batch = 0; batch < 3; ++batch) {
+    for (int batch = 0; batch < g_batches; ++batch) {
         CK(cudaEventRecord(a, g_stream));
         for (int i = 0; i < reps; ++i) fn();
         CK(cudaEventRecord(b, g_stream));
@@ -276,6 +277,14 @@ std::vector<Variant> make_blas_variants(const Buffers& b, int t, int n, int k) {
                      CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n, t, k, &one, b.w16, CUDA_R_16F, k, b.x16, CUDA_R_16F, k, &zero, b.y16,
                                      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
                  }});
+    if (t % 64 == 0 && t >= 128) {
+        // The same product as t/64 batched multiplies of 64 rows: the weights shared (stride 0), X and Y cut into row blocks.
+        v.push_back({"gemmex_f32acc_batched64_out32", false, true, [=, &b]() {
+                         CB(cublasGemmStridedBatchedEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n, 64, k, &one, b.w16, CUDA_R_16F, k, 0, b.x16, CUDA_R_16F, k,
+                                                       static_cast<long long>(64) * k, &zero, b.y32, CUDA_R_32F, n, static_cast<long long>(64) * n, t / 64,
+                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                     }});
+    }
     v.push_back({"gemmex_f32acc_NN_out32", false, true, [=, &b]() { // weights stored [K][N]
                      CB(cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, n, t, k, &one, b.w16t, CUDA_R_16F, n, b.x16, CUDA_R_16F, k, &zero, b.y32,
                                      CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -495,6 +504,7 @@ int main(int argc, char** argv) {
         else if (key == "--seconds") seconds = std::atoi(val.c_str());
         else if (key == "--algos") max_algos = std::atoi(val.c_str());
         else if (key == "--config") g_config = std::atoi(val.c_str());
+        else if (key == "--batches") g_batches = std::atoi(val.c_str());
         else {
             std::fprintf(stderr, "unknown option %s\n", key.c_str());
             return 1;

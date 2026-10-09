@@ -211,6 +211,9 @@ target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
 add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
 target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
 
+add_executable(sepal-cuda-engine-ab tools/engine_ab.cpp)
+target_link_libraries(sepal-cuda-engine-ab PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
+
 # ---- the multiply kernels (binary16 accumulation with a float32 flush, 2-D widening) ----
 add_executable(sepal_cuda_kernel_gemm_tests tests/test_gemm_kernels.cpp src/gemm_kernels.cu ../tests/test_main.cpp)
 target_include_directories(sepal_cuda_kernel_gemm_tests PRIVATE ../tests src)

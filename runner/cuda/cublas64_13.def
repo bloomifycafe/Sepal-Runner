@@ -12,3 +12,4 @@ EXPORTS
     cublasGetStatusString
     cublasSgemm_v2
     cublasGemmEx
+    cublasGemmStridedBatchedEx

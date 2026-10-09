@@ -253,6 +253,25 @@ void launch_config(bool acc16, bool y_half, const __half* x, int ldx, const __ha
     }
 }
 
+// Tile shape by problem size: the largest tile that still gives every SM two or more blocks, never taller than the batch needs.
+// Only the speed depends on this choice, not the bits (see the note on the arithmetic above).
+inline int pick_config(std::size_t t, std::size_t n) {
+    struct Candidate {
+        int config, bm, bn;
+    };
+    static constexpr Candidate candidates[] = {{0, 128, 128}, {1, 64, 128}, {3, 64, 64}, {4, 32, 64}, {5, 32, 32}};
+    const std::size_t height_cap = t > 192 ? 128 : (t > 32 ? 64 : 32);
+    constexpr std::size_t kWantedBlocks = 56; // two per SM of the RTX 3060; other cards just get a similar tile
+    int fallback = 5;
+    for (const Candidate& c : candidates) {
+        if (static_cast<std::size_t>(c.bm) > height_cap) continue;
+        const std::size_t blocks = (t + static_cast<std::size_t>(c.bm) - 1) / static_cast<std::size_t>(c.bm) * ((n + static_cast<std::size_t>(c.bn) - 1) / static_cast<std::size_t>(c.bn));
+        if (blocks >= kWantedBlocks) return c.config;
+        fallback = c.config;
+    }
+    return fallback;
+}
+
 } // namespace detail
 
 void launch_half_to_float_2d(const void* src, std::size_t ld_src, void* dst, std::size_t ld_dst, std::size_t rows,
@@ -291,17 +310,14 @@ void launch_gemm_nt(const void* x, std::size_t ld_x, const void* w, std::size_t 
     const int it = static_cast<int>(t), in = static_cast<int>(n), ik = static_cast<int>(k), ft = static_cast<int>(flush_k / detail::kBK);
     const int ilx = static_cast<int>(ld_x), ilw = static_cast<int>(ld_w), ily = static_cast<int>(ld_y);
     const bool acc16 = accumulate == GemmAccumulate::Float16Flush;
-    if (config < 0) config = t > 192 ? 0 : (t > 48 ? 1 : 2);
+    if (config < 0) config = detail::pick_config(t, n);
     switch (config) {
     case 0: detail::launch_config<128, 128, 2, 4, 3, 2>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
     case 1: detail::launch_config<64, 128, 1, 4, 4, 1>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
     case 2: detail::launch_config<32, 128, 1, 4, 4, 1>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 3: detail::launch_config<128, 64, 2, 2, 4, 1>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 4: detail::launch_config<128, 128, 2, 4, 5, 1>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 5: detail::launch_config<64, 128, 1, 4, 6, 2>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 6: detail::launch_config<128, 128, 2, 4, 4, 1>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 7: detail::launch_config<32, 128, 1, 4, 6, 3>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
-    case 8: detail::launch_config<32, 64, 1, 2, 6, 4>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
+    case 3: detail::launch_config<64, 64, 2, 2, 6, 4>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
+    case 4: detail::launch_config<32, 64, 1, 2, 6, 4>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
+    case 5: detail::launch_config<32, 32, 1, 2, 8, 6>(acc16, y_half, xh, ilx, wh, ilw, y, ily, it, in, ik, ft, stream); break;
     default: throw std::invalid_argument("gemm_nt: unknown configuration");
     }
     check(cudaGetLastError(), "gemm_nt kernel launch");

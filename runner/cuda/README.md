@@ -249,11 +249,16 @@ candidate, unmeasured) or less work per alert (last-layer pruning, the prefix ca
 | File | What it is |
 |---|---|
 | `toolchain-requirements.txt`, `setup_toolchain.ps1` | The pinned wheels and the script that recreates `.toolchain/` |
-| `CMakeLists.txt`, `CMakePresets.json`, `cublas64_13.def` | The build; the cuBLAS import-library definition |
+| `CMakeLists.txt`, `CMakePresets.json`, `cublas64_13.def`, `cublasLt64_13.def` | The build; the import-library definitions of the cuBLAS and cuBLASLt entry points used |
 | `include/sepal/cuda/cuda_gemm.hpp`, `src/cuda_gemm.cpp` | The provider |
 | `src/convert_kernels.hpp`, `src/convert_kernels.cu` | The element-type conversion kernels |
+| `src/gemm_kernels.hpp`, `src/gemm_kernels.cu` | The batch-invariant tensor-core multiply (binary16 or float32 accumulators) and the 2-D widening used by binary16-accumulating cuBLAS multiplies |
 | `tests/test_cuda_gemm.cpp` | Suites `contract`, `parity_small`, `parity_real`, `rows` |
+| `tests/test_gemm_kernels.cpp` | Suites `gemmk_convert`, `gemmk_accuracy`, `gemmk_invariance`, `gemmk_edge` (CTest `cuda_gemmk_*`) |
+| `tests/test_cuda_engine_multiply.cpp` | Suite `engine_multiply`: the multiply options on a tiny geometry |
 | `tools/sepal_cuda_bench.cpp` | `sepal-cuda-bench` |
+| `tools/gemm_probe.cpp` | `sepal-cuda-gemm-probe`: cuBLAS, cuBLASLt (every candidate algorithm) and the own kernel at the engine's shapes, with their error |
+| `tools/engine_ab.cpp` | `sepal-cuda-engine-ab`: engine option sets compared inside one process |
 
 ## Attention kernels
 
@@ -315,7 +320,8 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
   engine stays usable.
 - **Multiply batching.** `gemm_rows = 0` is natural (one multiply over all tokens). `gemm_rows = T` is strict: every
   multiply is cut into multiplies of exactly T rows, the last zero-padded, so a row's bits do not depend on the rest of
-  the call. All of the engine's own kernels are batch-invariant.
+  the call. All of the engine's own kernels are batch-invariant. With `multiply_path = Invariant` the multiplies are too
+  (the engine's own kernel, see "Multiply throughput" below), and strict mode then pads nothing.
 - **Residual ladder**: `EngineRow::capture_layers` returns every layer's output for that row.
 - **Tuning that is on by default**: the last layer's queries, attention, `o_proj` and MLP are computed for the tokens
   that are read out only (`prune_last_layer`; its keys and values are still stored for every token; bit-identical to
@@ -333,6 +339,7 @@ auto results = engine.run(rows);                       // results[k + 1].hidden:
 | Qwen3.5-2B-Base, float32 engine vs CPU reference (51 tokens, state with two branches) | 5.2e-5; float16 vs float32 engine: max 1.5e-2, mean 1.5e-3 |
 | strict mode (tiny, float32 and float16, gemm_rows 8/16/24/32/64; real model, 128 and 1024) | a row alone vs among other rows at random places: bit-identical in every trial; branch from a stored snapshot vs the same branch run with its state: bit-identical (118 of 118 tiny, 18 of 18 real, plus three-deep chains); permuting the rows of a call: 420 of 420 rows and 420 of 420 left-behind snapshots tiny, 111 of 111 rows real; repeated runs identical in both modes |
 | natural mode drift | real model, 36 branch rows alone vs in calls of 4 to 16 rows: every row differs in bits; float16 max |Δp| 7.3e-4; float32 max |Δp| 1.6e-6 |
+| multiply options (`gemmk_*`, `engine_multiply`, `real_f16`, `real_strict`, `real_2b`) | the own kernel against float64: float32 accumulation 2e-7 to 6e-6 relative rms, binary16 accumulation with a flush every 64 / 128 / 256 values of k 4.4e-4 / 6.1e-4 / 8.4e-4; a row's bits identical across six tile shapes, batches of 1 to 213 rows and every place in a batch; in the engine, with either accumulation, natural and strict (`gemm_rows` 0, 16, 48, 128) on the tiny and the real geometries: every row bit-identical alone, among other rows and continued from a stored snapshot; cuBLAS with binary16 accumulation in strict mode is bit-identical only since the last layer runs the same two multiplies pruned or not (before: 0 of 18 snapshot continuations identical); accuracy against the golden in "Multiply throughput" below |
 | memory | 3,000 calls creating and releasing snapshots: device memory before and after identical, pools back to zero use, heap fully merged; budget overrun fails with `BudgetExceeded`, nothing is leaked, the next call gives the same bits; snapshots outlive their parents' handles and the engine |
 | refusals | bad token ids, empty rows, readouts out of range, cyclic or dangling parents, empty handle, snapshot of another engine or geometry, too many rows/tokens: `std::invalid_argument`, nothing left allocated |
 
@@ -369,9 +376,11 @@ Where a call's time goes (synchronised profiling mode, so each total is longer t
 | 16 rows x 640 | 407 | 128 | 15.6 | 37 | 2.7 | 591 |
 | 16 alerts per call | 546 | 175 | 24.8 | 49.8 | 3.2 | 799 |
 
-The multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's float16-with-float32-accumulation tensor peak (28 SMs x
-512 FLOPs per clock x about 1.78 GHz = 25.5 TFLOP/s): on the 2B model they are 81% of a call, so raw tokens per second
-there (83% of a 16 x 640 call) cannot move far from llama.cpp's. What is left is the DeltaNet scan (one block per row and value head: a single
+The multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's tensor rate with binary16 operands and float32 accumulation (28 SMs x
+512 FLOPs per clock x about 1.9 GHz = 27.8 TFLOP/s; cuBLAS reaches 96% of it): on the 2B model they are 81% of a call, so raw tokens per
+second there (83% of a 16 x 640 call) cannot move far from llama.cpp's **while the accumulators are float32**. That rate is not the
+card's tensor peak: the same tensor cores run twice as fast with binary16 accumulators, which is what the next section measures and
+the new `EngineOptions` use. What is left is the DeltaNet scan (one block per row and value head: a single
 long row uses 16 blocks of 28 SMs) and the memory-bound elementwise kernels.
 
 Peak device memory (0.8B and 2B, float16, the bench's default budget of 85% of the free memory): the engine reserves
@@ -379,3 +388,253 @@ Peak device memory (0.8B and 2B, float16, the bench's default budget of 85% of t
 2B: weights 3,590, call buffers 1,460, 93 slots 1,792, heap 2,714); in use at the peak of the workload (16 alerts per
 call): 2,869 MiB for the 0.8B and 5,521 MiB for the 2B. The process took 9.7 GiB of the 12 GiB card (the desktop holds
 the rest).
+
+### Multiply throughput: what the card can do, and what the engine does with it
+
+`sepal-cuda-gemm-probe` (`tools/gemm_probe.cpp`, target `sepal-cuda-gemm-probe`) times one multiply at a time the way the engine
+issues it (`Y^T = op_T(W [N,K]) X^T`, binary16 operands, 32 MB cuBLAS workspace) and measures its error against a float64 product.
+Every figure is the shortest of several batches of back-to-back calls (the card is shared with the desktop and with other jobs,
+so one slow batch must not count). `cublasGemmEx` is called with `CUBLAS_GEMM_DEFAULT`; cuBLASLt is asked for 24 algorithms and every
+one is timed. Same card and software as above (cuBLAS 13.2.1, driver 591.86, SM clock about 1.9 GHz under load).
+
+**1. What cuBLAS delivers against what the card can do.** The previous section's number is right and its reading is not. 28 SMs x
+512 FLOPs per clock x 1.94 GHz = 27.8 TFLOP/s is the tensor-core rate with binary16 operands and **float32 accumulation**, and cuBLAS gets
+96% of it on large shapes (26.6 to 26.8). It is not the card's tensor peak: GeForce cards run the same tensor cores at **twice** that
+rate when the accumulators are binary16 (`CUBLAS_COMPUTE_16F`), and cuBLAS gets 44 to 49 TFLOP/s there (88% of 55.7).
+
+| 8192 x 8192 x 4096, TFLOP/s | cuBLAS `GemmEx` | cuBLASLt, best of its candidates |
+|---|---|---|
+| binary16 operands, float32 accumulation, float32 output (the engine today) | 26.6 | 26.5 |
+| the same with binary16 output | 26.8 | 26.6 |
+| the same with the weights stored [K][N] instead of [N][K] | 26.6 | 26.4 |
+| `CUBLAS_COMPUTE_32F_FAST_16F` | 26.5 | |
+| binary16 accumulation, binary16 output (`CUBLAS_COMPUTE_16F`) | 43.8 | 47.8; 48.9 with the weights [K][N] |
+| TF32 (float32 operands) | 13.3 | |
+| float32 (`cublasSgemm`) | 7.7 | |
+
+At the engine's own shapes, in TFLOP/s: the first column is today's call (float32 accumulation, float32 output, weights [N][K]); the
+others are the variants discussed below (`sepal-cuda-gemm-probe shapes --model 0.8b|2b --lt 1`):
+
+*Qwen3.5-0.8B shapes, TFLOP/s:*
+
+| shape (N x K) | tokens | cuBLAS (engine today) | W stored [K][N] | batched 64 rows | cuBLASLt, best of 24 | binary16 accumulate | binary16 acc., Lt best, [K][N] | own kernel, float32 acc. | own kernel, binary16 acc., flush 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| mlp_gate_up (7168 x 1024) | 64 | 13.2 | 12.3 |  | 15.6 | 17.4 | 18.0 | 12.6 | 12.7 |
+| mlp_gate_up (7168 x 1024) | 256 | 22.8 | 23.1 | 15.6 | 22.9 | 34.0 | 40.1 | 21.3 | 33.4 |
+| mlp_gate_up (7168 x 1024) | 1024 | 24.0 | 24.1 | 14.5 | 25.8 | 44.0 | 44.4 | 22.5 | 35.6 |
+| mlp_gate_up (7168 x 1024) | 4096 | 24.4 | 25.1 | 14.2 | 26.1 | 45.2 | 45.5 | 22.9 | 36.4 |
+| mlp_down (1024 x 3584) | 64 | 11.9 | 11.9 |  | 12.0 | 16.1 | 16.9 | 8.5 | 9.2 |
+| mlp_down (1024 x 3584) | 256 | 19.6 | 19.2 | 12.8 | 19.6 | 30.9 | 33.7 | 12.5 | 14.1 |
+| mlp_down (1024 x 3584) | 1024 | 21.4 | 21.3 | 20.1 | 23.5 | 39.9 | 41.8 | 16.7 | 26.7 |
+| mlp_down (1024 x 3584) | 4096 | 23.8 | 23.8 | 23.7 | 25.3 | 43.2 | 45.0 | 21.1 | 35.7 |
+| deltanet_in (8224 x 1024) | 64 | 10.3 | 12.4 |  | 12.5 | 13.3 | 15.5 | 9.8 | 10.9 |
+| deltanet_in (8224 x 1024) | 256 | 17.9 | 18.0 | 14.9 | 18.0 | 32.3 | 37.4 | 19.9 | 30.0 |
+| deltanet_in (8224 x 1024) | 1024 | 23.7 | 23.7 | 14.3 | 25.0 | 34.6 | 41.8 | 21.8 | 34.6 |
+| deltanet_in (8224 x 1024) | 4096 | 24.2 | 25.7 | 14.3 | 25.8 | 35.2 | 42.8 | 22.4 | 36.0 |
+| deltanet_out (1024 x 2048) | 64 | 11.6 | 12.0 |  | 12.0 | 14.5 | 15.1 | 8.1 | 8.7 |
+| deltanet_out (1024 x 2048) | 256 | 17.6 | 17.6 | 12.8 | 17.6 | 27.8 | 28.5 | 12.9 | 15.2 |
+| deltanet_out (1024 x 2048) | 1024 | 22.5 | 22.7 | 20.6 | 22.5 | 38.2 | 39.0 | 16.5 | 26.3 |
+| deltanet_out (1024 x 2048) | 4096 | 23.0 | 23.1 | 24.2 | 24.5 | 41.0 | 43.6 | 21.0 | 35.0 |
+| attn_in (5120 x 1024) | 64 | 13.4 | 15.2 |  | 13.4 | 16.8 | 17.3 | 11.7 | 12.4 |
+| attn_in (5120 x 1024) | 256 | 23.1 | 23.6 | 19.8 | 23.2 | 32.1 | 38.6 | 19.8 | 29.1 |
+| attn_in (5120 x 1024) | 1024 | 23.2 | 23.4 | 15.6 | 24.3 | 42.5 | 42.8 | 21.3 | 33.8 |
+| attn_in (5120 x 1024) | 4096 | 23.9 | 26.1 | 14.4 | 26.0 | 44.9 | 44.9 | 22.6 | 35.9 |
+| attn_out (1024 x 2048) | 64 | 11.6 | 11.9 |  | 12.0 | 14.5 | 15.1 | 8.1 | 8.7 |
+| attn_out (1024 x 2048) | 256 | 17.6 | 17.7 | 12.8 | 17.5 | 27.8 | 28.6 | 12.8 | 15.2 |
+| attn_out (1024 x 2048) | 1024 | 22.5 | 22.8 | 20.5 | 22.4 | 38.3 | 39.3 | 16.5 | 26.1 |
+| attn_out (1024 x 2048) | 4096 | 23.1 | 23.1 | 24.2 | 24.5 | 41.1 | 43.6 | 21.0 | 35.2 |
+
+*Qwen3.5-2B shapes, TFLOP/s:*
+
+| shape (N x K) | tokens | cuBLAS (engine today) | W stored [K][N] | batched 64 rows | cuBLASLt, best of 24 | binary16 accumulate | binary16 acc., Lt best, [K][N] | own kernel, float32 acc. | own kernel, binary16 acc., flush 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| mlp_gate_up (12288 x 2048) | 64 | 18.1 | 10.7 |  | 18.1 | 17.9 | 20.1 | 12.5 | 12.8 |
+| mlp_gate_up (12288 x 2048) | 256 | 21.7 | 25.1 | 14.5 | 21.6 | 39.8 | 41.9 | 22.2 | 34.4 |
+| mlp_gate_up (12288 x 2048) | 1024 | 25.5 | 25.5 | 14.3 | 26.1 | 43.0 | 46.8 | 22.8 | 37.8 |
+| mlp_gate_up (12288 x 2048) | 4096 | 24.4 | 26.1 | 14.1 | 26.6 | 42.3 | 46.9 | 23.4 | 35.5 |
+| mlp_down (2048 x 6144) | 64 | 12.4 | 12.7 |  | 14.6 | 17.7 | 19.8 | 6.7 | 7.9 |
+| mlp_down (2048 x 6144) | 256 | 21.9 | 22.1 | 13.3 | 21.8 | 33.8 | 37.2 | 14.8 | 19.9 |
+| mlp_down (2048 x 6144) | 1024 | 23.2 | 23.6 | 18.3 | 24.7 | 43.2 | 45.1 | 20.8 | 34.3 |
+| mlp_down (2048 x 6144) | 4096 | 25.0 | 25.2 | 15.4 | 26.4 | 40.5 | 47.1 | 22.4 | 35.7 |
+| deltanet_in (8224 x 2048) | 64 | 12.3 | 15.5 |  | 13.7 | 14.3 | 17.4 | 9.2 | 10.8 |
+| deltanet_in (8224 x 2048) | 256 | 19.2 | 19.2 | 14.6 | 19.9 | 37.2 | 38.6 | 20.5 | 32.4 |
+| deltanet_in (8224 x 2048) | 1024 | 25.0 | 24.9 | 14.7 | 25.7 | 41.5 | 43.1 | 22.3 | 36.8 |
+| deltanet_in (8224 x 2048) | 4096 | 23.6 | 25.0 | 14.5 | 26.2 | 42.1 | 45.6 | 22.8 | 36.0 |
+| deltanet_out (2048 x 2048) | 64 | 10.8 | 10.8 |  | 13.2 | 16.7 | 17.5 | 6.4 | 7.7 |
+| deltanet_out (2048 x 2048) | 256 | 16.9 | 17.9 | 13.4 | 17.7 | 30.6 | 33.7 | 14.5 | 19.1 |
+| deltanet_out (2048 x 2048) | 1024 | 20.2 | 20.3 | 18.0 | 24.0 | 39.3 | 42.8 | 20.4 | 32.0 |
+| deltanet_out (2048 x 2048) | 4096 | 22.9 | 23.4 | 23.0 | 25.6 | 42.7 | 43.8 | 22.2 | 36.7 |
+| attn_in (5120 x 2048) | 64 | 16.0 | 16.9 |  | 16.1 | 18.3 | 19.2 | 11.7 | 12.4 |
+| attn_in (5120 x 2048) | 256 | 24.5 | 24.6 | 20.7 | 24.5 | 36.9 | 41.9 | 20.4 | 31.4 |
+| attn_in (5120 x 2048) | 1024 | 24.4 | 24.5 | 16.5 | 25.2 | 42.5 | 44.9 | 21.7 | 36.3 |
+| attn_in (5120 x 2048) | 4096 | 24.0 | 25.6 | 15.0 | 26.4 | 42.9 | 47.1 | 23.0 | 37.2 |
+| attn_out (2048 x 2048) | 64 | 10.8 | 10.8 |  | 13.2 | 16.7 | 17.5 | 6.4 | 7.7 |
+| attn_out (2048 x 2048) | 256 | 16.9 | 17.8 | 13.4 | 17.7 | 30.6 | 33.6 | 14.5 | 19.1 |
+| attn_out (2048 x 2048) | 1024 | 20.2 | 20.3 | 18.0 | 23.9 | 39.2 | 42.4 | 20.4 | 32.2 |
+| attn_out (2048 x 2048) | 4096 | 22.8 | 23.4 | 23.1 | 25.6 | 42.7 | 43.9 | 22.2 | 36.5 |
+
+
+- **Shape and orientation.** From 1,024 tokens up cuBLAS runs the engine's wide shapes (N of 5,120 and more) at 23 to 25.5 TFLOP/s
+  (86 to 96% of the 26.6 ceiling) and the narrow output projections (N of 1,024 or 2,048) at 20 to 23; at 256 tokens it is at 17
+  to 25, at 64 tokens at 11 to 18. Storing the weights [K][N] instead of [N][K] changes nothing with float32 accumulation (within 3%;
+  up to +8% in a few cells, and +20% at 64 tokens for two of the shapes). Cutting the rows into 64-row batched multiplies is
+  slower (14 to 24). There is no tall-skinny penalty beyond the bandwidth limit below; `lda`/`ldb` are the natural ones and every
+  operand pointer is 256-byte aligned with every leading dimension a multiple of 8, so alignment is not a factor.
+
+**2. Other entry points.**
+
+- *cuBLASLt with the heuristic search* finds an algorithm 3 to 9% faster than the one `cublasGemmEx` picks (which is Lt's first
+  candidate, identical timings) from 1,024 tokens up, 18% at 64 tokens for the 7,168-wide gate_up, and 19% for the 2B model's 2,048 x
+  2,048 output projections at 1,024 tokens. It is not used: the winner has to be found by timing, per shape and per process, and a
+  different winner gives different bits.
+- *Compute types.* binary16 output instead of float32 saves 0 to 10% of the multiply and costs the traffic of widening it again; the
+  engine already does it where the consumer takes binary16 (the MLP's gate and up). `FAST_16F` is the same speed as `COMPUTE_32F` (the operands are
+  already binary16). TF32 and float32 are 2 and 3.5 times slower. `CUBLAS_COMPUTE_16F` is 1.8 times faster and is the one lever
+  that moves the multiplies, at an accuracy cost (below). int8 was out of scope.
+- *Strided batched over row blocks* (`cublasGemmStridedBatchedEx`, 64 rows per batch entry): slower than one call (above).
+- *Pedantic mode* changes no result (`CudaGemmOptions::pedantic`, README above).
+
+Accuracy of each variant at one multiply (relative rms error against float64, X ~ N(0,1), W ~ N(0,1/K); the same figures for K = 1,024
+and K = 3,584 unless two are given):
+
+| Variant | Error |
+|---|---|
+| float32 accumulation, float32 output (today) | 1.7e-6 / 1.5e-6 |
+| float32 accumulation, binary16 output | 2.1e-4 |
+| `CUBLAS_COMPUTE_16F`, binary16 output | 1.7e-3 / 3.1e-3 (grows with the square root of K) |
+| own kernel, binary16 accumulators flushed into float32 every 64 / 128 / 256 / 512 values of k | 4.4e-4 / 6.1e-4 / 8.4e-4 / 1.2e-3 |
+| own kernel, binary16 accumulators, never flushed (the same arithmetic as `COMPUTE_16F`) | 1.7e-3 / 3.1e-3 |
+
+**Engine accuracy** (`real_f16`, jeff-base, six prompts against the float32 golden; gates: |Δp| <= 0.03, no answer flip, today 7.4e-4;
+every row has 0 flips). "all four" is `gate_up`, `down`, `mixer_in` and `mixer_out` together.
+
+| Multiplies | max/mean \|Δp\| | max/mean \|Δhidden\| |
+|---|---|---|
+| cuBLAS, float32 accumulation (default) | 7.4e-4 / 1.6e-4 | 6.9e-3 / 9.7e-4 |
+| own kernel, float32 accumulation | 2.9e-4 / 9.6e-5 | 1.2e-2 / 9.4e-4 |
+| own kernel, binary16 accumulation, flush 64, all four | 4.4e-4 / 2.2e-4 | 1.6e-2 / 1.8e-3 |
+| own kernel, binary16 accumulation, flush 128, all four | 1.2e-3 / 4.7e-4 | 2.2e-2 / 2.6e-3 |
+| own kernel, binary16 accumulation, flush 256, all four | 2.0e-3 / 6.4e-4 | 3.1e-2 / 3.6e-3 |
+| own kernel, binary16 accumulation, never flushed, all four | 2.6e-3 / 1.0e-3 | 1.9e-1 / 1.1e-2 |
+| cuBLAS `COMPUTE_16F`, all four | 4.8e-3 / 1.4e-3 | 1.3e-1 / 8.1e-3 |
+| cuBLAS `COMPUTE_16F`, `gate_up` only / `down` only / `mixer_in` only / `mixer_out` only | 1.3e-3 / 1.0e-3 / 1.9e-3 / 9.5e-4 | 4.9e-2 / 1.3e-1 / 4.0e-2 / 2.9e-2 |
+| transformers' own float16, for scale | 5.0e-4 / 2.5e-4 | 2.0e-2 / 1.6e-3 |
+
+On Qwen3.5-2B (51 tokens, mean \|Δhidden\| against the float32 engine): cuBLAS float32 1.8e-3, cuBLAS `COMPUTE_16F` 1.1e-2, own kernel float32 2.0e-3,
+own kernel binary16 flush 64 / 128 / 256: 3.8e-3 / 4.4e-3 / 6.3e-3.
+
+**3. Removing work, and why small calls are slow.**
+
+- *Unused multiplies.* None left on the dense path: the last layer's queries, `o_proj` and MLP run for the read-out tokens only
+  (`prune_last_layer`); the keys and values of every token are needed by later rows and snapshots; the read-out norm and head run
+  on the read-out rows. Projections that share an input are already one multiply (q/k/v, the DeltaNet's q/k/v/z/b/a, gate and up).
+  The multiplies of one layer form a chain (input projection, scan or attention, output projection, MLP), so there is nothing to
+  run on a second stream, except the pruned last layer's two multiplies, which are small.
+- *64-token calls.* The profile's 5.8 ms of multiplies for 64 tokens is inflated by the synchronisation around every phase; the 96
+  multiplies unprofiled take 5.3 ms of the call's 7.5 ms. The floor is memory: the layers' weights are 0.99 GB in binary16 and the card
+  reads at 360 GB/s at best, 2.8 ms; cuBLAS runs these skinny multiplies at 190 GB/s (the 7,168 x 1,024 gate/up weight, 14.7 MB, in 0.075 ms), 52% of the
+  limit, and our own kernel, tried with six tile shapes, is at 0.070 to 0.074 ms with four of them: neither gets close to the bandwidth with so few
+  rows. cuBLASLt's best algorithm is 13% faster at that size (not used, see above). Launch and setup overhead is not the cause: the
+  probe's back-to-back calls include the launches, and the device time of the 96 multiplies matches the call.
+- *Strict mode's padding.* `gemm_rows = 1024` pads a 64-token call to 1,024 rows, which is why it ran at 1,352 tokens/s against 8,610 natural.
+  A fixed ladder of block sizes does not repair it with cuBLAS: a row's bits depend on the block size it was multiplied in, so the
+  ladder would have to be chosen from the row's own length and the rows grouped by rung before every multiply, one cuBLAS call per
+  group and layer, which is many small launches for a call with many rows. The engine's own kernel makes the question disappear
+  (below): its result for a row does not depend on the batch at all, so strict mode pads nothing.
+  One more thing found while checking this: `CUBLAS_COMPUTE_16F` kernels round differently from the float32-accumulate kernels
+  that cuBLAS picks for the other shapes, so the last layer's keys and values must come from the same multiply whether or not the
+  layer is pruned; in strict mode the engine now issues the unpruned last layer as the two multiplies the pruned one uses (queries
+  and gates; keys and values).
+
+**4. A hand-written tensor-core kernel is plausible, and it is in the engine.** `src/gemm_kernels.cu`: `mma.sync.m16n8k16`
+tiles of 128x128 (and five smaller shapes for few rows or narrow outputs), `cp.async` pipeline, XOR-swizzled shared memory, `ldmatrix`; about 300
+lines. First version, tuned only by tile shapes and stage counts (columns "own kernel" in the tables above): 21 to 23 TFLOP/s with float32
+accumulators on the wide shapes from 1,024 tokens (cuBLAS 24 to 25; 16 to 21 on the narrow ones), 33 to 37 with binary16 accumulators flushed
+every 128 (cuBLAS `COMPUTE_16F` 40 to 45); at 64 tokens it is 20 to 40% below cuBLAS on the narrow shapes. An ablation says why it stops there: a
+variant that only loads the tiles, with no multiply, already takes longer than the multiplies alone would, so the kernel is bound by the
+global-to-shared traffic of its 128x128 tile. A larger tile would move less data per FLOP but does not fit the register budget
+next to the float32 flush accumulators, so closing the rest of the gap is real work, not a parameter.
+What the kernel has that cuBLAS cannot offer: **a row's bits depend on that row, the weights, K and the flush interval only**
+(tests: across six tile shapes, batch sizes 1 to 213 and every place in a batch, bit for bit), the **flush** that brings binary16
+accumulation back to the accuracy of a binary16 output, and **no padding in strict mode**.
+
+#### What is implemented (`EngineOptions`)
+
+| Field | Default | What it does |
+|---|---|---|
+| `multiply_path` | `Cublas` | `Invariant` runs every float16-path multiply on `src/gemm_kernels.cu`: bits independent of the batch (natural mode is invariant too), strict mode (`gemm_rows` > 0) pads nothing. A multiply whose shape the kernel does not take (K or a row stride not a multiple of 8, odd N) falls back to cuBLAS and strict mode pads as before |
+| `fp16_accumulate.{gate_up, down, mixer_in, mixer_out}` | all `false` | which multiplies accumulate in binary16: with `Cublas`, `CUBLAS_COMPUTE_16F` and a binary16 result widened by a small kernel; with `Invariant`, the own kernel with the flush |
+| `fp16_accumulate.flush_k` | 128 | `Invariant` only: binary16 values summed before they are added to the float32 sum (a multiple of 32; 0 never flushes) |
+
+`sepal-cuda-engine-bench` takes `--multiply-path cublas|invariant`, `--fp16-accumulate all|none|gate_up,down,...` and `--fp16-flush-k N`;
+`sepal-cuda-engine-ab` runs several option sets in one process, round after round, and reports the best of each (a shared GPU
+needs that). Nothing is on by default: binary16 accumulation changes the numbers, and `Invariant` changes the bits and is
+slower than cuBLAS with float32 accumulators.
+
+#### Engine speed, before and after (same session, `sepal-cuda-engine-ab`, best of 2 rounds x 5 reps, tokens/s)
+
+*Qwen3.5-0.8B, natural mode (`gemm_rows` 0), prefill, best of 3 rotated rounds of 7 timed calls each:*
+
+| tokens/s | cuBLAS (today) | cuBLAS binary16 acc., MLP only | cuBLAS binary16 acc., all four | own kernel, float32 acc. | own, binary16 acc., flush 64 | own, binary16 acc., flush 128 |
+|---|---|---|---|---|---|---|
+| 1 row x 64 | 8,605 | 9,140 (+6%) | 8,856 (+3%) | 7,196 (-16%) | 7,535 (-12%) | 7,586 (-12%) |
+| 1 row x 128 | 11,389 | 12,847 (+13%) | 12,461 (+9%) | 8,548 (-25%) | 9,616 (-16%) | 9,702 (-15%) |
+| 1 row x 300 | 11,723 | 14,464 (+23%) | 12,956 (+11%) | 10,851 (-7%) | 13,388 (+14%) | 13,603 (+16%) |
+| 1 row x 600 | 13,099 | 16,547 (+26%) | 14,809 (+13%) | 12,250 (-6%) | 14,847 (+13%) | 15,120 (+15%) |
+| 1 row x 1000 | 13,672 | 16,606 (+21%) | 15,711 (+15%) | 12,452 (-9%) | 15,758 (+15%) | 16,128 (+18%) |
+| 1 row x 2048 | 13,895 | 17,211 (+24%) | 15,755 (+13%) | 13,124 (-6%) | 16,427 (+18%) | 16,805 (+21%) |
+| 1 row x 4800 | 13,892 | 16,488 (+19%) | 15,393 (+11%) | 12,932 (-7%) | 16,006 (+15%) | 16,373 (+18%) |
+| 16 rows x 640 | 17,895 | 22,692 (+27%) | 20,816 (+16%) | 16,819 (-6%) | 21,731 (+21%) | 22,162 (+24%) |
+
+*Qwen3.5-2B, the same:*
+
+| tokens/s | cuBLAS (today) | cuBLAS binary16 acc., MLP only | cuBLAS binary16 acc., all four | own kernel, float32 acc. | own, binary16 acc., flush 64 | own, binary16 acc., flush 128 |
+|---|---|---|---|---|---|---|
+| 1 row x 64 | 4,326 | 4,742 (+10%) | 4,503 (+4%) | 3,013 (-30%) | 3,268 (-24%) | 3,296 (-24%) |
+| 1 row x 128 | 5,831 | 6,907 (+18%) | 6,366 (+9%) | 4,912 (-16%) | 5,492 (-6%) | 5,562 (-5%) |
+| 1 row x 300 | 5,840 | 8,083 (+38%) | 6,856 (+17%) | 5,164 (-12%) | 6,943 (+19%) | 7,128 (+22%) |
+| 1 row x 600 | 6,650 | 9,012 (+36%) | 8,148 (+23%) | 5,987 (-10%) | 8,150 (+23%) | 8,326 (+25%) |
+| 1 row x 1000 | 6,667 | 9,539 (+43%) | 8,584 (+29%) | 6,271 (-6%) | 8,687 (+30%) | 8,923 (+34%) |
+| 1 row x 2048 | 7,062 | 9,676 (+37%) | 8,756 (+24%) | 6,475 (-8%) | 8,977 (+27%) | 9,171 (+30%) |
+| 1 row x 4800 | 6,792 | 9,369 (+38%) | 8,364 (+23%) | 6,471 (-5%) | 8,652 (+27%) | 8,803 (+30%) |
+| 16 rows x 640 | 8,107 | 11,098 (+37%) | 9,927 (+22%) | 7,351 (-9%) | 9,636 (+19%) | 9,828 (+21%) |
+
+llama.cpp b11514 on the same card, for scale (earlier table): 0.8B 5,204 / 9,422 / 11,056 / 10,018 at 64 / 600 / 2,048 / 4,800 tokens; 2B 3,281 / 6,342 / 6,888 at 64 / 600 / 2,048.
+
+*Strict mode (`gemm_rows` 1024, bit-identical whatever shares the call): cuBLAS pads every multiply to a multiple of 1,024 rows; the own kernel pads nothing. Tokens per second, alerts per second for the last two rows; best of 2 rounds x 5 calls in one process.*
+
+*Qwen3.5-0.8B:*
+
+| strict `gemm_rows` 1024 | cuBLAS padded | own kernel, float32 acc. | own, binary16 acc., flush 64 |
+|---|---|---|---|
+| 1 row x 64 | 1,343 | 7,161 (+433%) | 7,541 (+461%) |
+| 1 row x 128 | 2,540 | 8,535 (+236%) | 9,617 (+279%) |
+| 1 row x 600 | 9,190 | 12,130 (+32%) | 14,621 (+59%) |
+| 1 row x 2048 | 13,084 | 12,666 (-3%) | 16,114 (+23%) |
+| 16 rows x 640 | 16,576 | 16,250 (-2%) | 21,080 (+27%) |
+| 1 alert(s) per call [alerts/s] | 14.0 | 14.7 (+5%) | 19.2 (+37%) |
+| 16 alert(s) per call [alerts/s] | 18.6 | 18.6 (+0%) | 23.8 (+28%) |
+
+*Qwen3.5-2B:*
+
+| strict `gemm_rows` 1024 | cuBLAS padded | own kernel, float32 acc. | own, binary16 acc., flush 64 |
+|---|---|---|---|
+| 1 row x 64 | 524 | 3,016 (+476%) | 3,263 (+523%) |
+| 1 row x 128 | 1,029 | 4,915 (+377%) | 5,483 (+433%) |
+| 1 row x 600 | 4,274 | 5,992 (+40%) | 8,142 (+91%) |
+| 1 row x 2048 | 6,686 | 6,444 (-4%) | 8,959 (+34%) |
+| 16 rows x 640 | 7,510 | 7,335 (-2%) | 9,686 (+29%) |
+| 1 alert(s) per call [alerts/s] | 6.7 | 7.4 (+10%) | 10.4 (+55%) |
+| 16 alert(s) per call [alerts/s] | 8.4 | 8.5 (+1%) | 11.0 (+31%) |
+
+
+Reading: **binary16 accumulation is the one thing that moves the multiplies**, and it moves them 1.2 to 1.4 times. With cuBLAS
+(`cublas16`) the engine is 24% (0.8B) and 37% (2B) faster at 2,048 tokens for a 6.5x larger |Δp| (4.8e-3, still 6x inside the gate); with
+the own kernel and flush 64 it is 18% and 27% faster at the accuracy of today's engine (|Δp| 4.4e-4 against 7.4e-4), and bit-identical
+whatever shares the call. On the 2B model that is 9.0k tokens/s at 2,048 tokens against llama.cpp's 6.9k: 1.3x; with `cublas16`, 9.7k: 1.4x.
+The own kernel with float32 accumulators costs 5 to 8% at 2,048 tokens and 15 to 30% below 300 tokens, and buys batch invariance in natural
+mode and strict mode without padding (the strict rows above).
+In strict mode the own kernel removes the padding: a 64-token call goes from 1,343 to 7,161 tokens/s on the 0.8B (5.3x; natural cuBLAS
+is 8,500) and from 524 to 3,016 on the 2B (5.8x), a single alert from 14.0 to 14.7 alerts/s (float32 accumulators) or 19.2 (binary16, flush 64)
+on the 0.8B and from 6.7 to 7.4 or 10.4 on the 2B, while a row's bits still do not depend on the call. The 2B strict rows were measured
+with the other jobs on the card at their noisiest; read them to within 10%.
