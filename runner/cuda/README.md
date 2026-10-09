@@ -1138,6 +1138,11 @@ Qwen3.5-0.8B fine-tune) and Qwen3.5-2B-Base, float16 path. Code: `src/gemm_s8_ke
 
 ### Conclusion
 
+* **Update (smoothing, section 5): a mixed profile gets W8A8 to the accuracy of W8A16 and keeps the 2B at 2.0x llama.cpp (not above it) and 1.23x the new default.** Static per-input-channel smoothing (SmoothQuant: a fixed factor per channel from calibration statistics, folded into the weights and into the row-quantise pass,
+  no cost in the multiply) brings the three groups whose large activations sit in fixed channels (gate/up, the input and the output projections) from 8 to 26 flips of 512 each to 1 to 4; down (the SwiGLU product, whose outliers belong to tokens) is not helped and stays on the engine's own
+  binary16-accumulate kernel. **The recommended profile `w8a8:gate_up+mixer_in+mixer_out` + smoothing (rms, alpha 0.6) + down on the own kernel (flush 64) passes the gate on the 512 evaluation prompts (3 flips, largest |dp| 4.8e-2, 2.5e-2 rel L2 of the hidden state; 2B: 3.4e-2, W8A16's is 3.35e-2)**
+  and is as accurate as W8A16 on a second, fresh set of 512 prompts, where both are over 1% flips (11 of 1,024 for the profile, 17 for W8A16): the gate cannot be met robustly by any int8-weight scheme with a scale per output channel, and the evaluation set's pass is partly luck. Speed on the merged tree (default now = cuBLAS binary16 accumulation): the profile is 20 to 23% faster than the default on the 2B at 600 to 2,048 tokens, **2.00x llama.cpp's 6,888 tokens/s at 2,048 tokens (13,765) and 1.97x at 600**; with cuBLAS `COMPUTE_16F` for down instead of the own kernel, **2.10x and 2.09x** (14,454 and 13,250),
+  at the price of natural-mode batch invariance for that multiply and of the gate (6 flips of 512 on the merged tree, one over; 5 before main was merged). 0.8B: 2.37x (26,160) and 2.46x (27,201) llama.cpp at 2,048 tokens. Weights 1,017 MiB (2B) and 388 MiB (0.8B) smaller. Tables in section 5.
 * **The int8 tensor cores are there.** `mma.sync` int8 (`m16n8k32`) in our own kernel runs at 64 to 72 TOP/s at 4,096 tokens (49 to 70 at 1,024), 1.5 to 1.8 times
   cuBLAS's binary16-accumulate rate (39 to 45) and 2.6 to 3.1 times its float32-accumulate rate (21 to 25), which is what the engine runs today; cuBLAS's own int8
   reaches 83 to 92 TOP/s on big shapes (the card's peak is 111). At the engine's shapes our kernel is 1.4 to 3.0 times today's multiply from 256 tokens up and 1.4 to 2.1 times at 64
@@ -1152,7 +1157,7 @@ Qwen3.5-0.8B fine-tune) and Qwen3.5-2B-Base, float16 path. Code: `src/gemm_s8_ke
   and -5% (2B) at 2,048 tokens against the default engine, -8% and -18% at 64 tokens. Worth having for memory, not for speed.
 * **Small calls** do not gain what halved weight traffic suggests: W8A8 is +22% at 64 tokens on both models (0.8B 9.3k -> 11.4k tokens/s), because those multiplies are latency-bound at that size, not
   bandwidth-bound (our kernel reaches 200 GB/s of int8 weights on the 7,168 x 1,024 gate/up at 64 tokens, cuBLAS int8 216).
-* **Recommendation.** Keep `Int8Multiply`, off by default. Use W8A16 where weight memory decides (a model that would not otherwise fit). Do not use W8A8 as it is for the alert read-out: it buys
+* **Recommendation (before smoothing, kept for the record; the update above supersedes it for the alert read-out).** Keep `Int8Multiply`, off by default. Use W8A16 where weight memory decides (a model that would not otherwise fit). Do not use W8A8 with one scale per row for the alert read-out: it buys
   1.29 to 1.38x over cuBLAS binary16 accumulation and 1.6 to 1.9x over the default, at a largest |dp| of 0.15 and 44 flips of 512 against 2.0e-3 and 1 for the own kernel with binary16 accumulation
   (flush 64). The owner's 2x llama.cpp on the 2B (13.8k tokens/s at 2,048 tokens) is reached by W8A8 only (15.3k); with an option that passes the gate the 2B is at 1.45x (own kernel, binary16 accumulation,
   flush 64, 10.0k) to 1.6x (cuBLAS binary16 accumulation, 11.1k).
@@ -1187,6 +1192,9 @@ gate/up and the input projections the best (8 and 9), and nothing is cheap: Hype
 * `EngineOptions::int8_multiply = {gate_up, down, mixer_in, mixer_out, int8_activations}`. A selected group overrides `fp16_accumulate` for that group. The DeltaNet's `in_proj_b / in_proj_a` rows are stored and multiplied in binary16 (own kernel,
   float32 accumulation) whatever is selected. The float32 path, a K that is not a multiple of 16 and widths the kernels do not take are refused at creation. Strict mode pads nothing for int8 groups; with every group on int8 (or the own kernel for
   the rest) natural mode is batch-invariant as well. Tools: `sepal-cuda-engine-bench --int8 w8a8:all|w8a16:noout|...`, `sepal-cuda-engine-ab --options w8a8-all,w8a16-mlp,...` (groups: `gate_up`, `down`, `mixer_in`, `mixer_out`, `mlp`, `noout`, `all`).
+* Smoothing (section 5): `Int8Multiply::smoothing = {stats, alpha, statistic}` (off without statistics); `EngineOptions::collect_activation_stats` + `CudaEngine::activation_stats()` + `save_activation_stats` / `load_activation_stats` produce and carry the statistics; `sepal-cuda-calibrate --model <dir> --workload <calibration json> --out <file>`
+  writes them; `sepal-cuda-engine-bench --int8 w8a8:gate_up+mixer_in+mixer_out --smooth-stats <file> --smooth rms:0.6 --multiply-path invariant --fp16-accumulate down --fp16-flush-k 64` is the recommended profile, `sepal-cuda-engine-ab` takes `w8a8-gate_up+mixer_in+mixer_out/own16-64/smooth=rms:0.6` with `--smooth-stats`.
+  The recommended profile in code: `int8_multiply = {gate_up, mixer_in, mixer_out = true, down = false}` with the smoothing above, `multiply_path = Invariant`, `fp16_accumulate = {down only, flush 64}`. The smoothing vectors are in the weight memory (weight fingerprint), alpha and the statistic in the compute fingerprint of the snapshot files.
 
 ### 1. What the card does (`sepal-cuda-int8-probe`, minimum of three batches, 32 MB workspace, errors against float64 in the tool's output)
 
@@ -1373,21 +1381,135 @@ What remains is the binary16 embedding (485 MiB at 0.8B, 970 MiB at 2B; it is al
 not run (no 9B checkpoint here): a 9B at hidden size 4,096 has about 13.8 GB of binary16 layer weights and a 2.0 GB embedding; the layers on int8 are about 7 GB, so with the embedding 9 GB, leaving about 3 GB of a 12 GiB card (before the display's share) for call buffers and snapshots,
 where binary16 (15.9 GB) cannot be loaded at all. The embedding could be stored int8 per row as well (the design's `cpu-q8` profile does); not done.
 
-### 5. Tests
+### 5. Making W8A8 accurate: smoothing, calibration, and what else was tried
+
+Everything here is measured on jeff-base (0.8B) against the transformers float32 golden unless it says 2B. Code: `Int8Smoothing`, `EngineOptions::collect_activation_stats`, `src/activation_stats.cpp`, `tools/calibrate.cpp`.
+
+**Why the first table (above) fails, and what the second checkpoint of work found.** An evaluation set of 512 prompts is a noisy instrument at this level. The *flips* are prompts whose float32 probability is within a few thousandths of one half; every
+variant that perturbs the hidden state by 1 to 3% flips about that many of them, and which ones is chance. To see how much chance, a second workload of 64 alerts was made (`tools/make_alert_workload.py --seed 31337`, golden by
+`tools/export_alert_golden.py`, 512 prompts, disjoint from the evaluation alerts and from the calibration alerts below) and every candidate was run on both:
+
+| (flips on the 512 evaluation prompts + flips on the 512 second-set prompts) | flips | largest \|dp\| (evaluation / second set) | rel L2 of the hidden state |
+|---|---|---|---|
+| float32-accumulating engine (the default) | 0 + 0 | 1.9e-3 / 1.4e-3 | 4.7e-4 |
+| **W8A16, all four** (int8 weights per output channel, binary16 activations) | **4 + 13 = 17** | 3.9e-2 / 3.8e-2 | 2.6e-2 |
+| W8A8, all four, one scale per row (the engine before smoothing) | 44 + 48 = 92 | 1.5e-1 / 1.6e-1 | 1.05e-1 |
+| W8A8, all four, smoothed (rms, alpha 0.6) | 11 + 17 = 28 | 7.5e-2 / 7.7e-2 | 3.2e-2 |
+| W8A8 gate_up + mixer_in, smoothed, the rest own kernel binary16 acc. (flush 64) | 2 + 10 = 12 | 4.4e-2 / 4.4e-2 | 1.9e-2 |
+| **W8A8 gate_up + mixer_in + mixer_out, smoothed (rms, alpha 0.6), down on the own kernel with binary16 accumulation (flush 64): the recommendation** | **3 + 8 = 11** | 4.8e-2 / 5.0e-2 | 2.5e-2 |
+| the same with down on cuBLAS `COMPUTE_16F` | 5 + 8 = 13 (before main was merged; 6 on the merged tree's evaluation set, one over the gate) | 3.4e-2 / 4.1e-2 | 2.5e-2 |
+
+So: per-channel int8 weights alone already flip 1.7% of the prompts on a fresh set (the evaluation set's 4 of 512 is the lucky draw), and the gate (1% flips) is out of reach for any int8-weight scheme with one scale per output channel, W8A16 included.
+What smoothing does is bring W8A8 to the weights' own level (rel L2 2.5e-2 against 2.6e-2; 11 flips of 1024 against 17); it cannot do better than the weights. On the evaluation set the recommended profile passes the gate
+(3 flips, largest |dp| 4.8e-2, thin on the second); on the second set it has 8 flips (1.6%) and a largest |dp| of 5.0e-2: **it passes the gate as the owner defined it, on the set the gate was defined on, and not on a fresh set, where W8A16 does not either.**
+
+*Qwen3.5-2B-Base* has no golden; against the float32 engine on 64 prompts (8 alerts), mean relative L2 of the final hidden state: default (`auto`) 5.6e-3, W8A16 all four 3.35e-2, W8A8 all four 1.12e-1 (unsmoothed) and **4.38e-2 smoothed**, **the recommended profile 3.24e-2**, the same with cuBLAS for down 3.57e-2:
+the 2B behaves as the 0.8B does (W8A8 smoothed lands at the weights' level), and its calibration is its own (`sepal-cuda-calibrate` on the 2B, the same alert workload).
+
+**Smoothing** (`Int8Smoothing`): a fixed factor s[k] per input channel of each multiply, s = a[k]^alpha / w[k]^(1 - alpha), where a[k] is a statistic of the channel over calibration tokens (largest |x|, mean |x| or root mean square) and w[k] the largest |weight|
+in the column. The activation is multiplied by 1/s[k] in the row-quantise pass (which already reads every element: the cost is one extra read of a vector, 0.0 to 0.2% of a call) and the weight column by s[k] before the weights are quantised, so the product is unchanged.
+It is applied to the four groups' own inputs, not folded into the norm weights: the DeltaNet's output norm is shared by all heads and the SwiGLU product has no weight to fold into, and keeping it in the quantise pass leaves in_proj_b/a and every other consumer of the norm output alone.
+The factors are derived at engine creation from the statistics, stored in the weight memory (so the weight fingerprint of the snapshot files covers them) and applied by the same kernel for every row: a row's bits still depend on that row only.
+
+* *Calibration.* `sepal-cuda-calibrate` runs the float16 engine (own kernel, so the activations do not depend on how the calibration is batched) over a calibration workload and writes per-channel largest |x|, mean |x| and rms for the input of each of the four groups of every layer
+  (`ActivationStats`, a file with a hash; 2.2 MB for the 0.8B, 3.5 MB for the 2B). **The calibration set used here is 64 alerts from `tools/make_alert_workload.py --seed 4242`, 55,318 tokens, disjoint from the 64 evaluation alerts (seed 0) and from the second set (seed 31337); it is the same text
+  model as the workload (the alert-shaped prompt), not other text.** Statistics from a different kind of text would be a different calibration; nothing was tried beyond this (see the six `real_f16` prompts below).
+* *alpha.* On the evaluation set, all four groups per-row (one scale per row), rms as the statistic: alpha 0.5 / 0.7 / 0.8 / 0.9 / 1.0 gives 11 / 9 / 12 / 10 / 36 flips, largest |dp| 0.071 / 0.049 / 0.094 / 0.071 / 0.128 (calibration statistics from the cuBLAS float16 engine; the run-to-run noise is of the order of 2 flips and 0.01 in |dp|: a different batching of the calibration moved one profile from 2 flips and 0.038 to 3 and 0.048);
+  with max |x| as the statistic: alpha 0.3 / 0.5 / 0.7 / 0.85 / 1.0 gives 35 / 13 / 10 / 4 / 18 flips, largest |dp| 0.19 / 0.12 / 0.058 / 0.059 / 0.095; mean |x| is no better. rms is the better of the two on rel L2 (3.3e-2 against 3.8e-2 to 4.1e-2 at the best alpha).
+  The curve is flat and noisy between 0.5 and 0.8; 0.6 (rms) is the middle of it and was chosen on the evaluation set and the second set together, which makes 0.6 mildly tuned to the evaluation set; 0.5 and 0.7 give 20 and 11 flips of 1024 for the recommended profile.
+* *Per group, alone, with smoothing (rms, alpha 0.6; flips of 512, largest |dp|)*: gate/up 1 and 2.7e-2 (was 8 and 7.3e-2), input projections 2 and 2.4e-2 (was 9, 6.4e-2), output projections 4 and 2.9e-2 (was 26, 1.05e-1), **down 11 and 4.8e-2 (was 10, 6.2e-2)**. Down is the one smoothing does not help:
+  its input is the SwiGLU product, whose large values are specific to tokens, not channels (channels over 10 times the median of their layer's amax: 0 to 148 of 3,584, the last layer's the worst), so a fixed per-channel factor cannot take them out. Hence the recommendation keeps down at 16 bits.
+* *The six `real_f16` prompts* (a different kind of text, which the calibration never saw; largest |dp| over all options): **the recommended profile has 6.8e-2 on them, above the 0.05 of the gate (it has no flips there)**, W8A8 all four with smoothing 8.8e-2, without smoothing 5.1e-2; alpha 0.5 gave 2.3e-2 to 3.3e-2 on them and 0.7 up to 1.0e-1.
+  Smoothing tuned to one kind of prompt costs on another; the more aggressive alpha, the more. The gate was defined on the alert workload, and so was the calibration; a model asked other questions needs its own calibration set.
+
+**Scales per group of channels, with and without smoothing** (diagnostic: the activations were quantised and dequantised in groups of k channels along the inner dimension, one scale per group, and fed to the W8A16 kernel; weights as before; not kept in the code). Evaluation set, rel L2 / flips / largest |dp|:
+
+| groups | no smoothing | rms alpha 0.5 | rms alpha 0.6 |
+|---|---|---|---|
+| per row | 1.05e-1 / 42 / 2.6e-1 | 3.4e-2 / 16-19 / 0.061-0.095 | 3.3e-2 / 8-11 / 0.069 |
+| 512 | 6.7e-2 / 18 / 1.2e-1 | 2.8e-2 / 3-5 / 0.047-0.054 | |
+| 256 | | 2.6e-2 / 5 / 0.042 | 2.7e-2 / 13 / 0.047 |
+| 128 | 4.1e-2 / 9 / 7.1e-2 | 2.5e-2 / 3 / 0.046 | 2.5e-2 / 10 / 0.032 |
+| 64 | | 2.4e-2 / 6 / 0.043 | 2.5e-2 / 14 / 0.032 |
+| 32 | 3.2e-2 / 6 / 5.1e-2 | 2.2e-2 / 5 / 0.038 | |
+
+and with a scale per group of the *weights* as well (groups of k along the inner dimension; weight-only error with exact activations: per channel 2.0e-2, k = 128 1.3e-2, 64 1.3e-2, 32 1.0e-2):
+
+| activation groups # weight groups (rms alpha 0.5-0.6) | rel L2 | flips of 512 | largest \|dp\| |
+|---|---|---|---|
+| 128 # 128 | 1.8e-2 to 2.0e-2 | 3 to 8 | 0.033 to 0.048 |
+| 64 # 64 | 1.7e-2 to 1.8e-2 | 5 to 8 | 0.040 to 0.042 |
+| 32 # 32 | 1.35e-2 to 1.5e-2 | 3 to 9 | 0.030 to 0.051 |
+
+So scales per 128 channels with smoothing reach rel L2 2.5e-2 (the weights' level) and with scales on the weights too 1.8e-2, but flips stay between 3 and 9 for all of them: the instrument cannot tell them apart, and the cost is a kernel that converts every group's int32 sum to float
+(the kernel has to hold a second set of accumulators, or shift and add integers, for each group of 128 or fewer channels, on the int8 tensor cores' bandwidth; not built because the accuracy it buys is within the instrument's noise of the mixed profile below, and the weights' own
+error is the floor either way).
+
+*Tried and dropped, all with the same emulation*: (1) **static channel sets, largest first** (a permutation of the channels by calibration rms, one scale per row and set, 2 to 4 sets of 16 to 1,024 channels, scales either free or restricted to the finest times a power of two so that one int32 accumulator can be shifted
+between sets at no cost; both kernels were written and tested bit for bit, then removed): rel L2 2.5e-2 to 3.4e-2, flips 3 to 20, i.e. no better than one scale per row with smoothing (3.3e-2): the large values are not in a fixed set of channels. (2) **power-of-two scales per group of
+128 channels** (so that the group sums can be shifted and added as integers) lose most of the gain of group scales: rel L2 2.5e-2 to 3.2e-2 against 2.35e-2 to 2.55e-2 for free scales. (3) **Clipping the weight scale** (the least squared error among nine ratios between 1 and 1/2 of the largest |w|, per output channel): chose 1 for every channel of every matrix, results identical to the unclipped weights.
+(4) Clipping the activation scale was already shown to make it worse (table in section 2).
+
+**Why down stays at 16 bits, and the profile.** With smoothing the other three groups are close to W8A16 (above); down with one scale per row is not. The mixed profile keeps the SwiGLU-to-down multiply on the engine's own kernel with binary16 accumulators flushed every 64 values of k
+(`fp16_accumulate.down`, `multiply_path = Invariant`: the same accuracy as the engine's other binary16-accumulate runs, 4.4e-4 in |dp| on the six prompts) so that every multiply of the model runs on the engine's own kernels: **natural mode is batch-invariant and strict mode pads nothing**.
+With cuBLAS `COMPUTE_16F` for down instead it is 3 to 4% faster and natural mode is not batch-invariant (strict mode pads that one multiply to `gemm_rows`).
+
+**Speed of the profiles on the merged tree** (`sepal-cuda-engine-ab`, same process, best of 3 rounds of 4 timed calls, natural mode, while another job shared the card, so read to within 3%; tokens/s, alerts/s for the last two rows; weights in MiB from `sepal-cuda-engine-bench`).
+`auto` is the engine's default now (cuBLAS, binary16 accumulation in all four groups); `profile` is the recommendation (gate/up, input and output projections W8A8 smoothed, down on the own kernel with binary16 accumulation, flush 64); `profile + cuBLAS down` has down on cuBLAS `COMPUTE_16F`; `W8A8 all` is all four groups on int8 (smoothed, rms 0.6; fails the gate; shown for the ceiling).
+
+*Qwen3.5-2B-Base* (llama.cpp b11514: 3,281 / 6,342 / 6,888 tokens/s at 64 / 600 / 2,048):
+
+| tokens/s | auto (default) | profile | profile + cuBLAS down | W8A8 all |
+|---|---|---|---|---|
+| 1 row x 64 | 5,068 | 4,851 (-4%; 1.48x llama.cpp) | 5,643 (+11%; 1.72x) | 5,487 |
+| 1 row x 600 | 10,384 | 12,470 (+20%; 1.97x) | 13,250 (+28%; 2.09x) | 13,900 |
+| 1 row x 2048 | 11,178 | 13,765 (+23%; 2.00x) | 14,454 (+29%; 2.10x) | 15,228 |
+| 1 row x 4800 | 10,967 | 13,313 (+21%) | 14,124 (+29%) | 14,610 |
+| 16 rows x 640 | 12,418 | 14,149 (+14%) | 16,166 (+30%) | 16,632 |
+| 1 alert per call [alerts/s] | 12.7 | 15.7 (+24%) | 16.2 (+28%) | 17.1 |
+| 16 alerts per call | 14.4 | 15.7 (+9%) | 18.3 (+27%) | 18.8 |
+| same, states cached, 1 / 16 per call | 40.0 / 50.6 | 41.5 / 64.0 | 48.8 / 66.5 | |
+| weights, MiB | 3,590 | 2,573 | 2,573 | 2,285 |
+
+*jeff-base (Qwen3.5-0.8B)* (llama.cpp: 5,204 / 9,422 / 11,056 / 10,018 at 64 / 600 / 2,048 / 4,800):
+
+| tokens/s | auto (default) | profile | profile + cuBLAS down | W8A8 all |
+|---|---|---|---|---|
+| 1 row x 64 | 10,455 | 10,414 (0%; 2.00x llama.cpp) | 11,293 (+8%; 2.17x) | 11,300 |
+| 1 row x 600 | 21,136 | 23,060 (+9%; 2.45x) | 25,025 (+18%; 2.66x) | 24,688 |
+| 1 row x 2048 | 22,316 | 26,160 (+17%; 2.37x) | 27,201 (+22%; 2.46x) | 27,470 |
+| 1 row x 4800 | 21,404 | 25,134 (+17%; 2.51x) | 25,843 (+21%; 2.58x) | 26,265 |
+| 16 rows x 640 | 26,838 | 31,678 (+18%) | 33,057 (+23%) | 33,696 |
+| 1 alert per call [alerts/s] | 24.3 | 29.8 (+23%) | 30.4 (+25%) | 30.9 |
+| 16 alerts per call | 29.7 | 35.0 (+18%) | 36.7 (+24%) | 37.3 |
+| same, states cached, 1 / 16 per call | 74.7 / 99.5 | 76.1 / 125.0 | 86.2 / 129.0 | |
+| weights, MiB | 1,436 | 1,048 | 1,048 | 964 |
+
+So against the default of the merged tree the profile is 20 to 23% faster on the 2B at 600 to 2,048 tokens, 29% with cuBLAS for down; 2.00x and 2.10x llama.cpp at 2,048 tokens on the 2B. **The profile with the own kernel for down is at 2.0x, not clearly above it** (1.97x at 600 tokens,
+1.998x at 2,048); with cuBLAS for down it is 2.09x and 2.10x, at the price of natural-mode batch invariance for that one multiply (strict mode pads down to `gemm_rows`) and of the gate: 6 flips of 512 (largest |dp| 3.4e-2) on the merged tree, one over (5 before main was merged; 8 on the second set). It is not recommended. At 64 tokens the own-kernel profile is a little slower than the default on the 2B (the own kernel's binary16-accumulate multiply is slower than cuBLAS's below 300 tokens).
+Memory: the profile takes 1,017 MiB less weight memory on the 2B (3,590 -> 2,573) and 388 MiB less on the 0.8B (1,436 -> 1,048); the extra call buffers (int8 activations and their scales) are about 60 MiB (0.8B) to 110 MiB (2B) at 16,384 tokens.
+
+### 6. Tests
 
 * `sepal_cuda_kernel_s8_tests` (CTest `cuda_s8_*`): `s8_quantize` (host oracle, bit for bit: bytes and scales, both weight layouts, K from 16 to 6,144; zero rows, a 65,504 outlier, subnormals, +-127), `s8_gemm` (the exact integer product of the
   device's own int8 operands scaled in float32, bit for bit, five shapes; W8A16 against float64 of the dequantised weights, 1e-5; quantisation error against the unquantised product; an outlier-channel case), `s8_invariance` (six tile shapes, batches of 1 to 213, every place: bit-identical, both kernels),
-  `s8_edge` (eight tiny and ragged shapes with every tile shape, zero rows, 14 refusals: K, odd N, misaligned or null pointers, strides, unknown configuration). 465 checks.
+  `s8_edge` (eight tiny and ragged shapes with every tile shape, zero rows, 14 refusals: K, odd N, misaligned or null pointers, strides, unknown configuration). 502 checks (with the smoothing suite).
 * `sepal_cuda_engine_tests engine_int8` (CTest `cuda_engine_engine_int8`): defaults and refusals (float32 path, H = 24), closeness to the float32 engine for seven option sets and memory below binary16's, bit-identity alone / among other rows / from a stored snapshot for four option sets in natural and strict (`gemm_rows` 16, 48)
-  modes with cuBLAS or the own kernel for the rest, strict pruned against unpruned last layer and repeated runs. 1,188 checks.
-* `real_int8`, `real_int8_2b`: the tables above (they assert finite results, the default engine's gate, and bit-identity of the all-int8 profiles across batching ways). The planted-bug check: dropping the sign flip in the W8A16 weight widening (`v ^= 0x80808080` -> `0x00808080`) fails `s8_gemm` in every shape
-  (`err < 1e-5` and `quantisation < 1.2e-2`); reverted.
+  modes with cuBLAS or the own kernel for the rest, strict pruned against unpruned last layer and repeated runs. 1,881 checks (with the smoothing tests below).
+* Smoothing and calibration: `s8_smoothing` (the factors enter both quantisers as float32 products, bytes and scales bit for bit against the host, both weight layouts; factors of 1 change nothing; four 200-sigma channels: error 4.8e-2 without, 6.5e-3 with; channel statistics and column maxima against the host, run twice with the same bits; refusals),
+  `engine_int8` (statistics of the right shape and order, identical for identical calls, different for other tokens; smoothing refused for W8A16, for no group, for alpha outside [0, 1] or NaN, for statistics of too few layers or channels; collecting refused on the float32 path; the statistics file round-trips and 326 damaged copies are refused;
+  smoothing changes the numbers and the weight fingerprint; smoothed variants close to the float32 engine; **bit-identity alone / among other rows / from a snapshot in natural and strict mode (`gemm_rows` 16 and 48) for the smoothed all-four profile and for the recommended profile; strict pruned against unpruned last layer for the smoothed and the recommended profile**),
+  `snap_tiers` (a snapshot of a smoothed engine is accepted by the same smoothing and refused by other statistics, another alpha or statistic, or none).
+* `real_int8`, `real_int8_2b`: the tables above (they assert finite results, the gates of `base`, `auto`, `strict` and of the recommended profile on the 512 prompts, and bit-identity of the all-own-kernel profiles across batching ways: one alert per call, 16 per call, states cached).
+  Smoothing variants need a calibration workload (`SEPAL_CALIB_ALERTS`, or `runs/calibration_workload.json`); without one they are skipped with a message. The planted-bug checks: dropping the sign flip in the W8A16 weight widening (`v ^= 0x80808080` -> `0x00808080`) fails `s8_gemm` in every shape
+  (`err < 1e-5` and `quantisation < 1.2e-2`); for smoothing, leaving the factors out of the weight quantiser's second pass fails `s8_smoothing` (10 checks), and storing s instead of 1/s as the activation factor fails `engine_int8` (three variants far from the float32 engine); both reverted.
 
-The whole CTest suite with all the real-model environment variables set: 67 of 67 pass (23 minutes, `real_cpu` 520 s of it), none skipped; the 60 tests that existed before still pass, strict-mode bit-identity suites included.
+The whole CTest suite on the merged tree (main at 46f3b7d), with all the real-model environment variables and `SEPAL_CALIB_ALERTS` set: 77 of 77 pass (`ctest -E real_cpu`: 76 tests, 1,084 s; `real_cpu`: 515 s), of which one is reported Skipped (`snap_default_big`, which takes 85% of the free memory and needs `SEPAL_BIG_ENGINE_TEST=1`: run with it, it passes). `real_int8` also ran with `SEPAL_INT8_WAYS=all`: 21,156 checks, none failed, the recommended profile bit-identical alone, 16 per call and with the states cached.
 
 ### Not done
 
 * Tuning the W8A8 kernel (51 to 65% of the int8 peak; cuBLAS int8 is 10 to 35% faster on the deep shapes), fusing the row quantisation into SwiGLU and the norms, and split-k for small calls (the 64-token multiplies stay latency-bound).
-* A cheaper way to W8A8 that passes the gate: smoothing (needs calibration), scales per group along k in the epilogue (per 128 still fails on |dp|, per 32 is expensive), outlier channels kept in binary16. None tried beyond the emulation above.
+* A cheaper way to W8A8 that passes the gate was found only in part (section 5). Not built: the kernel with a scale per group of 128 channels (activations, and weights per group as well), which the emulation puts at the weights' own accuracy (rel L2 1.8e-2 to 2.5e-2) at a cost in the epilogue nobody has measured; fusing the smoothing and the row quantisation into the producing kernels;
+  per-layer choice of which layers go on int8 (the first and last layers were not tried apart); calibration on text other than the alert prompt (the six `real_f16` prompts are worse with the more aggressive alphas); weight quantisation better than per output channel (groups of channels along k, or error-feedback rounding), the only thing that could lower the flips below the weights' floor.
 * int8 embedding, int8 attention or K/V, int4 weights, an int8 route for the CPU reference.
 * No 9B run; llama.cpp was not re-measured (its figures are from the earlier section).
