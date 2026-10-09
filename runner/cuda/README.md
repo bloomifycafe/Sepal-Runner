@@ -250,3 +250,32 @@ candidate, unmeasured) or less work per alert (last-layer pruning, the prefix ca
 | `src/convert_kernels.hpp`, `src/convert_kernels.cu` | The element-type conversion kernels |
 | `tests/test_cuda_gemm.cpp` | Suites `contract`, `parity_small`, `parity_real`, `rows` |
 | `tools/sepal_cuda_bench.cpp` | `sepal-cuda-bench` |
+
+## Attention kernels
+
+`src/kernels_attention.hpp`, `src/kernels_attention.cu`: the full-attention mixer's work between the q/k/v
+multiply and the `o_proj` multiply. Library `sepal_cuda_attention`, tests `sepal_cuda_kernel_attention_tests`
+(CTest `cuda_attention_*`), benchmark `sepal-cuda-attention-bench`. The contract is in the header; in short:
+
+- Two launches per layer over many rows: `launch_attention_prepare` (per-head RMSNorm of q and k, partial RoPE,
+  the row's keys and values written to its own segment) and `launch_attention` (causal grouped-query attention,
+  times sigmoid(gate), written in the `o_proj` operand type). Launch prepare for all rows, then attention for all
+  rows: no waves are needed, because a branch needs its parent's keys and values, not its output.
+- K/V layout: a segment is `[tokens, kv_heads, head_dim]` for keys and again for values, float32 or binary16.
+  A row lists its segments (parent chain, oldest first, its own last) in a device table; segments are read in
+  place, never copied. Three arrays describe a launch: `RowSpan`, `AttentionRowDesc`, `KvSegment`.
+- Paths: `Reference` (a plain kernel, either type, any head_dim up to 256) and `Tiled` (mma.sync tensor cores,
+  binary16 only, head_dim 16/64/128/256, group size 1 to 16). Both reduce in an order that depends only on the
+  row's own chain, so a token's bits do not depend on other rows, their number, or the row's place in the list.
+  RoPE angles are float64 products with float64 sine and cosine, as in the reference, and match it bit for bit
+  at every position from 0 to 75,775.
+- The cuBLAS import library needs no new function: nothing here calls cuBLAS.
+
+Time per layer in ms (minimum of 30 synchronised repetitions on the shared RTX 3060; 0.8B and 2B have the same
+attention geometry, 8 heads over 2 KV heads of 256, and measured alike), `sepal-cuda-attention-bench`:
+
+| Request | f32 plain | f16 plain | f16 tiled (prepare + attention) |
+|---|---|---|---|
+| (a) 16 rows x 640 | 43.0 | 39.8 | 2.88 (0.68 + 2.19) |
+| (b) 1 row x 4096 | 135.3 | 107.3 | 3.73 (0.28 + 3.45) |
+| (c) 8 states x 640 + 64 branches x 27 | 47.3 | 39.2 | 2.34 (0.46 + 1.87) |

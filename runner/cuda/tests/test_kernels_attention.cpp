@@ -592,7 +592,7 @@ bool identical_rows(const RowOut& a, const RowOut& b, const char* what, const ch
     const std::size_t dk = count_different(a.keys, b.keys);
     const std::size_t dv = count_different(a.values, b.values);
     const std::size_t dout = count_different(a.out, b.out);
-    const bool ok = dq == 0 && dk == 0 && dv == 0 && dout == 0;
+    const bool ok = dq == 0 && dk == 0 && dv == 0 && dout == 0 && all_finite(a.out) && !a.out.empty();
     if (!ok) {
         std::printf("  [DIFFERENT] %s %s: q %zu, keys %zu, values %zu, out %zu values differ\n", what, variant, dq, dk, dv, dout);
     }
