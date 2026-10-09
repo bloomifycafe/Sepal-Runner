@@ -61,6 +61,9 @@ struct EngineOptions {
     std::size_t memory_budget_bytes = 0;
     /// 0 natural, T > 0 strict: see the header comment. In strict mode T should be a multiple of 8.
     std::size_t gemm_rows = 0;
+    /// Compute the last layer's queries, attention, output projection and MLP only for the tokens that are read out
+    /// (its keys and values are still computed for every token). The last layer is always a full-attention layer.
+    bool prune_last_layer = true;
     /// The most tokens one call may carry; the activation buffers are sized for it.
     std::size_t max_call_tokens = 16384;
     /// The most rows one call may carry.

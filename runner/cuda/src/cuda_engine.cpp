@@ -19,6 +19,7 @@
 
 #include "convert_kernels.hpp"
 #include "device.hpp"
+#include "engine_kernels.hpp"
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
 #include "kernels_elementwise.hpp"
@@ -279,6 +280,9 @@ struct CudaEngine::Impl {
     char* a3 = nullptr;      // SwiGLU output [cap, I], operand type
     float* p = nullptr;      // multiply output [cap, p_width]
     char* q = nullptr;       // normed, rotated queries [cap, attn_width], K/V type
+    char* a1c = nullptr;     // the last layer's norm output for the rows that are read out [cap_compact, H], operand type
+    float* xc = nullptr;     // their residual stream [cap_compact, H]
+    std::size_t cap_compact = 0;
     char* tables = nullptr;  // row tables of one call
 
     std::shared_ptr<Pools> pools;
@@ -434,6 +438,8 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
     take(cap_rows * I * elem_bytes, a3);
     take(cap_rows * p_width * 4, p);
     take(cap_rows * std::max<std::size_t>(attn_width, 8) * elem_bytes, q);
+    take(cap_compact * H * elem_bytes, a1c);
+    take(cap_compact * H * 4, xc);
     take(kTableBytes, tables);
     used += kCublasWorkspace; // taken last: its address is call_memory + used - workspace
     return used;
@@ -458,7 +464,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     attn_width = dim(config.attn_width());
     attn_kv_width = dim(config.attn_kv_width());
     attn_in_width = dim(config.attn_in_proj_width());
-    p_width = std::max({dn_layers != 0 ? dn_in_width : 0, attn_layers != 0 ? attn_in_width : 0, 2 * I});
+    p_width = align_up(std::max({dn_layers != 0 ? dn_in_width : 0, attn_layers != 0 ? attn_in_width : 0, 2 * I}), 64);
     mix_width = std::max({dn_layers != 0 ? value_dim : 0, attn_layers != 0 ? attn_width : 0, std::size_t{1}});
     if (options.max_call_tokens == 0 || options.max_call_rows == 0) {
         throw std::invalid_argument("EngineOptions: max_call_tokens and max_call_rows must be positive");
@@ -467,6 +473,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
         throw std::invalid_argument("EngineOptions: gemm_rows must be 0 (natural) or a multiple of 8");
     }
     cap_rows = options.gemm_rows == 0 ? options.max_call_tokens : align_up(options.max_call_tokens, options.gemm_rows);
+    // Room for the rows the last layer computes in full (see prune_last_layer); a call with more readouts runs unpruned.
+    cap_compact = std::min(cap_rows, options.gemm_rows == 0 ? std::size_t{1024} : align_up(std::size_t{1024}, options.gemm_rows));
 
     dn_geometry = DeltaNetGeometry{u32(dim(config.dn_key_heads)), u32(dim(config.dn_value_heads)),
                                    u32(dim(config.dn_key_head_dim)), u32(dim(config.dn_value_head_dim)),
@@ -570,14 +578,15 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     memory_stats.device_free_min = std::min(memory_stats.device_free_min, free_now);
 }
 
-// Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: multiplies of exactly
-// gemm_rows rows each; the call buffers hold zero rows up to the next multiple, so the last one is a full one.
+// Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: `rows` is a multiple of
+// gemm_rows and the multiply is cut into blocks of exactly that many rows (the call buffers hold zero rows up to the
+// next multiple, so the last block is a full one).
 void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, float* out,
                             std::size_t ld_out, std::size_t rows) {
     const std::size_t step = options.gemm_rows == 0 ? rows : options.gemm_rows;
     const float alpha = 1.0f, beta = 0.0f;
     for (std::size_t at = 0; at < rows; at += step) {
-        const std::size_t t = options.gemm_rows == 0 ? rows : step;
+        const std::size_t t = step;
         const char* xin = static_cast<const char*>(in) + at * ld_in * elem_bytes;
         float* yout = out + at * ld_out;
         const int m_ = static_cast<int>(n), t_ = static_cast<int>(t), k_ = static_cast<int>(k);
@@ -820,6 +829,66 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     for (std::size_t r = 0; r < rows.size(); ++r) {
         for (const std::size_t offset : rows[r].readout_offsets) readout_rows.push_back(u32(plan[r].offset + offset));
     }
+
+    // ---- the last layer for the rows that are read out only ----
+    // Keys and values of every token are needed (a later row or a snapshot continues them), but the queries, the
+    // attention, the output projection and the MLP of the last layer matter only for the tokens that are read out.
+    // Each such token becomes a "row" of one token whose context is its own row up to it: the same keys, read in place.
+    bool prune = options.prune_last_layer && attn_layers != 0 && readouts != 0;
+    for (const EngineRow& row : rows) prune = prune && !row.capture_layers;
+    const std::size_t pad_step = options.gemm_rows != 0 ? options.gemm_rows : 1;
+    std::vector<std::uint32_t> upos, readout_compact;
+    std::vector<RowSpan> spans_u;
+    std::vector<AttentionRowDesc> descs_u;
+    std::vector<KvSegment> segs_u;
+    std::size_t padded_u = 0;
+    if (prune) {
+        struct Item {
+            std::uint32_t pos;
+            std::uint32_t row;
+            std::uint32_t offset;
+        };
+        std::vector<Item> items;
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            for (const std::size_t offset : rows[r].readout_offsets) items.push_back({u32(plan[r].offset + offset), u32(r), u32(offset)});
+        }
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.pos < b.pos; });
+        items.erase(std::unique(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.pos == b.pos; }), items.end());
+        padded_u = align_up(items.size(), pad_step);
+        const std::size_t padded_all = align_up(n, pad_step);
+        // Worth doing only when the rows of the last layer's multiplies really shrink, and when they fit the buffers.
+        if (padded_u >= padded_all || padded_u > cap_compact) {
+            prune = false;
+        } else {
+            char* const heap = pools->kv_memory.data();
+            const std::size_t last = attn_layers - 1;
+            std::vector<const KvBlock*> chain;
+            for (std::size_t j = 0; j < items.size(); ++j) {
+                const std::size_t r = items[j].row;
+                const std::size_t o = items[j].offset;
+                upos.push_back(items[j].pos);
+                spans_u.push_back(RowSpan{u32(j), 1});
+                chain.clear();
+                for (const KvBlock* b = plan[r].kv->parent.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
+                std::reverse(chain.begin(), chain.end());
+                const std::size_t first = segs_u.size();
+                const auto segment_of = [&](const KvBlock* b, std::size_t skip, std::uint32_t tokens) {
+                    const std::size_t per_layer = kv_layer_bytes(b->tokens);
+                    char* keys = heap + b->offset + last * 2 * per_layer + skip * kv_layer_unit;
+                    segs_u.push_back(KvSegment{keys, keys + per_layer, tokens, 0});
+                };
+                for (const KvBlock* b : chain) segment_of(b, 0, b->tokens);
+                if (o > 0) segment_of(plan[r].kv.get(), 0, u32(o));
+                segment_of(plan[r].kv.get(), o, 1);
+                descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 0});
+            }
+            check_attention_rows(spans_u, descs_u, segs_u);
+            for (const std::uint32_t pos : readout_rows) {
+                readout_compact.push_back(u32(std::lower_bound(upos.begin(), upos.end(), pos) - upos.begin()));
+            }
+        }
+    }
+
     const std::size_t off_tokens = tw.put(token_ids);
     const std::size_t off_spans = tw.put(spans);
     const std::size_t off_in = tw.put(in_slots);
@@ -829,6 +898,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     const std::size_t off_readout = tw.put(readout_rows);
     std::vector<std::size_t> off_segments(attn_layers);
     for (std::size_t a = 0; a < attn_layers; ++a) off_segments[a] = tw.put(segments[a]);
+    const std::size_t off_upos = tw.put(upos), off_compact = tw.put(readout_compact), off_spans_u = tw.put(spans_u);
+    const std::size_t off_descs_u = tw.put(descs_u), off_segs_u = tw.put(segs_u);
     if (tw.bytes().size() > kTableBytes) {
         throw BudgetExceeded("the row tables of this call take " + mib(tw.bytes().size()) + ", more than the " + mib(kTableBytes) +
                              " reserved; send fewer rows per call");
@@ -845,8 +916,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     const auto* d_waves = reinterpret_cast<const std::uint32_t*>(tables + off_waves);
     const auto* d_descs = reinterpret_cast<const AttentionRowDesc*>(tables + off_descs);
     const auto* d_readout = reinterpret_cast<const std::uint32_t*>(tables + off_readout);
+    const auto* d_upos = reinterpret_cast<const std::uint32_t*>(tables + off_upos);
+    const auto* d_compact = reinterpret_cast<const std::uint32_t*>(tables + off_compact);
+    const auto* d_spans_u = reinterpret_cast<const RowSpan*>(tables + off_spans_u);
+    const auto* d_descs_u = reinterpret_cast<const AttentionRowDesc*>(tables + off_descs_u);
+    const auto* d_segs_u = reinterpret_cast<const KvSegment*>(tables + off_segs_u);
 
-    const std::size_t padded = options.gemm_rows == 0 ? n : align_up(n, options.gemm_rows);
+    // Rows of every multiply: all n of them in natural mode; in strict mode n rounded up to whole blocks of gemm_rows, the
+    // extra rows being zero.
+    const std::size_t padded = align_up(n, pad_step);
     const float eps = static_cast<float>(config.rms_norm_eps);
     {
         Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -875,10 +953,75 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
 
     for (std::size_t l = 0; l < layers; ++l) {
         const LayerWeights& w = weights.layers[l];
+        if (prune && l + 1 == layers) {
+            // The last layer (always a full-attention layer) for the rows that are read out; see "the last layer" above.
+            const std::size_t ru = upos.size();
+            const AttentionRows full_rows{d_spans, d_descs, reinterpret_cast<const KvSegment*>(tables + off_segments[w.kind_index]),
+                                          nullptr, u32(rows.size()), max_row_tokens};
+            const AttentionRows u_rows{d_spans_u, d_descs_u, d_segs_u, nullptr, u32(ru), 1};
+            const char* w_kv = static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes;
+            {
+                Phase phase(*this, &PhaseTimes::multiplies_ms);
+                gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded); // keys and values of every token
+            }
+            {
+                Phase phase(*this, &PhaseTimes::attention_ms);
+                launch_attention_prepare(attn_shape, full_rows, attn_elem, FloatBand{nullptr, 0}, FloatBand{p, p_width},
+                                         FloatBand{p + attn_kv_width, p_width}, w.q_norm, w.k_norm, ElemMatrix{nullptr, 0}, stream,
+                                         PreparePart::KeysValuesOnly);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::elementwise_ms);
+                if (padded_u > ru) { // strict mode multiplies whole blocks: rows past the compact ones must be zero
+                    check_cuda(cudaMemsetAsync(a1c + ru * H * elem_bytes, 0, (padded_u - ru) * H * elem_bytes, stream), "cudaMemsetAsync");
+                    check_cuda(cudaMemsetAsync(a2 + ru * mix_width * elem_bytes, 0, (padded_u - ru) * mix_width * elem_bytes, stream), "cudaMemsetAsync");
+                    check_cuda(cudaMemsetAsync(a3 + ru * I * elem_bytes, 0, (padded_u - ru) * I * elem_bytes, stream), "cudaMemsetAsync");
+                }
+                launch_gather_rows(a1, H * elem_bytes, d_upos, ru, H * elem_bytes, a1c, H * elem_bytes, stream);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::multiplies_ms);
+                gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u); // queries and gates of the read-out tokens
+            }
+            {
+                Phase phase(*this, &PhaseTimes::attention_ms);
+                const FloatBand q_gate{p, p_width};
+                launch_attention_prepare(attn_shape, u_rows, attn_elem, q_gate, FloatBand{nullptr, 0}, FloatBand{nullptr, 0}, w.q_norm,
+                                         w.k_norm, ElemMatrix{q, attn_width}, stream, PreparePart::QueriesOnly);
+                launch_attention(attn_shape, u_rows, attn_elem, AttentionPath::Auto, ConstElemMatrix{q, attn_width}, q_gate,
+                                 ElemMatrix{a2, mix_width}, attn_elem, stream);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::multiplies_ms);
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::elementwise_ms);
+                launch_gather_rows(x, H * 4, d_upos, ru, H * 4, xc, H * 4, stream);
+                launch_add_rms_norm(xc, H, m, H, xc, H, w.post_norm, ru, H, eps, a1c, elem, H, stream);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::multiplies_ms);
+                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::elementwise_ms);
+                launch_swiglu(p, 2 * I, p + I, 2 * I, ru, I, a3, elem, I, stream);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::multiplies_ms);
+                gemm(a3, I, w.down, H, I, m, H, padded_u);
+            }
+            {
+                Phase phase(*this, &PhaseTimes::elementwise_ms);
+                launch_add(xc, H, m, H, xc, H, ru, H, stream);
+            }
+            break;
+        }
         if (!w.attention) {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, n);
+                gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, padded);
             }
             {
                 Phase phase(*this, &PhaseTimes::deltanet_ms);
@@ -895,12 +1038,12 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, n);
+                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded);
             }
         } else {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w.mixer_in, attn_in_width, H, p, p_width, n);
+                gemm(a1, H, w.mixer_in, attn_in_width, H, p, p_width, padded);
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -917,7 +1060,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, n);
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded);
             }
         }
         {
@@ -926,7 +1069,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
-            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, n);
+            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded);
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -934,7 +1077,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
-            gemm(a3, I, w.down, H, I, m, H, n);
+            gemm(a3, I, w.down, H, I, m, H, padded);
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -955,7 +1098,13 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     std::vector<float> hidden(readouts * H);
     {
         Phase phase(*this, &PhaseTimes::elementwise_ms);
-        if (readouts != 0) launch_readout_norm(x, H, d_readout, readouts, weights.final_norm, H, eps, m, H, stream);
+        if (readouts != 0) {
+            if (prune) {
+                launch_readout_norm(xc, H, d_compact, readouts, weights.final_norm, H, eps, m, H, stream);
+            } else {
+                launch_readout_norm(x, H, d_readout, readouts, weights.final_norm, H, eps, m, H, stream);
+            }
+        }
     }
     if (readouts != 0) {
         check_cuda(cudaMemcpyAsync(hidden.data(), m, hidden.size() * 4, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "readout");

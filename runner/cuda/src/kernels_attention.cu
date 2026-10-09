@@ -92,6 +92,8 @@ struct PrepareParams {
     const float* k_norm;
     void* q_out;
     std::size_t q_out_stride;
+    bool do_queries;
+    bool do_keys_values;
     double inverse_frequency[kMaxRotaryPairs];
 };
 
@@ -129,6 +131,7 @@ __global__ void attention_prepare_kernel(const PrepareParams p) {
 
     for (std::uint32_t v = warp; v < p.heads + p.kv_heads; v += kPrepareThreads / 32) {
         const bool is_query = v < p.heads;
+        if (is_query ? !p.do_queries : !p.do_keys_values) continue;
         const float* src = is_query ? p.q_gate.data + token * p.q_gate.stride + static_cast<std::size_t>(v) * 2 * head_dim
                                     : p.k.data + token * p.k.stride + static_cast<std::size_t>(v - p.heads) * head_dim;
         const float* weight = is_query ? p.q_norm : p.k_norm;
@@ -154,6 +157,7 @@ __global__ void attention_prepare_kernel(const PrepareParams p) {
         }
     }
 
+    if (!p.do_keys_values) return;
     const float* v_src = p.v.data + token * p.v.stride;
     for (std::uint32_t j = threadIdx.x; j < kv_width; j += blockDim.x) values[j] = from_float<T>(v_src[j]);
 }
@@ -621,7 +625,7 @@ bool attention_tiled_supported(const AttentionShape& shape, AttnElem kv_type) {
 
 void launch_attention_prepare(const AttentionShape& shape, const AttentionRows& rows, AttnElem kv_type, FloatBand q_gate,
                               FloatBand k, FloatBand v, const float* q_norm, const float* k_norm, ElemMatrix q_out,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, PreparePart part) {
     validate_shape(shape);
     validate_rows(rows);
     if (rows.run_count == 0 || rows.max_row_tokens == 0) return;
@@ -640,6 +644,8 @@ void launch_attention_prepare(const AttentionShape& shape, const AttentionRows& 
     p.k_norm = k_norm;
     p.q_out = q_out.data;
     p.q_out_stride = q_out.stride;
+    p.do_queries = part != PreparePart::KeysValuesOnly;
+    p.do_keys_values = part != PreparePart::QueriesOnly;
     // The reference's own expression, evaluated in float64 on the host: theta ** (-2i / rotary_dims).
     const double rotary = static_cast<double>(2 * p.pairs);
     for (std::uint32_t i = 0; i < p.pairs; ++i) {

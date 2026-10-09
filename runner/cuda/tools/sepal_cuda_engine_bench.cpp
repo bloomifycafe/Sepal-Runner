@@ -52,6 +52,7 @@ struct Options {
     std::size_t max_call_tokens = 16384;
     std::size_t budget_mib = 0;
     std::size_t state_slots = 0;
+    bool prune_last_layer = true;
     bool prefill = true, alerts = true, cached = true, profile = true;
 };
 
@@ -59,7 +60,7 @@ struct Options {
     std::fprintf(stderr,
                  "%s\nusage: sepal-cuda-engine-bench --model <dir> --workload <json> [--precision f16|f32] [--gemm-rows N] [--reps N]\n"
                  "       [--warmup N] [--json out.json] [--sections prefill,alerts,cached,profile] [--max-call-tokens N] [--budget-mib N]\n"
-                 "       [--state-slots N]\n",
+                 "       [--state-slots N] [--prune-last-layer 0|1]\n",
                  why.c_str());
     std::exit(2);
 }
@@ -96,6 +97,8 @@ Options parse(int argc, char** argv) {
             o.budget_mib = std::stoul(value);
         } else if (flag == "--state-slots") {
             o.state_slots = std::stoul(value);
+        } else if (flag == "--prune-last-layer") {
+            o.prune_last_layer = value != "0";
         } else if (flag == "--sections") {
             o.prefill = o.alerts = o.cached = o.profile = false;
             std::stringstream ss(value);
@@ -271,6 +274,7 @@ int main(int argc, char** argv) {
         eo.max_call_rows = 16 * 9 + 16;
         eo.memory_budget_bytes = opt.budget_mib << 20;
         eo.state_slots = opt.state_slots;
+        eo.prune_last_layer = opt.prune_last_layer;
         const auto created = std::chrono::steady_clock::now();
         CudaEngine engine(model, eo);
         const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count();
@@ -289,6 +293,7 @@ int main(int argc, char** argv) {
         std::printf("  model %s (%s): %llu layers, hidden %llu; precision %s; multiply batching %s; engine created in %.1f s\n", cfg.name.c_str(), opt.model.c_str(),
                     static_cast<unsigned long long>(cfg.num_layers), static_cast<unsigned long long>(cfg.hidden_size), opt.precision == Precision::F16 ? "float16" : "float32",
                     opt.gemm_rows == 0 ? "natural" : ("strict, gemm_rows " + std::to_string(opt.gemm_rows)).c_str(), create_s);
+        std::printf("  last layer computed for the read-out tokens only: %s\n", opt.prune_last_layer ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",
                     static_cast<double>(mem0.weights_bytes) / (1 << 20), static_cast<double>(mem0.call_buffer_bytes) / (1 << 20), mem0.slots_total,
                     static_cast<double>(mem0.slot_bytes) / (1 << 20), static_cast<double>(mem0.kv_heap_bytes) / (1 << 20), static_cast<double>(mem0.budget_bytes) / (1 << 20));
@@ -392,6 +397,7 @@ int main(int argc, char** argv) {
         if (opt.profile) {
             std::printf("TIME BREAKDOWN (synchronised profiling mode; the best of 5 runs; ms per call)\n");
             const std::vector<std::uint32_t> pool = token_pool(alerts, 16 * 640 + 64);
+            profile_call(engine, "1 row x 64", {plain_row(pool, 0, 64, true)}, 5);
             profile_call(engine, "1 row x 600", {plain_row(pool, 0, 600, true)}, 5);
             profile_call(engine, "1 row x 2048", {plain_row(pool, 0, 2048, true)}, 5);
             {

@@ -174,7 +174,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core

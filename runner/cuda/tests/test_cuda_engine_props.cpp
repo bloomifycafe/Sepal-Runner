@@ -330,6 +330,37 @@ SEPAL_TEST(engine_strict, repeated_runs_are_bit_identical) {
     }
 }
 
+SEPAL_TEST(engine_strict, computing_the_last_layer_for_the_read_out_tokens_only_changes_no_bit) {
+    // The pruned pass takes a different route through the last layer (its own queries, attention rows and multiplies);
+    // in strict mode it must still give the unpruned pass's bits.
+    for (const Precision precision : {Precision::F32, Precision::F16}) {
+        for (const std::size_t t : {std::size_t{16}, std::size_t{48}}) {
+            EngineOptions with = options_for(precision, t);
+            EngineOptions without = with;
+            without.prune_last_layer = false;
+            CudaEngine pruned(tiny_test_config(), weights_of(40), with);
+            CudaEngine full(tiny_test_config(), weights_of(40), without);
+            Rng rng(t * 7 + 1);
+            std::size_t compared = 0, identical = 0;
+            for (std::size_t trial = 0; trial < 40; ++trial) {
+                FuzzOptions fo;
+                fo.allow_store = false;
+                fo.max_len = trial % 2 == 0 ? 300 : 40;
+                const Request request = make_request(rng, {}, fo);
+                const auto a = run(pruned, request.engine);
+                const auto b = run(full, request.engine);
+                for (std::size_t r = 0; r < a.size(); ++r) {
+                    ++compared;
+                    if (same_bits(a[r].hidden, b[r].hidden)) ++identical;
+                }
+            }
+            std::cout << "  strict " << name_of(precision) << ", gemm_rows " << t << ": " << identical << " of " << compared
+                      << " rows bit-identical between the pruned and the full last layer\n";
+            CHECK_EQ(identical, compared);
+        }
+    }
+}
+
 SEPAL_TEST(engine_natural, drift_with_the_composition_of_the_call) {
     for (const Precision precision : {Precision::F32, Precision::F16}) {
         CudaEngine engine(tiny_test_config(), weights_of(35), options_for(precision, 0));

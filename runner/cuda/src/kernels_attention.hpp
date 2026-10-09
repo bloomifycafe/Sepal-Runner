@@ -118,6 +118,11 @@ struct ConstElemMatrix {
     std::size_t stride;
 };
 
+/// Which of the two jobs of the prepare launch to do. A pass that needs the queries of only some of the tokens (the last
+/// layer, where only the tokens that are read out matter) stores every token's keys and values with KeysValuesOnly and
+/// prepares those tokens' queries separately with QueriesOnly: the bands and q_out that a part does not use may be null.
+enum class PreparePart : int { All = 0, QueriesOnly = 1, KeysValuesOnly = 2 };
+
 /// Per-head norm and RoPE of q and k, then stores k and v.
 ///   q_gate  [N, 2 * heads * head_dim]: per head, the query then its gate (the gate is read by launch_attention).
 ///   k, v    [N, kv_heads * head_dim].
@@ -126,7 +131,7 @@ struct ConstElemMatrix {
 /// The row's keys and values go to its own (last) segment.
 void launch_attention_prepare(const AttentionShape& shape, const AttentionRows& rows, AttnElem kv_type, FloatBand q_gate,
                               FloatBand k, FloatBand v, const float* q_norm, const float* k_norm, ElemMatrix q_out,
-                              cudaStream_t stream);
+                              cudaStream_t stream, PreparePart part = PreparePart::All);
 
 /// Causal grouped-query attention of every token, multiplied by sigmoid(gate); `gate` is the same band as the
 /// q_gate of the prepare launch (it is read at column head * 2 * head_dim + head_dim). out is [N, heads * head_dim]
