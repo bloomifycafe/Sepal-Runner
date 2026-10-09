@@ -16,18 +16,21 @@ and on it a complete forward pass (the reference path) that is compared with the
 | Planner | `include/sepal/planner.hpp`, `src/plan/planner.cpp` | A memory plan (weights, working buffers, snapshot arena), or a refusal that names the shortfall and the knob to reduce |
 | Weights | `include/sepal/weights.hpp`, `src/core/weights.cpp` | The tensor names and shapes a geometry implies, a read-only container keyed by tensor name with `scope("layers.3")`, a strict loader from any name-to-array map, and seeded random weights for benchmarks |
 | Golden file | `include/sepal/golden.hpp`, `src/io/golden.cpp`, `include/sepal/json.hpp`, `src/io/json.cpp` | The reader of the golden-vector format and the small JSON reader its header needs |
+| Safetensors | `include/sepal/safetensors.hpp`, `src/io/safetensors.cpp`, `include/sepal/mapped_file.hpp`, `src/io/mapped_file.cpp` | A zero-copy safetensors reader (read-only mapping on Windows and POSIX; every offset, size, alignment and overlap checked) and `Checkpoint`, one or many files with or without an index |
+| Loader | `include/sepal/loader.hpp`, `src/model/loader.cpp` | `config.json` to a `ModelConfig` (compared with the closest preset), checkpoint names to engine names, the ignored tensors listed, `Weights<float/double>` for the reference path and a raw zero-copy view in the stored precision; `DecisionReadout` for the label-row readout. See "Real checkpoints" |
 | Reference path | `include/sepal/ref/*.hpp` | The whole forward pass and the request semantics, ported function for function from `sepal/refengine`: see "The reference path" below |
-| Tools | `tools/sepal_info.cpp`, `tools/sepal_bench.cpp`, `tools/export_golden.py` | `sepal-info`: a preset's derived quantities and a memory plan for a budget. `sepal-bench`: tokens per second of the reference path. `export_golden.py`: writes the golden file from the oracle |
+| Tools | `tools/sepal_info.cpp`, `tools/sepal_bench.cpp`, `tools/sepal_run.cpp`, `tools/export_golden.py`, `tools/make_tiny_checkpoint.py` | `sepal-info`: a preset's derived quantities and a memory plan for a budget. `sepal-bench`: tokens per second of the reference path. `sepal-run`: one pass of a real checkpoint. `export_golden.py`: writes the golden file from the oracle. `make_tiny_checkpoint.py`: writes the loader's test checkpoint |
 | Tests | `tests/` | A small self-registering harness (`tests/test.hpp`) and one suite per part; `tests/golden/tiny.sgv` is the golden file |
 
 No size is hard-wired outside the preset table in `src/core/config.cpp`.
 
 ## Not here yet
 
-The weight loader (GGUF), the tokenizer and encoder, the optimised layer-interleaved pass executor, the snapshot
+The GGUF loader, the tokenizer and encoder, the optimised layer-interleaved pass executor, the snapshot
 store and caches, the C ABI and the server come next. Of the provider interface, `gemm_f` and `gemm_f64` exist;
-`gemm_qd8` and `gemm_dq` come with the quantised profiles. Nothing has been run on real model weights yet: every
-number below comes from the `tiny` test geometry or from random weights.
+`gemm_qd8` and `gemm_dq` come with the quantised profiles. The numbers in "The reference path" and below come from
+the `tiny` test geometry or from random weights; the comparison with transformers on a real checkpoint is under
+"Real checkpoints".
 
 ## The reference path
 
@@ -231,10 +234,50 @@ Everything here was built and tested with MSVC 19.44 on Windows 11, in both pres
 standard with compiler extensions off and no platform headers, but it has not yet been compiled with GCC or
 Clang; the first Linux build may meet warnings that MSVC does not raise.
 
+## Real checkpoints
+
+`LoadedModel::open(dir)` reads `dir/config.json`, maps the safetensors files (`model.safetensors`, or the shards
+named by `model.safetensors.index.json`, or `model-0000k-of-0000N.safetensors` alone), finds the text model under
+its prefix (`model.language_model.`, `language_model.`, `model.` or none) and checks every tensor against the
+geometry with the strict check of `weights.hpp`. Anything the engine does not load is listed in `ignored()` with a
+reason: `visual.*` / `model.visual.*` (vision tower), `lm_head.*` (vocabulary projection), `mtp.*` / `model.mtp.*`
+(multi-token-prediction head). Any other tensor, a missing one, one of another shape, or a config the engine does not
+compute (no output gate, attention bias, an activation other than SiLU, layer types that are not a fixed
+full-attention interval) refuses the checkpoint with a message that names it. The pointer head belongs to an adapter
+and is not in a checkpoint; `weights<T>()` fills it with zeros, as the Python `engine_weights` does.
+
+`raw()` gives every loaded tensor by engine name as (pointer into the mapping, F32/F16/BF16, shape): a GPU engine
+uploads from it without widening on the host. `DecisionReadout::open_directory(dir)` reads `readout.safetensors`
+and the temperature of `decision_config.json`; `probabilities(hidden, N)` is the softmax over the first N rows of
+`hidden . row / temperature`, in float64.
+
+```
+sepal-run <checkpoint dir> <token file> [--readout <dir>] [--options N] [--precision f32|f64] [--show N]
+```
+
+The token file is token ids separated by spaces, commas or newlines. `sepal-run` prints the final hidden state's
+first values and, with `--readout`, the probabilities.
+
+**Against transformers.** `tools/export_real_golden.py` runs `mstrasser/jeff-base` in transformers on the CPU in
+float32 and writes `runs/real-golden/case_{i,ii,iii,iv}.safetensors` (git-ignored; the file documents every
+tensor). `tests/test_real_model.cpp` compares the CPU reference path with them and is skipped, with a message,
+unless both variables are set:
+
+```
+uv run --project <main checkout> --group verify python tools/export_real_golden.py
+SEPAL_REAL_MODEL=<snapshot dir> SEPAL_REAL_GOLDEN=runs/real-golden build/release/sepal_tests real
+```
+
+It takes about five minutes on one thread (16 + 64 + 300 + 300 + 179 tokens in float32, 16 in float64 as well).
+Measured on 2026-10-09: largest difference over every layer and token 1.7e-05 (16 tokens) and 1.8e-05 (64 tokens) in
+float32 against transformers' float32; 3.9e-14 for the float64 pass against transformers with its casts promoted to
+float64; final hidden state 7.6e-06 to 3.9e-05 and probabilities at most 1.1e-06 on the longer cases, with the three
+branches of one 300-token state matching the three full prompts.
+
 ## Running one suite
 
 `sepal_tests` runs everything; `sepal_tests <suite>` runs one of `config`, `dtype`, `tensor`, `gemm`, `ops`,
-`planner`, `golden`, `deltanet`, `attention`, `executor`, `readout`, `float32`, and fails if the name matches no
+`planner`, `golden`, `deltanet`, `attention`, `executor`, `readout`, `float32`, `safetensors`, `loader`, `real`, and fails if the name matches no
 test case. The last five print the largest difference from the oracle that each comparison saw; CTest shows a
 test's output only when it fails, so run the suite directly to read them, for example
 `build/release/sepal_tests executor`.
