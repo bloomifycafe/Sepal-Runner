@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include "device.hpp"
+#include "gemm_ptx.cuh"
 
 namespace sepal::cuda {
 
@@ -53,24 +54,6 @@ constexpr int kBK = 32;
 constexpr int kGroupM = 4;  // blocks run in groups of this many row tiles, so that the blocks resident together share panels in L2
 constexpr int kPitch = kBK; // halves per shared-memory row: 64 bytes, four 16-byte chunks, stored XOR-swizzled (see swz)
 
-// Chunk c (of 4) of tile row r lives at chunk c ^ ((r >> 1) & 3): the eight rows of an ldmatrix read, or the eight
-// consecutive threads of a cp.async write, then fall into different bank groups.
-__device__ inline int swz(int r, int c) { return c ^ ((r >> 1) & 3); }
-
-__device__ inline void cp_async16(void* smem, const void* gmem, bool valid) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    const int bytes = valid ? 16 : 0; // zero-fill outside the matrix
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(bytes));
-}
-__device__ inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N>
-__device__ inline void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-}
-__device__ inline void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* smem) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(s));
-}
 __device__ inline void mma_f16(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
                  : "+r"(c0), "+r"(c1)

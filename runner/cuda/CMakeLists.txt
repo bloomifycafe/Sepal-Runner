@@ -124,6 +124,11 @@ target_include_directories(sepal-cuda-gemm-probe PRIVATE src)
 target_include_directories(sepal-cuda-gemm-probe SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal-cuda-gemm-probe PRIVATE sepal_cublas sepal_cublaslt sepal_cuda sepal_cuda_flags)
 
+add_executable(sepal-cuda-int8-probe tools/int8_probe.cpp src/gemm_kernels.cu src/gemm_s8_kernels.cu)
+target_include_directories(sepal-cuda-int8-probe PRIVATE src)
+target_include_directories(sepal-cuda-int8-probe SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-cuda-int8-probe PRIVATE sepal_cublas sepal_cublaslt sepal_cuda sepal_cuda_flags)
+
 add_executable(sepal_cuda_tests tests/test_cuda_gemm.cpp)
 target_link_libraries(sepal_cuda_tests PRIVATE sepal_cuda sepal_cuda_flags)
 
@@ -202,7 +207,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu src/gemm_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
