@@ -438,7 +438,9 @@ SEPAL_TEST(engine_memory, thousands_of_calls_with_snapshots_created_and_released
               << " bytes; slots in use at most " << max_slots << " of " << after.slots_total << ", keys and values at most " << max_kv
               << " of " << after.kv_heap_bytes << " bytes; after releasing everything: " << after.slots_in_use << " slots and " << after.kv_in_use_bytes
               << " bytes in use, largest free block " << after.kv_largest_free_bytes << " of " << after.kv_heap_bytes << "\n";
-    CHECK_EQ(free_after, free_before);
+    // The card is shared: other processes move the device-wide free figure by megabytes, so the engine's own pools (checked
+    // exactly below) carry the leak check and this one only catches a leak that grows with the calls.
+    CHECK(free_after + (std::size_t{64} << 20) > free_before);
     CHECK(max_slots <= 6 + 6 + 12); // ring + the call's own rows
     CHECK_EQ(after.slots_in_use, 0u);
     CHECK_EQ(after.kv_in_use_bytes, 0u);
