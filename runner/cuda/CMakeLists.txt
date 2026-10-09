@@ -180,6 +180,9 @@ target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUD
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
   PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cuda_flags)
 
+add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
+target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
+
 # ---- engine tests ----
 # The real-model suite is skipped, with a message, unless SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN are set.
 add_executable(sepal_cuda_engine_tests
