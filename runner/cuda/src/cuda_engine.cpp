@@ -1044,12 +1044,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             chain.clear();
             for (const KvBlock* b = plan[r].kv.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
             std::reverse(chain.begin(), chain.end());
-            descs[r] = AttentionRowDesc{u32(segment_total), u32(chain.size()), u32(plan[r].start_position), 0};
+            // indexed: each segment says how many tokens precede it, so the kernels find a key's segment by binary search.
+            descs[r] = AttentionRowDesc{u32(segment_total), u32(chain.size()), u32(plan[r].start_position), 1};
             for (std::size_t a = 0; a < attn_layers; ++a) {
+                std::uint32_t before = 0;
                 for (const KvBlock* b : chain) {
                     const std::size_t per_layer = kv_layer_bytes(b->tokens);
                     char* keys = heap + b->offset + a * 2 * per_layer;
-                    segments[a].push_back(KvSegment{keys, keys + per_layer, b->tokens, 0});
+                    segments[a].push_back(KvSegment{keys, keys + per_layer, b->tokens, before});
+                    before += b->tokens;
                 }
             }
             segment_total += chain.size();
@@ -1104,15 +1107,17 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                 for (const KvBlock* b = plan[r].kv->parent.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
                 std::reverse(chain.begin(), chain.end());
                 const std::size_t first = segs_u.size();
+                std::uint32_t before = 0;
                 const auto segment_of = [&](const KvBlock* b, std::size_t skip, std::uint32_t tokens) {
                     const std::size_t per_layer = kv_layer_bytes(b->tokens);
                     char* keys = heap + b->offset + last * 2 * per_layer + skip * kv_layer_unit;
-                    segs_u.push_back(KvSegment{keys, keys + per_layer, tokens, 0});
+                    segs_u.push_back(KvSegment{keys, keys + per_layer, tokens, before});
+                    before += tokens;
                 };
                 for (const KvBlock* b : chain) segment_of(b, 0, b->tokens);
                 if (o > 0) segment_of(plan[r].kv.get(), 0, u32(o));
                 segment_of(plan[r].kv.get(), o, 1);
-                descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 0});
+                descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 1});
             }
             check_attention_rows(spans_u, descs_u, segs_u);
             for (const std::uint32_t pos : readout_rows) {

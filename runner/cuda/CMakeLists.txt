@@ -182,7 +182,7 @@ target_link_libraries(sepal_cuda_kernel_attention_tests PRIVATE sepal_cuda_atten
 add_executable(sepal-cuda-attention-bench tools/attention_bench.cpp)
 target_link_libraries(sepal-cuda-attention-bench PRIVATE sepal_cuda_attention sepal_cuda_flags)
 
-foreach(suite stages geometry continuation shared_context causality invariance positions rope_exact tables)
+foreach(suite stages geometry continuation shared_context causality invariance positions rope_exact tables chains)
   add_test(NAME cuda_attention_${suite} COMMAND sepal_cuda_kernel_attention_tests ${suite})
 endforeach()
 set_tests_properties(cuda_attention_geometry PROPERTIES TIMEOUT 900)
