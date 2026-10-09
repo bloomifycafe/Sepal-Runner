@@ -8,6 +8,10 @@ and changes nothing outside `runner/cuda/`.
 Everything measured below was measured on one machine on 2026-10-09: Windows 11, NVIDIA GeForce RTX 3060 12 GB
 (compute capability 8.6), driver 591.86, MSVC 19.44, CMake 3.31, Ninja.
 
+> **Update.** The sections up to "Attention kernels" describe the first slice, the cuBLAS provider, and are kept as
+> measured. Every item of the "not on the GPU" column below is now on the GPU and assembled into an engine that runs
+> a real model end to end: see [The GPU engine](#the-gpu-engine) at the end of this file.
+
 ## What is and is not on the GPU yet
 
 | On the GPU | Not on the GPU |
@@ -279,3 +283,99 @@ attention geometry, 8 heads over 2 KV heads of 256, and measured alike), `sepal-
 | (a) 16 rows x 640 | 43.0 | 39.8 | 2.88 (0.68 + 2.19) |
 | (b) 1 row x 4096 | 135.3 | 107.3 | 3.73 (0.28 + 3.45) |
 | (c) 8 states x 640 + 64 branches x 27 | 47.3 | 39.2 | 2.34 (0.46 + 1.87) |
+
+## The GPU engine
+
+`include/sepal/cuda/cuda_engine.hpp`, `src/cuda_engine.cpp`, `src/engine_kernels.{hpp,cu}`: `CudaEngine` runs a Qwen3.5
+hybrid model (Gated DeltaNet and full-attention layers) on the GPU, from a `LoadedModel` (a checkpoint, bf16/f16/f32
+converted on the device) or from a config and `Weights<float>`. Library `sepal_cuda_engine`; tests
+`sepal_cuda_engine_tests` (CTest `cuda_engine_*`); benchmark `sepal-cuda-engine-bench`; workload generator
+`tools/make_alert_workload.py` at the repository root.
+
+```cpp
+sepal::cuda::CudaEngine engine(sepal::LoadedModel::open(dir), {.precision = Precision::F16, .gemm_rows = 0});
+std::vector<sepal::cuda::EngineRow> rows(9);          // a state and eight questions about it
+rows[0].token_ids = state;                             // rows[0].keep_snapshot = true would store the state
+for (int k = 0; k < 8; ++k) {
+    rows[k + 1].token_ids = suffix[k];
+    rows[k + 1].parent = sepal::cuda::ParentRow{0};    // or a DeviceSnapshot from an earlier call
+    rows[k + 1].readout_offsets = {suffix[k].size() - 1};
+}
+auto results = engine.run(rows);                       // results[k + 1].hidden: final-normed hidden state, float32, host
+```
+
+- **One call, one flat token list.** All rows go through the stack together, layer by layer; every multiply runs once
+  over all tokens; DeltaNet rows whose parent is a row of the same call run in a later wave; attention reads parents'
+  keys and values in place. Semantics are those of `sepal::ref::run_rows` (a row continues a snapshot, another row of
+  the call, or nothing; rows sharing a parent never see each other; positions are explicit or follow the parent).
+- **Device snapshots** (`DeviceSnapshot`): immutable, reference counted; own a DeltaNet state slot and the row's keys
+  and values (one heap block, all attention layers) and keep the parent's keys and values alive. Memory is taken at
+  creation out of `memory_budget_bytes` (weights, call buffers for `max_call_tokens`, a slot pool, a key/value heap);
+  `run` allocates nothing on the device, throws `BudgetExceeded` before doing any work when a call does not fit, and the
+  engine stays usable.
+- **Multiply batching.** `gemm_rows = 0` is natural (one multiply over all tokens). `gemm_rows = T` is strict: every
+  multiply is cut into multiplies of exactly T rows, the last zero-padded, so a row's bits do not depend on the rest of
+  the call. All of the engine's own kernels are batch-invariant.
+- **Residual ladder**: `EngineRow::capture_layers` returns every layer's output for that row.
+- **Tuning that is on by default**: the last layer's queries, attention, `o_proj` and MLP are computed for the tokens
+  that are read out only (`prune_last_layer`; its keys and values are still stored for every token; bit-identical to
+  the full pass in strict mode); on the float16 path the MLP's gate and up multiply writes binary16 (`fp16_gate_up`).
+  Measured on the same session, both off then on: 16 rows x 640 16.3k -> 17.2k tokens/s, 4800 tokens 12.7k -> 13.3k, 16
+  alerts per call 18.9 -> 19.8 alerts/s, 16 alerts with the states cached 72 -> 75 alerts/s.
+
+### Correctness (RTX 3060, the numbers `sepal_cuda_engine_tests` prints)
+
+| Test | Result |
+|---|---|
+| float32 engine vs CPU reference executor, tiny geometry, 400 random calls (2,529 rows, 75,491 tokens, 737 snapshots kept, 328 rows continuing stored snapshots) | largest hidden-state difference 1.83e-4; 3 of 400 calls over 1e-4, all explained: the float32 reference is itself 1.7e-4 from float64 on the same calls (engine 1.4e-4) because the random weights amplify float32 rounding noise through the DeltaNet layers (`diag` suite; without stored parents, 1,000 calls: engine 4.7e-4 and reference 4.3e-4 from float64) |
+| float32 engine vs transformers float32, jeff-base, cases i-iv | every layer of cases i and ii within 1.05e-5; final hidden within 2.6e-5; option probabilities within 1.6e-6; case iv as one call and as a stored snapshot continued by a later call agree to 1e-5 |
+| float16 engine vs float32 golden, jeff-base, 6 prompts | |Δhidden| max 6.9e-3, mean 9.7e-4; |Δp| max 7.4e-4, mean 1.6e-4; no answer flip. transformers' own float16: 1.95e-2 / 1.6e-3 and 5.0e-4 / 2.5e-4 |
+| Qwen3.5-2B-Base, float32 engine vs CPU reference (51 tokens, state with two branches) | 5.2e-5; float16 vs float32 engine: max 1.5e-2, mean 1.5e-3 |
+| strict mode (tiny, float32 and float16, gemm_rows 8/16/24/32/64; real model, 128 and 1024) | a row alone vs among other rows at random places: bit-identical in every trial; branch from a stored snapshot vs the same branch run with its state: bit-identical (118 of 118 tiny, 18 of 18 real, plus three-deep chains); permuting the rows of a call: 420 of 420 rows and 420 of 420 left-behind snapshots tiny, 111 of 111 rows real; repeated runs identical in both modes |
+| natural mode drift | real model, 36 branch rows alone vs in calls of 4 to 16 rows: every row differs in bits; float16 max |Δp| 7.3e-4; float32 max |Δp| 1.6e-6 |
+| memory | 3,000 calls creating and releasing snapshots: device memory before and after identical, pools back to zero use, heap fully merged; budget overrun fails with `BudgetExceeded`, nothing is leaked, the next call gives the same bits; snapshots outlive their parents' handles and the engine |
+| refusals | bad token ids, empty rows, readouts out of range, cyclic or dangling parents, empty handle, snapshot of another engine or geometry, too many rows/tokens: `std::invalid_argument`, nothing left allocated |
+
+The real-model suites (`real_f32`, `real_f16`, `real_strict`, `real_natural`, `real_2b`) print SKIPPED unless
+`SEPAL_REAL_MODEL` (checkpoint directory), `SEPAL_REAL_GOLDEN` (`tools/export_real_golden.py` output) and, for `real_2b`,
+`SEPAL_REAL_MODEL_2B` are set.
+
+### Speed (RTX 3060 12 GB, driver 591.86, CUDA 13.1, cuBLAS 13.2.1, float16; best of 7 runs; llama.cpp b11514 for comparison)
+
+`sepal-cuda-engine-bench --model <dir> --workload runs/alert_workload.json [--gemm-rows 1024] [--json out.json]`.
+
+| Prefill, tokens/s | 0.8B natural | 0.8B strict 1024 | llama.cpp 0.8B | 2B natural | 2B strict 1024 | llama.cpp 2B |
+|---|---|---|---|---|---|---|
+| 1 row x 64 | 8,610 | 1,352 | 5,204 | 4,020 | 506 | 3,281 |
+| 1 row x 600 | 12,906 | 9,328 | 9,422 | 6,179 | 4,176 | 6,342 |
+| 1 row x 1000 | 13,522 | 12,886 | 10,653 | 6,287 | 6,329 | |
+| 1 row x 2048 | 13,613 | 13,166 | 11,056 | 6,859 | 6,483 | 6,888 |
+| 1 row x 4800 | 13,432 | 12,511 | 10,018 | 6,666 | 6,167 | |
+| 16 rows x 640 | 17,571 | 16,725 | | 7,923 | 7,317 | |
+
+| Alerts per second (state + 8 questions) | 0.8B natural | 0.8B strict 1024 | llama-server 0.8B | 2B natural | 2B strict 1024 | llama-server 2B |
+|---|---|---|---|---|---|---|
+| 1 alert per call | 16.1 | 14.0 | 1.7 (2.9 best) | 7.6 | 6.5 | 1.1 (2.5 best) |
+| 4 alerts per call | 18.4 | 15.9 | | 8.4 | 7.1 | |
+| 16 alerts per call | 20.2 | 18.6 | | 9.2 | 8.2 | |
+| state cached, 1 alert per call | 56.3 | 19.7 | | 25.1 | 7.8 | |
+| state cached, 16 alerts per call | 77.1 | 65.5 | | 34.4 | 28.8 | |
+
+Where a call's time goes (synchronised profiling mode, so each total is longer than the same call unprofiled), ms:
+
+| Call (0.8B, natural) | multiplies | DeltaNet | attention | elementwise | host + launch | wall |
+|---|---|---|---|---|---|---|
+| 1 row x 600 | 28.4 | 15.5 | 1.2 | 2.6 | 2.1 | 49.8 |
+| 16 rows x 640 | 407 | 128 | 15.6 | 37 | 2.7 | 591 |
+| 16 alerts per call | 546 | 175 | 24.8 | 49.8 | 3.2 | 799 |
+
+The multiplies run at 24 to 25 TFLOP/s, which is the RTX 3060's float16-with-float32-accumulation tensor peak (28 SMs x
+512 FLOPs per clock x about 1.78 GHz = 25.5 TFLOP/s): on the 2B model they are 81% of a call, so raw tokens per second
+there (83% of a 16 x 640 call) cannot move far from llama.cpp's. What is left is the DeltaNet scan (one block per row and value head: a single
+long row uses 16 blocks of 28 SMs) and the memory-bound elementwise kernels.
+
+Peak device memory (0.8B and 2B, float16, the bench's default budget of 85% of the free memory): the engine reserves
+9,557 MiB at creation (0.8B: weights 1,436, call buffers 962, 148 state slots of 19.3 MiB 2,851, key/value heap 4,307;
+2B: weights 3,590, call buffers 1,460, 93 slots 1,792, heap 2,714); in use at the peak of the workload (16 alerts per
+call): 2,869 MiB for the 0.8B and 5,521 MiB for the 2B. The process took 9.7 GiB of the 12 GiB card (the desktop holds
+the rest).
