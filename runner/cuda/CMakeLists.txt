@@ -135,6 +135,25 @@ foreach(suite stages growth geometry continuation waves invariance edge)
   set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900)
 endforeach()
 
+# ---- attention kernels (full-attention mixer: norm, RoPE, K/V storage, attention, gate) ----
+# A library of its own so that it builds and tests without the cuBLAS provider.
+add_library(sepal_cuda_attention STATIC src/kernels_attention.cu)
+target_include_directories(sepal_cuda_attention PUBLIC src)
+target_include_directories(sepal_cuda_attention SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_attention PUBLIC sepal_core PRIVATE sepal_cuda_flags)
+
+add_executable(sepal_cuda_kernel_attention_tests tests/test_kernels_attention.cpp ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_attention_tests PRIVATE ../tests)
+target_link_libraries(sepal_cuda_kernel_attention_tests PRIVATE sepal_cuda_attention sepal_cuda_flags)
+
+add_executable(sepal-cuda-attention-bench tools/attention_bench.cpp)
+target_link_libraries(sepal-cuda-attention-bench PRIVATE sepal_cuda_attention sepal_cuda_flags)
+
+foreach(suite stages geometry continuation shared_context causality invariance positions rope_exact tables)
+  add_test(NAME cuda_attention_${suite} COMMAND sepal_cuda_kernel_attention_tests ${suite})
+endforeach()
+set_tests_properties(cuda_attention_geometry PROPERTIES TIMEOUT 900)
+
 # ---- elementwise, norm, MLP, embedding and readout kernels ----
 # A library of their own (no cuBLAS), so the kernels and their tests build and run whatever state the GEMM provider is in.
 add_library(sepal_cuda_elementwise STATIC src/kernels_elementwise.cu)
