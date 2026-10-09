@@ -20,15 +20,25 @@ enum class S8WeightLayout {
 /// Per-row symmetric int8 quantisation of binary16 activations: scale[r] = max |x[r, :]| / 127, q[r, c] = round-to-nearest-even
 /// of x[r, c] / scale[r] (a zero row gets scale 0 and zeros). x is [rows, cols] binary16 with row stride ld_x, q is int8 with
 /// row stride ld_q. Requires cols a multiple of 16, ld_x and ld_q multiples of 16 and 16-byte aligned pointers.
+/// `smooth` (null, or `cols` floats, 16-byte aligned): every value is multiplied by smooth[column] in float32 before the scale is
+/// taken and the value rounded (a fixed per-channel factor, the same for every row: README.md, "int8 multiplies").
 /// Enqueued on `stream`; throws std::invalid_argument / std::runtime_error as launch_gemm_nt.
 void launch_quantize_rows_s8(const void* x, std::size_t ld_x, void* q, std::size_t ld_q, float* scales, std::size_t rows, std::size_t cols,
-                             cudaStream_t stream);
+                             cudaStream_t stream, const float* smooth = nullptr);
 
 /// Per-output-channel symmetric int8 quantisation of a weight matrix w [n, k] (binary16, row stride ld_w, k contiguous):
 /// scales[r] = max |w[r, :]| / 127, wq[r, c] = round-to-nearest-even of w[r, c] / scales[r], stored contiguously with row
-/// stride k in `layout`. Requires k a multiple of 16, ld_w a multiple of 16, 16-byte aligned pointers.
+/// stride k in `layout`. Requires k a multiple of 16, ld_w a multiple of 16, 16-byte aligned pointers. `col_scale` (null, or k
+/// floats, 16-byte aligned): w[r, c] is multiplied by col_scale[c] in float32 first (the other half of the smoothing).
 void launch_quantize_weights_s8(const void* w, std::size_t ld_w, void* wq, float* scales, std::size_t n, std::size_t k, S8WeightLayout layout,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const float* col_scale = nullptr);
+
+/// out[c] = max over the rows of |x[r, c]| for c in [0, cols): x binary16 [rows, cols] with row stride ld_x (calibration).
+void launch_column_absmax(const void* x, std::size_t ld_x, float* out, std::size_t rows, std::size_t cols, cudaStream_t stream);
+
+/// Running per-channel statistics of binary16 activations x [rows, cols] (row stride ld_x), added into what is there: amax[c] = max(amax[c],
+/// max over rows |x[r, c]|), sums[c] += sum |x[r, c]|, sums[cols + c] += sum x[r, c]^2 (double, summed in row order: the same bits on every run).
+void launch_channel_stats(const void* x, std::size_t ld_x, std::size_t rows, std::size_t cols, float* amax, double* sums, cudaStream_t stream);
 
 /// Y[t, n] = sx[t] * sw[n] * sum over k of xq[t, k] * wq[n, k]: int8 operands (xq [T, K] with row stride ld_x, wq [N, K] with row
 /// stride ld_w, layout Plain), exact int32 sums on the tensor cores, then (float(sum) * sx[t]) * sw[n] in float32. Y is row-major

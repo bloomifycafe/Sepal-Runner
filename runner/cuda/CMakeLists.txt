@@ -207,7 +207,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
@@ -218,6 +218,9 @@ target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_co
 
 add_executable(sepal-cuda-engine-ab tools/engine_ab.cpp)
 target_link_libraries(sepal-cuda-engine-ab PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
+
+add_executable(sepal-cuda-calibrate tools/calibrate.cpp)
+target_link_libraries(sepal-cuda-calibrate PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
 
 # ---- the multiply kernels (binary16 accumulation with a float32 flush, 2-D widening) ----
 add_executable(sepal_cuda_kernel_gemm_tests tests/test_gemm_kernels.cpp src/gemm_kernels.cu ../tests/test_main.cpp)
@@ -234,7 +237,7 @@ add_executable(sepal_cuda_kernel_s8_tests tests/test_gemm_s8_kernels.cpp src/gem
 target_include_directories(sepal_cuda_kernel_s8_tests PRIVATE ../tests src)
 target_include_directories(sepal_cuda_kernel_s8_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_kernel_s8_tests PRIVATE sepal_core sepal_cuda_flags)
-foreach(suite s8_quantize s8_gemm s8_invariance s8_edge)
+foreach(suite s8_quantize s8_gemm s8_invariance s8_edge s8_smoothing)
   add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_s8_tests ${suite})
   set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
 endforeach()

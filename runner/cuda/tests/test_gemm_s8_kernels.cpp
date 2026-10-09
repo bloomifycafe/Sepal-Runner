@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -366,4 +367,184 @@ SEPAL_TEST(s8_edge, tiny_shapes_zero_rows_and_refused_arguments) {
     launch_gemm_w8a16(p.dx.data(), 64, p.wqp.data(), 64, p.swp.data(), y.data(), 8, false, 0, 8, 64, -1, stream());
     launch_quantize_rows_s8(p.dx.data(), 64, p.xq.data(), 64, p.sx.data(), 0, 64, stream());
     sync();
+}
+
+// ---- smoothing and calibration ----
+
+namespace {
+
+std::vector<float> random_factors(std::mt19937& rng, std::size_t k) {
+    std::uniform_real_distribution<float> ud(0.1f, 10.0f);
+    std::vector<float> v(k);
+    for (float& e : v) e = ud(rng);
+    return v;
+}
+
+bool refused_call(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+SEPAL_TEST(s8_smoothing, the_factors_enter_both_quantisers_as_a_float32_product_and_ones_change_nothing) {
+    std::mt19937 rng(8);
+    for (const std::size_t k : {16u, 48u, 1024u, 3584u}) {
+        const Problem p(29, 19, k, 6, 3.0f);
+        const std::vector<float> s = random_factors(rng, k);
+        const std::vector<float> ones(k, 1.0f);
+        const DeviceBuffer<float> ds(s), d1(ones);
+        // Activations: x * s[k] in float32, then the same rule as without.
+        DeviceBuffer<std::int8_t> xq(p.t * k);
+        DeviceBuffer<float> sx(p.t);
+        sepal::cuda::launch_quantize_rows_s8(p.dx.data(), k, xq.data(), k, sx.data(), p.t, k, stream(), ds.data());
+        sync();
+        const auto got = xq.download();
+        const auto got_scale = sx.download();
+        bool exact = true;
+        for (std::size_t r = 0; r < p.t; ++r) {
+            std::vector<float> scaled(k);
+            for (std::size_t i = 0; i < k; ++i) scaled[i] = p.xf[r * k + i] * s[i];
+            std::vector<std::int8_t> want(k);
+            float scale = 0;
+            quantize_row(scaled.data(), k, want.data(), &scale);
+            exact = exact && std::memcmp(want.data(), &got[r * k], k) == 0 && std::memcmp(&scale, &got_scale[r], sizeof(float)) == 0;
+        }
+        CHECK(exact);
+        // Weights, both layouts.
+        for (const S8WeightLayout layout : {S8WeightLayout::Plain, S8WeightLayout::Fp16Pairs}) {
+            DeviceBuffer<std::int8_t> wq(p.n * k);
+            DeviceBuffer<float> sw(p.n);
+            sepal::cuda::launch_quantize_weights_s8(p.dw.data(), k, wq.data(), sw.data(), p.n, k, layout, stream(), ds.data());
+            sync();
+            const auto wh = wq.download();
+            const auto swh = sw.download();
+            bool w_exact = true;
+            for (std::size_t r = 0; r < p.n; ++r) {
+                std::vector<float> scaled(k);
+                for (std::size_t i = 0; i < k; ++i) scaled[i] = p.wf[r * k + i] * s[i];
+                std::vector<std::int8_t> want(k);
+                float scale = 0;
+                quantize_row(scaled.data(), k, want.data(), &scale);
+                w_exact = w_exact && std::memcmp(&scale, &swh[r], sizeof(float)) == 0;
+                for (std::size_t g = 0; g < k; g += 16) {
+                    for (std::size_t e = 0; e < 16; ++e) {
+                        const std::size_t pos = layout == S8WeightLayout::Plain ? e : 4 * ((e & 7) >> 1) + (e & 1) + 2 * (e >> 3);
+                        w_exact = w_exact && wh[r * k + g + pos] == want[g + e];
+                    }
+                }
+            }
+            CHECK(w_exact);
+        }
+        // Factors of one change nothing, bit for bit.
+        DeviceBuffer<std::int8_t> xq1(p.t * k), wq1(p.n * k);
+        DeviceBuffer<float> sx1(p.t), sw1(p.n);
+        sepal::cuda::launch_quantize_rows_s8(p.dx.data(), k, xq1.data(), k, sx1.data(), p.t, k, stream(), d1.data());
+        sepal::cuda::launch_quantize_weights_s8(p.dw.data(), k, wq1.data(), sw1.data(), p.n, k, S8WeightLayout::Plain, stream(), d1.data());
+        sync();
+        CHECK(xq1.download() == p.xq.download());
+        CHECK(wq1.download() == p.wq.download());
+        CHECK(same_bits(sx1.download().data(), p.sx.download().data(), p.t));
+        CHECK(same_bits(sw1.download().data(), p.sw.download().data(), p.n));
+    }
+}
+
+SEPAL_TEST(s8_smoothing, dividing_the_large_channels_out_of_the_activations_lowers_the_error_of_the_int8_multiply) {
+    // Four channels 200 times larger than the rest in every row: a row's scale is set by them. Factors s = sqrt(max|x| / max|w|) per channel
+    // (the SmoothQuant rule, alpha 1/2) move most of that into the weights.
+    const std::size_t t = 64, n = 96, k = 1024;
+    Problem p(t, n, k, 9);
+    std::vector<__half> x = p.x;
+    std::mt19937 rng(10);
+    for (std::size_t r = 0; r < t; ++r)
+        for (const std::size_t c : {17u, 300u, 301u, 900u}) x[r * k + c] = __float2half(200.0f * (0.5f + 0.001f * static_cast<float>(rng() % 1000)));
+    DeviceBuffer<__half> dx(x);
+    std::vector<float> xf(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) xf[i] = __half2float(x[i]);
+    std::vector<float> s(k, 1.0f);
+    for (std::size_t c = 0; c < k; ++c) {
+        float xm = 0, wm = 0;
+        for (std::size_t r = 0; r < t; ++r) xm = std::max(xm, std::fabs(xf[r * k + c]));
+        for (std::size_t r = 0; r < n; ++r) wm = std::max(wm, std::fabs(p.wf[r * k + c]));
+        s[c] = std::sqrt(xm / wm);
+    }
+    std::vector<double> want(t * n);
+    for (std::size_t r = 0; r < t; ++r)
+        for (std::size_t c = 0; c < n; ++c) {
+            double acc = 0;
+            for (std::size_t i = 0; i < k; ++i) acc += static_cast<double>(xf[r * k + i]) * p.wf[c * k + i];
+            want[r * n + c] = acc;
+        }
+    std::vector<float> inv(k);
+    for (std::size_t c = 0; c < k; ++c) inv[c] = 1.0f / s[c];
+    const DeviceBuffer<float> ds(s), dinv(inv);
+    double err[2];
+    for (int smoothed = 0; smoothed < 2; ++smoothed) {
+        DeviceBuffer<std::int8_t> xq(t * k), wq(n * k);
+        DeviceBuffer<float> sx(t), sw(n), y(t * n);
+        sepal::cuda::launch_quantize_rows_s8(dx.data(), k, xq.data(), k, sx.data(), t, k, stream(), smoothed ? dinv.data() : nullptr);
+        sepal::cuda::launch_quantize_weights_s8(p.dw.data(), k, wq.data(), sw.data(), n, k, S8WeightLayout::Plain, stream(), smoothed ? ds.data() : nullptr);
+        sepal::cuda::launch_gemm_s8(xq.data(), k, sx.data(), wq.data(), k, sw.data(), y.data(), n, false, t, n, k, -1, stream());
+        sync();
+        err[smoothed] = relative_rms_error(y.download(), want);
+    }
+    std::printf("  with four 200-sigma channels: W8A8 %.3e, smoothed %.3e\n", err[0], err[1]);
+    CHECK(err[1] < err[0] / 3.0);
+    CHECK(err[1] < 2.0e-2);
+}
+
+SEPAL_TEST(s8_smoothing, channel_statistics_and_column_maxima_match_the_host) {
+    const std::size_t rows = 77, cols = 200, ld = 208;
+    std::mt19937 rng(12);
+    std::vector<__half> x(rows * ld, __float2half(0.0f));
+    std::normal_distribution<float> nd(0.0f, 2.0f);
+    for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t c = 0; c < cols; ++c) x[r * ld + c] = __float2half(nd(rng));
+    DeviceBuffer<__half> dx(x);
+    DeviceBuffer<float> amax(cols), cmax(cols);
+    DeviceBuffer<double> sums(2 * cols);
+    amax.zero();
+    sums.zero();
+    // Two calls (a split of the rows) add up to one pass over all of them.
+    sepal::cuda::launch_channel_stats(dx.data(), ld, 30, cols, amax.data(), sums.data(), stream());
+    sepal::cuda::launch_channel_stats(dx.data() + 30 * ld, ld, rows - 30, cols, amax.data(), sums.data(), stream());
+    sepal::cuda::launch_column_absmax(dx.data(), ld, cmax.data(), rows, cols, stream());
+    sync();
+    const auto a = amax.download(), m = cmax.download();
+    const auto s = sums.download();
+    bool ok = true;
+    for (std::size_t c = 0; c < cols; ++c) {
+        float want_max = 0;
+        double want_abs = 0, want_sq = 0;
+        for (std::size_t r = 0; r < rows; ++r) {
+            const float v = __half2float(x[r * ld + c]);
+            want_max = std::max(want_max, std::fabs(v));
+            want_abs += std::fabs(static_cast<double>(v));
+            want_sq += static_cast<double>(v) * v;
+        }
+        ok = ok && a[c] == want_max && m[c] == want_max && std::fabs(s[c] - want_abs) <= 1e-9 * want_abs && std::fabs(s[cols + c] - want_sq) <= 1e-9 * want_sq;
+    }
+    CHECK(ok);
+    // The same calls again give the same bits.
+    DeviceBuffer<float> amax2(cols);
+    DeviceBuffer<double> sums2(2 * cols);
+    amax2.zero();
+    sums2.zero();
+    sepal::cuda::launch_channel_stats(dx.data(), ld, 30, cols, amax2.data(), sums2.data(), stream());
+    sepal::cuda::launch_channel_stats(dx.data() + 30 * ld, ld, rows - 30, cols, amax2.data(), sums2.data(), stream());
+    sync();
+    CHECK(sums2.download() == sums.download());
+    // Refusals.
+    CHECK(refused_call([&] { sepal::cuda::launch_channel_stats(nullptr, ld, rows, cols, amax.data(), sums.data(), stream()); }));
+    CHECK(refused_call([&] { sepal::cuda::launch_channel_stats(dx.data(), 100, rows, cols, amax.data(), sums.data(), stream()); }));
+    CHECK(refused_call([&] { sepal::cuda::launch_column_absmax(dx.data(), 100, cmax.data(), rows, cols, stream()); }));
+    // A misaligned factor vector is refused.
+    const Problem q(4, 8, 64, 1);
+    const DeviceBuffer<float> f(std::vector<float>(80, 1.0f));
+    CHECK(refused_call([&] { sepal::cuda::launch_quantize_rows_s8(q.dx.data(), 64, q.xq.data(), 64, q.sx.data(), 4, 64, stream(), f.data() + 1); }));
+    CHECK(refused_call([&] { sepal::cuda::launch_quantize_weights_s8(q.dw.data(), 64, q.wq.data(), q.sw.data(), 8, 64, S8WeightLayout::Plain, stream(), f.data() + 1); }));
 }

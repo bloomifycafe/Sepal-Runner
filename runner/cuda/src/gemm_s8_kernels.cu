@@ -31,56 +31,67 @@ __device__ inline int quantize_one(float v, float inv) {
     return min(127, max(-127, q));
 }
 
+// The eight inputs of channels 8c ... 8c+7 as float32, times their smoothing factors (`mul` null: as they are).
+__device__ inline void load8(const uint4& v, const float* __restrict__ mul, int c, float (&f)[8]) {
+    const __half2* h = reinterpret_cast<const __half2*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 g = __half22float2(h[i]);
+        f[2 * i] = g.x;
+        f[2 * i + 1] = g.y;
+    }
+    if (mul != nullptr) {
+        const float4 m0 = *reinterpret_cast<const float4*>(mul + 8 * c), m1 = *reinterpret_cast<const float4*>(mul + 8 * c + 4);
+        f[0] *= m0.x; f[1] *= m0.y; f[2] *= m0.z; f[3] *= m0.w;
+        f[4] *= m1.x; f[5] *= m1.y; f[6] *= m1.z; f[7] *= m1.w;
+    }
+}
+
 // One block per row. The maximum does not depend on the order it is taken in, and each element is quantised on its own.
+// `smooth` (null or cols floats): the activations are multiplied by it, channel by channel, before the scale is taken.
 __global__ void quantize_rows_s8_kernel(const uint4* __restrict__ x, std::size_t ld_x8, uint2* __restrict__ q, std::size_t ld_q8, float* __restrict__ scales,
-                                        int cols8) {
+                                        int cols8, const float* __restrict__ smooth) {
     __shared__ float shared[8];
     const std::size_t row = blockIdx.x;
     const uint4* xr = x + row * ld_x8;
     float amax = 0.0f;
     for (int c = threadIdx.x; c < cols8; c += blockDim.x) {
-        const uint4 v = xr[c];
-        const __half2* h = reinterpret_cast<const __half2*>(&v);
+        float f[8];
+        load8(xr[c], smooth, c, f);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 f = __half22float2(h[i]);
-            amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
-        }
+        for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(f[i]));
     }
     amax = block_max(amax, shared);
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     if (threadIdx.x == 0) scales[row] = amax / 127.0f;
     uint2* qr = q + row * ld_q8;
     for (int c = threadIdx.x; c < cols8; c += blockDim.x) {
-        const uint4 v = xr[c];
-        const __half2* h = reinterpret_cast<const __half2*>(&v);
+        float f[8];
+        load8(xr[c], smooth, c, f);
         unsigned packed[2] = {0u, 0u};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float2 f = __half22float2(h[i]);
-            const unsigned lo = static_cast<unsigned>(quantize_one(f.x, inv)) & 0xFFu, hi = static_cast<unsigned>(quantize_one(f.y, inv)) & 0xFFu;
+            const unsigned lo = static_cast<unsigned>(quantize_one(f[2 * i], inv)) & 0xFFu, hi = static_cast<unsigned>(quantize_one(f[2 * i + 1], inv)) & 0xFFu;
             packed[i >> 1] |= (lo << ((i & 1) * 16)) | (hi << ((i & 1) * 16 + 8));
         }
         qr[c] = make_uint2(packed[0], packed[1]);
     }
 }
 
-// One block per row; a thread takes groups of 16 values of k (two 16-byte loads, one 16-byte store).
+// One block per row; a thread takes groups of 16 values of k (two 16-byte loads, one 16-byte store). `col_scale` (null or k floats):
+// the weights are multiplied by it, input channel by channel, before the row's scale is taken (the smoothing factors).
 __global__ void quantize_weights_s8_kernel(const uint4* __restrict__ w, std::size_t ld_w8, uint4* __restrict__ wq, float* __restrict__ scales, int groups,
-                                           bool pairs) {
+                                           bool pairs, const float* __restrict__ col_scale) {
     __shared__ float shared[8];
     const std::size_t row = blockIdx.x;
     const uint4* wr = w + row * ld_w8;
     float amax = 0.0f;
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {
         for (int part = 0; part < 2; ++part) {
-            const uint4 v = wr[2 * g + part];
-            const __half2* h = reinterpret_cast<const __half2*>(&v);
+            float f[8];
+            load8(wr[2 * g + part], col_scale, 2 * g + part, f);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = __half22float2(h[i]);
-                amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
-            }
+            for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(f[i]));
         }
     }
     amax = block_max(amax, shared);
@@ -91,14 +102,10 @@ __global__ void quantize_weights_s8_kernel(const uint4* __restrict__ w, std::siz
         unsigned char b[16];
 #pragma unroll
         for (int part = 0; part < 2; ++part) {
-            const uint4 v = wr[2 * g + part];
-            const __half2* h = reinterpret_cast<const __half2*>(&v);
+            float f[8];
+            load8(wr[2 * g + part], col_scale, 2 * g + part, f);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = __half22float2(h[i]);
-                b[part * 8 + 2 * i] = static_cast<unsigned char>(quantize_one(f.x, inv));
-                b[part * 8 + 2 * i + 1] = static_cast<unsigned char>(quantize_one(f.y, inv));
-            }
+            for (int i = 0; i < 8; ++i) b[part * 8 + i] = static_cast<unsigned char>(quantize_one(f[i], inv));
         }
         __align__(16) unsigned char o[16];
 #pragma unroll
@@ -108,6 +115,34 @@ __global__ void quantize_weights_s8_kernel(const uint4* __restrict__ w, std::siz
         }
         qr[g] = *reinterpret_cast<const uint4*>(o);
     }
+}
+
+// max |x[r, c]| over the rows r, one thread per column c (calibration: the order of a maximum does not matter).
+__global__ void column_absmax_kernel(const __half* __restrict__ x, std::size_t ld_x, float* __restrict__ out, std::size_t rows, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    float m = 0.0f;
+    for (std::size_t r = 0; r < rows; ++r) m = fmaxf(m, fabsf(__half2float(x[r * ld_x + c])));
+    out[c] = m;
+}
+
+// Per column c: amax[c] = max(amax[c], max |x[r, c]|), sums[c] += sum |x[r, c]|, sums[cols + c] += sum x[r, c]^2, the sums taken
+// in double over the rows in order r = 0, 1, ... by one thread, so the result is the same on every run.
+__global__ void channel_stats_kernel(const __half* __restrict__ x, std::size_t ld_x, std::size_t rows, int cols, float* __restrict__ amax,
+                                     double* __restrict__ sums) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    float m = 0.0f;
+    double a = 0.0, q = 0.0;
+    for (std::size_t r = 0; r < rows; ++r) {
+        const float v = __half2float(x[r * ld_x + c]);
+        m = fmaxf(m, fabsf(v));
+        a += static_cast<double>(fabsf(v));
+        q += static_cast<double>(v) * static_cast<double>(v);
+    }
+    amax[c] = fmaxf(amax[c], m);
+    sums[c] += a;
+    sums[cols + c] += q;
 }
 
 // ---- the int8-activation multiply -----------------------------------------------------------------------------------
@@ -427,34 +462,53 @@ inline int pick_s8_config(std::size_t t, std::size_t n) {
 } // namespace detail
 
 void launch_quantize_rows_s8(const void* x, std::size_t ld_x, void* q, std::size_t ld_q, float* scales, std::size_t rows, std::size_t cols,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, const float* smooth) {
     if (rows == 0 || cols == 0) return;
     if (x == nullptr || q == nullptr || scales == nullptr) throw std::invalid_argument("quantize_rows_s8: null pointer");
     if (cols % 16 != 0 || ld_x % 16 != 0 || ld_q % 16 != 0 || ld_x < cols || ld_q < cols || reinterpret_cast<std::uintptr_t>(x) % 16 != 0 ||
-        reinterpret_cast<std::uintptr_t>(q) % 16 != 0) {
+        reinterpret_cast<std::uintptr_t>(q) % 16 != 0 || reinterpret_cast<std::uintptr_t>(smooth) % 16 != 0) {
         throw std::invalid_argument("quantize_rows_s8: cols and both row strides must be multiples of 16, strides at least cols, pointers 16-byte aligned");
     }
     if (rows > 0x7FFFFFFF || cols > 0x7FFFFFFF) throw std::invalid_argument("quantize_rows_s8: dimension beyond 32 bits");
     const int cols8 = static_cast<int>(cols / 8);
     const unsigned threads = cols8 >= 256 ? 256u : (static_cast<unsigned>(cols8) + 31u) / 32u * 32u;
     detail::quantize_rows_s8_kernel<<<dim3(static_cast<unsigned>(rows)), dim3(threads), 0, stream>>>(
-        static_cast<const uint4*>(x), ld_x / 8, static_cast<uint2*>(q), ld_q / 8, scales, cols8);
+        static_cast<const uint4*>(x), ld_x / 8, static_cast<uint2*>(q), ld_q / 8, scales, cols8, smooth);
     check(cudaGetLastError(), "quantize_rows_s8 kernel launch");
 }
 
 void launch_quantize_weights_s8(const void* w, std::size_t ld_w, void* wq, float* scales, std::size_t n, std::size_t k, S8WeightLayout layout,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const float* col_scale) {
     if (n == 0 || k == 0) return;
     if (w == nullptr || wq == nullptr || scales == nullptr) throw std::invalid_argument("quantize_weights_s8: null pointer");
-    if (k % 16 != 0 || ld_w % 16 != 0 || ld_w < k || reinterpret_cast<std::uintptr_t>(w) % 16 != 0 || reinterpret_cast<std::uintptr_t>(wq) % 16 != 0) {
+    if (k % 16 != 0 || ld_w % 16 != 0 || ld_w < k || reinterpret_cast<std::uintptr_t>(w) % 16 != 0 || reinterpret_cast<std::uintptr_t>(wq) % 16 != 0 ||
+        reinterpret_cast<std::uintptr_t>(col_scale) % 16 != 0) {
         throw std::invalid_argument("quantize_weights_s8: k and the row stride must be multiples of 16, stride at least k, pointers 16-byte aligned");
     }
     if (n > 0x7FFFFFFF || k > 0x7FFFFFFF) throw std::invalid_argument("quantize_weights_s8: dimension beyond 32 bits");
     const int groups = static_cast<int>(k / 16);
     const unsigned threads = groups >= 256 ? 256u : (static_cast<unsigned>(groups) + 31u) / 32u * 32u;
     detail::quantize_weights_s8_kernel<<<dim3(static_cast<unsigned>(n)), dim3(threads), 0, stream>>>(
-        static_cast<const uint4*>(w), ld_w / 8, static_cast<uint4*>(wq), scales, groups, layout == S8WeightLayout::Fp16Pairs);
+        static_cast<const uint4*>(w), ld_w / 8, static_cast<uint4*>(wq), scales, groups, layout == S8WeightLayout::Fp16Pairs, col_scale);
     check(cudaGetLastError(), "quantize_weights_s8 kernel launch");
+}
+
+void launch_column_absmax(const void* x, std::size_t ld_x, float* out, std::size_t rows, std::size_t cols, cudaStream_t stream) {
+    if (rows == 0 || cols == 0) return;
+    if (x == nullptr || out == nullptr) throw std::invalid_argument("column_absmax: null pointer");
+    if (ld_x < cols || cols > 0x7FFFFFFF) throw std::invalid_argument("column_absmax: stride below the column count");
+    detail::column_absmax_kernel<<<dim3(static_cast<unsigned>((cols + 127) / 128)), dim3(128), 0, stream>>>(static_cast<const __half*>(x), ld_x, out, rows,
+                                                                                                           static_cast<int>(cols));
+    check(cudaGetLastError(), "column_absmax kernel launch");
+}
+
+void launch_channel_stats(const void* x, std::size_t ld_x, std::size_t rows, std::size_t cols, float* amax, double* sums, cudaStream_t stream) {
+    if (rows == 0 || cols == 0) return;
+    if (x == nullptr || amax == nullptr || sums == nullptr) throw std::invalid_argument("channel_stats: null pointer");
+    if (ld_x < cols || cols > 0x7FFFFFFF) throw std::invalid_argument("channel_stats: stride below the column count");
+    detail::channel_stats_kernel<<<dim3(static_cast<unsigned>((cols + 127) / 128)), dim3(128), 0, stream>>>(static_cast<const __half*>(x), ld_x, rows,
+                                                                                                           static_cast<int>(cols), amax, sums);
+    check(cudaGetLastError(), "channel_stats kernel launch");
 }
 
 void launch_gemm_s8(const void* xq, std::size_t ld_x, const float* sx, const void* wq, std::size_t ld_w, const float* sw, void* y, std::size_t ld_y,
