@@ -154,7 +154,7 @@ double mean_distance(const std::vector<EngineRowResult>& a, const std::vector<En
 
 SEPAL_TEST(engine_multiply, defaults_and_refusals) {
     const EngineOptions defaults;
-    CHECK(defaults.multiply_path == MultiplyPath::Cublas);
+    CHECK(defaults.multiply_path == MultiplyPath::Auto);
     CHECK(!defaults.fp16_accumulate.gate_up && !defaults.fp16_accumulate.down && !defaults.fp16_accumulate.mixer_in && !defaults.fp16_accumulate.mixer_out);
     CHECK_EQ(defaults.fp16_accumulate.flush_k, 128u);
     const ModelConfig cfg = kernel_config();
@@ -165,6 +165,97 @@ SEPAL_TEST(engine_multiply, defaults_and_refusals) {
         refused = true;
     }
     CHECK(refused); // a flush interval that is not a multiple of 32
+}
+
+namespace {
+
+EngineOptions default_options(std::size_t gemm_rows) {
+    EngineOptions o = options_with(MultiplyPath::Auto, false, gemm_rows);
+    o.fp16_accumulate = sepal::cuda::Fp16Accumulate{}; // untouched: Auto chooses it
+    return o;
+}
+
+bool all_four(const sepal::cuda::Fp16Accumulate& f) { return f.gate_up && f.down && f.mixer_in && f.mixer_out; }
+bool none_of(const sepal::cuda::Fp16Accumulate& f) { return !f.gate_up && !f.down && !f.mixer_in && !f.mixer_out; }
+
+} // namespace
+
+SEPAL_TEST(engine_multiply, the_default_path_resolves_by_mode) {
+    const ModelConfig cfg = kernel_config();
+    const Weights<float>& weights = weights_of(cfg, 9);
+    {
+        // Natural mode: cuBLAS with binary16 accumulation in all four groups.
+        CudaEngine engine(cfg, weights, default_options(0));
+        CHECK(engine.options().multiply_path == MultiplyPath::Cublas);
+        CHECK(all_four(engine.options().fp16_accumulate));
+    }
+    for (const std::size_t gemm_rows : {std::size_t{16}, std::size_t{48}}) {
+        // Strict mode: the own kernel, binary16 accumulators flushed every 64 values of k, all four groups.
+        CudaEngine engine(cfg, weights, default_options(gemm_rows));
+        CHECK(engine.options().multiply_path == MultiplyPath::Invariant);
+        CHECK(all_four(engine.options().fp16_accumulate));
+        CHECK_EQ(engine.options().fp16_accumulate.flush_k, 64u);
+    }
+    {
+        // The float32 path has nothing to choose.
+        EngineOptions o = default_options(0);
+        o.precision = Precision::F32;
+        CudaEngine engine(cfg, weights, o);
+        CHECK(engine.options().multiply_path == MultiplyPath::Cublas);
+        CHECK(none_of(engine.options().fp16_accumulate));
+    }
+    {
+        // Explicit settings are left as they are.
+        CudaEngine engine(cfg, weights, options_with(MultiplyPath::Cublas, false, 0));
+        CHECK(engine.options().multiply_path == MultiplyPath::Cublas);
+        CHECK(none_of(engine.options().fp16_accumulate));
+    }
+    {
+        // An accumulation setting next to Auto is refused rather than ignored.
+        EngineOptions o = default_options(0);
+        o.fp16_accumulate.gate_up = true;
+        bool refused = false;
+        try {
+            CudaEngine engine(cfg, weights, o);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
+}
+
+SEPAL_TEST(engine_multiply, the_default_keeps_strict_mode_bit_identical_and_natural_mode_close_to_float32) {
+    // Strict mode with the default path: the own kernel where it takes the shapes (kernel_config), padded cuBLAS with binary16
+    // accumulation where it does not (the tiny preset, whose DeltaNet value width is not a multiple of 8).
+    for (const ModelConfig& cfg : {kernel_config(), tiny_test_config()}) {
+        const Weights<float>& weights = weights_of(cfg, 10);
+        for (const std::size_t gemm_rows : {std::size_t{16}, std::size_t{48}}) {
+            CudaEngine engine(cfg, weights, default_options(gemm_rows));
+            const Counts c = family_invariance(engine, 1100 + gemm_rows, 8);
+            std::cout << "  default engine on " << cfg.name << ", strict " << gemm_rows << ": " << c.identical << " of " << c.trials
+                      << " rows bit-identical alone, among other rows, and continued from a stored snapshot\n";
+            CHECK_EQ(c.identical, c.trials);
+        }
+    }
+    // Natural mode with the default: stays close to the float32 engine.
+    const ModelConfig cfg = kernel_config();
+    const Weights<float>& weights = weights_of(cfg, 11);
+    EngineOptions f32;
+    f32.precision = Precision::F32;
+    f32.memory_budget_bytes = std::size_t{192} << 20;
+    f32.max_call_tokens = 4096;
+    f32.state_slots = 128;
+    CudaEngine reference(cfg, weights, f32);
+    CudaEngine engine(cfg, weights, default_options(0));
+    Rng rng(41);
+    double worst = 0, mean_sum = 0;
+    for (std::size_t call = 0; call < 24; ++call) {
+        const std::vector<EngineRow> request = others(rng, 200);
+        mean_sum += mean_distance(run(engine, request), run(reference, request), &worst);
+    }
+    std::cout << "  default engine, natural, against the float32 engine on the tiny geometry: mean |difference| " << std::scientific << std::setprecision(2) << mean_sum / 24.0
+              << ", largest " << worst << std::fixed << "\n";
+    CHECK(mean_sum / 24.0 < 0.06);
 }
 
 SEPAL_TEST(engine_multiply, the_variants_stay_close_to_the_float32_engine) {
@@ -184,6 +275,8 @@ SEPAL_TEST(engine_multiply, the_variants_stay_close_to_the_float32_engine) {
     const std::vector<Variant> variants = {
         {"cuBLAS, float32 accumulation", options_with(MultiplyPath::Cublas, false, 0), 0.03},
         {"cuBLAS, binary16 accumulation everywhere", options_with(MultiplyPath::Cublas, true, 0), 0.06},
+        {"cuBLAS, binary16 accumulation, one group at a time (mixer_in)", [] { EngineOptions o = options_with(MultiplyPath::Cublas, false, 0); o.fp16_accumulate.mixer_in = true; return o; }(), 0.06},
+        {"cuBLAS, binary16 accumulation, one group at a time (mixer_out + down)", [] { EngineOptions o = options_with(MultiplyPath::Cublas, false, 0); o.fp16_accumulate.mixer_out = o.fp16_accumulate.down = true; return o; }(), 0.06},
         {"own kernel, float32 accumulation", options_with(MultiplyPath::Invariant, false, 0), 0.03},
         {"own kernel, binary16 accumulation, flush 64", options_with(MultiplyPath::Invariant, true, 0, 64), 0.04},
         {"own kernel, binary16 accumulation, flush 256", options_with(MultiplyPath::Invariant, true, 0, 256), 0.05},
@@ -227,10 +320,12 @@ SEPAL_TEST(engine_multiply, the_own_kernel_makes_every_batch_composition_give_th
 SEPAL_TEST(engine_multiply, strict_cublas_with_binary16_accumulation_is_still_bit_identical) {
     // cuBLAS picks its kernel from the shape and the binary16 kernels round differently from the float32 ones, so the
     // last layer must run the same multiplies whether or not it is pruned to the read-out tokens.
+    // (And with float32 accumulation, explicitly: it was the default of strict mode, and padding is what keeps it invariant.)
     const ModelConfig cfg = tiny_test_config();
     const Weights<float>& weights = weights_of(cfg, 7);
+    for (const bool binary16 : {true, false})
     for (const std::size_t gemm_rows : {std::size_t{16}, std::size_t{48}}) {
-        EngineOptions with = options_with(MultiplyPath::Cublas, true, gemm_rows);
+        EngineOptions with = options_with(MultiplyPath::Cublas, binary16, gemm_rows);
         EngineOptions without = with;
         without.prune_last_layer = false;
         CudaEngine pruned(cfg, weights, with);
@@ -247,7 +342,7 @@ SEPAL_TEST(engine_multiply, strict_cublas_with_binary16_accumulation_is_still_bi
                 if (same_bits(a[r].hidden, b[r].hidden)) ++identical;
             }
         }
-        std::cout << "  strict cuBLAS, binary16 accumulation, gemm_rows " << gemm_rows << ": " << c.identical << " of " << c.trials
+        std::cout << "  strict cuBLAS, " << (binary16 ? "binary16" : "float32") << " accumulation, gemm_rows " << gemm_rows << ": " << c.identical << " of " << c.trials
                   << " rows bit-identical alone / among others / from a snapshot; " << identical << " of " << compared << " rows identical between pruned and full last layer\n";
         CHECK_EQ(c.identical, c.trials);
         CHECK_EQ(identical, compared);

@@ -9,6 +9,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 
 #include "attack_util.hpp"
 #include "snapshot_file.hpp"
@@ -494,6 +495,42 @@ SEPAL_TEST(snap_tiers, int8_multiply_engines_round_trip_and_do_not_mix_with_the_
     CudaEngine defaults(cfg, weights, o);
     CHECK_EQ(defaults.memory().slots_total, std::size_t{64});
     CHECK(defaults.memory().weights_bytes < make(false, false)->memory().weights_bytes);
+    fs::remove(file);
+}
+
+// MultiplyPath::Auto resolves to a configuration that changes the numbers: a snapshot file made by the default engine is of the kind
+// of the explicit engine with the same multiplies, and of no other (the compute fingerprint is made from what the engine resolved to).
+SEPAL_TEST(snap_tiers, the_default_multiply_options_are_part_of_the_snapshot_kind) {
+    using sepal::cuda::MultiplyPath;
+    const auto make = [&](std::size_t gemm_rows, const std::function<void(EngineOptions&)>& tweak) {
+        Knobs k;
+        k.precision = Precision::F16;
+        k.gemm_rows = gemm_rows;
+        k.slots = 32;
+        k.budget_mib = 96;
+        k.max_tokens = 1024;
+        EngineOptions o = options_of(k);
+        tweak(o);
+        return std::make_unique<CudaEngine>(tiny_test_config(), tiny_weights(31), o);
+    };
+    const fs::path file = scratch_dir() / "default-kind.snap";
+    const auto automatic = make(0, [](EngineOptions&) {});
+    CHECK(automatic->options().multiply_path == MultiplyPath::Cublas);
+    const DeviceSnapshot s = make_chain(*automatic, 2, 33);
+    automatic->save(s, file);
+    // The same multiplies, spelled out: accepted.
+    CHECK(make(0, [](EngineOptions& o) {
+              o.multiply_path = MultiplyPath::Cublas;
+              o.fp16_accumulate = {true, true, true, true, 128};
+          })->load(file).valid());
+    // The multiplies of the engine before Auto (cuBLAS, float32 accumulators), the own kernel, and another subset: refused.
+    CHECK_THROWS(make(0, [](EngineOptions& o) { o.multiply_path = MultiplyPath::Cublas; })->load(file), SnapshotFileError);
+    CHECK_THROWS(make(0, [](EngineOptions& o) {
+                     o.multiply_path = MultiplyPath::Cublas;
+                     o.fp16_accumulate.gate_up = o.fp16_accumulate.down = true;
+                 })->load(file),
+                 SnapshotFileError);
+    CHECK_THROWS(make(0, [](EngineOptions& o) { o.multiply_path = MultiplyPath::Invariant; })->load(file), SnapshotFileError);
     fs::remove(file);
 }
 

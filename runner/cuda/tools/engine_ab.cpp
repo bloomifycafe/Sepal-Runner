@@ -4,8 +4,8 @@
 //   sepal-cuda-engine-ab --model <dir> --workload <json> [--rounds 2] [--reps 5] [--gemm-rows N] [--sizes 64,600,2048]
 //                        [--options cublas,cublas16,cublas16-mlp,own32,own16-64,own16-128,...] [--smooth-stats <file>]
 //
-// An option set is one name or several joined by '/', applied in order: cublas | cublas16 | cublas16-mlp | own32 | own16-<flush> |
-// own16-mlp-<flush> | w8a8-<groups> | w8a16-<groups> (groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp, noout, all) |
+// An option set is one name or several joined by '/', applied in order: auto | cublas | cublas16 | cublas16-mlp | cublas16-<groups> | own32 |
+// own16-<flush> | own16-mlp-<flush> | w8a8-<groups> | w8a16-<groups> (groups joined by '+': gate_up, down, mixer_in, mixer_out, mlp, noout, all) |
 // smooth=<max|mean|rms>:<alpha> (W8A8 smoothing from the --smooth-stats file). A group on int8 overrides the binary16 accumulation
 // chosen for it: "w8a8-gate_up+mixer_in+mixer_out/own16-64" is int8 for three groups and the own binary16-accumulate kernel for down.
 //
@@ -76,8 +76,12 @@ std::vector<std::string> split(const std::string& s, char sep) {
 std::shared_ptr<const cuda::ActivationStats> g_stats;
 
 void apply_part(EngineOptions& o, const std::string& name) {
+    // name: auto (the engine's default) | cublas (float32 accumulators) | cublas16 (all four binary16) | cublas16-mlp |
+    //       cublas16-<groups> (gate_up, down, mixer_in, mixer_out joined by '+') | own32 | own16-<flush> (all four) | own16-mlp-<flush>
     const auto flags = [&](bool gate_up, bool down, bool mixer_in, bool mixer_out) { o.fp16_accumulate = {gate_up, down, mixer_in, mixer_out, o.fp16_accumulate.flush_k}; };
-    if (name == "cublas") {
+    if (name == "auto") {
+    } else if (name == "cublas") {
+        o.multiply_path = MultiplyPath::Cublas;
     } else if (name.rfind("smooth=", 0) == 0) {
         const std::string spec = name.substr(7);
         const std::size_t colon = spec.find(':');
@@ -90,9 +94,16 @@ void apply_part(EngineOptions& o, const std::string& name) {
         o.int8_multiply.smoothing.statistic = stat == "max" ? cuda::Int8Smoothing::Statistic::Max : stat == "mean" ? cuda::Int8Smoothing::Statistic::MeanAbs : cuda::Int8Smoothing::Statistic::Rms;
         o.int8_multiply.smoothing.alpha = std::stof(spec.substr(colon + 1));
     } else if (name == "cublas16") {
+        o.multiply_path = MultiplyPath::Cublas;
         flags(true, true, true, true);
     } else if (name == "cublas16-mlp") {
+        o.multiply_path = MultiplyPath::Cublas;
         flags(true, true, false, false);
+    } else if (name.rfind("cublas16-", 0) == 0) {
+        o.multiply_path = MultiplyPath::Cublas;
+        const std::string g = name.substr(9);
+        const auto has = [&](const char* group) { return g.find(group) != std::string::npos; };
+        flags(has("gate_up"), has("down"), has("mixer_in"), has("mixer_out"));
     } else if (name == "own32") {
         o.multiply_path = MultiplyPath::Invariant;
     } else if (name.rfind("own16-mlp-", 0) == 0) {

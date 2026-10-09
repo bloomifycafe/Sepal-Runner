@@ -156,6 +156,15 @@ enum class MultiplyPath {
     /// the kernel does not take (an inner dimension that is not a multiple of 8, say) goes to cuBLAS, and strict mode then
     /// pads as before.
     Invariant,
+    /// The default: the engine picks from the mode, once, when it is created (the choice depends on the options and on nothing
+    /// else, never on a call), and `CudaEngine::options()` then says what it picked. Natural mode (gemm_rows 0): cuBLAS with
+    /// binary16 accumulation in all four groups. Strict mode (gemm_rows > 0): the own kernel with binary16 accumulation in all
+    /// four groups and a flush every 64 values of k, which is batch-invariant and pads nothing. With `int8_multiply` groups set,
+    /// the other groups stay on cuBLAS with float32 accumulators (the profiles measured in the README). `fp16_accumulate` must be
+    /// left at its default: the setting is the engine's, and a different one needs an explicit path. The float32 path ignores it.
+    /// (Last in the enum, so that the values stored in snapshot files' compute fingerprints, which never hold Auto, keep meaning
+    /// what they meant.)
+    Auto,
 };
 
 struct EngineOptions {
@@ -169,9 +178,11 @@ struct EngineOptions {
     /// Float16 path only: the multiply of the MLP's gate and up projections writes binary16 instead of float32, as
     /// PyTorch's float16 run has it. Halves the memory traffic of that multiply and of the SwiGLU product that reads it.
     bool fp16_gate_up = true;
-    /// Float16 path only: who multiplies, see MultiplyPath. Default: cuBLAS.
-    MultiplyPath multiply_path = MultiplyPath::Cublas;
-    /// Float16 path only: multiplies that accumulate in binary16. Default: none.
+    /// Float16 path only: who multiplies, see MultiplyPath. Default: Auto, which resolves to a fast configuration that passes the
+    /// accuracy gate (README.md, "Multiply throughput").
+    MultiplyPath multiply_path = MultiplyPath::Auto;
+    /// Float16 path only: multiplies that accumulate in binary16. Leave it at its default with `Auto`; with an explicit
+    /// `multiply_path` the default means none.
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;

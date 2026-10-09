@@ -477,10 +477,19 @@ SEPAL_TEST(real_2b, second_geometry_against_the_cpu_reference_and_float16_agains
     const auto want = ref::run_rows<float>(*gemm, cfg, weights32, std::span<const ref::Row<float>>(reference));
     std::cout << "  " << cfg.name << ": CPU reference on " << 28 + 12 + 5 + 6 << " tokens in " << std::fixed << std::setprecision(1) << seconds_since(start) << " s\n";
 
+    // float32; float16 with cuBLAS float32 accumulators (the default before MultiplyPath::Auto); float16 with the default (binary16 accumulators)
     std::vector<std::vector<EngineRowResult>> got;
-    for (const Precision precision : {Precision::F32, Precision::F16}) {
-        CudaEngine engine(model, real_options(precision, 0, precision == Precision::F32 ? 9000 : 6000));
+    for (const auto& [precision, fast] : {std::pair{Precision::F32, false}, std::pair{Precision::F16, false}, std::pair{Precision::F16, true}}) {
+        EngineOptions options = real_options(precision, 0, precision == Precision::F32 ? 9000 : 6000);
+        if (precision == Precision::F16 && !fast) options.multiply_path = sepal::cuda::MultiplyPath::Cublas;
+        CudaEngine engine(model, options);
         got.push_back(run(engine, rows));
+    }
+    {
+        double d_fast = 0.0;
+        for (std::size_t r = 0; r < rows.size(); ++r) d_fast = std::max(d_fast, max_abs_diff(got[2][r].hidden.data(), got[0][r].hidden.data(), got[2][r].hidden.size()));
+        std::cout << "  " << cfg.name << ": float16 default (binary16 accumulators) vs float32 engine: largest " << std::scientific << std::setprecision(3) << d_fast << std::fixed << "\n";
+        CHECK(d_fast < 0.5);
     }
     double d32 = 0.0, d16_ref = 0.0, d16_32 = 0.0, sum16 = 0.0;
     std::size_t count = 0;
@@ -525,7 +534,7 @@ EngineOptions variant_options(const MultiplyVariant& v, std::size_t gemm_rows, s
 
 const std::vector<MultiplyVariant>& multiply_variants() {
     static const std::vector<MultiplyVariant> variants = {
-        {"cuBLAS, float32 accumulation (the default)", MultiplyPath::Cublas, false, 0, 2e-3},
+        {"cuBLAS, float32 accumulation (the default before MultiplyPath::Auto)", MultiplyPath::Cublas, false, 0, 2e-3},
         {"cuBLAS, binary16 accumulation", MultiplyPath::Cublas, true, 0, 1e-2},
         {"own kernel, float32 accumulation", MultiplyPath::Invariant, false, 0, 2e-3},
         {"own kernel, binary16 accumulation, flush every 64", MultiplyPath::Invariant, true, 64, 2e-3},

@@ -239,6 +239,17 @@ void launch_config(bool acc16, bool y_half, const __half* x, int ldx, const __ha
 // Tile shape by problem size: the largest tile that still gives every SM two or more blocks, never taller than the batch needs.
 // Only the speed depends on this choice, not the bits (see the note on the arithmetic above).
 inline int pick_config(std::size_t t, std::size_t n) {
+    // Up to 128 rows the count of blocks is not the whole story (a block that streams K = 1,024 to 6,144 of a narrow output is long and
+    // there are few of them): the shape per size below is the one that was fastest on the engine's multiplies of both geometries
+    // (sepal-cuda-gemm-probe shapes --config, shorter of two passes; narrow = N below 4,096), 15 to 45% of the multiplies' time
+    // against the rule that follows. Above it the rule holds.
+    if (t <= 128) {
+        const bool wide = n >= 4096;
+        if (t <= 32) return 5;
+        if (t <= 64) return wide ? 4 : 5;
+        if (t <= 96) return wide ? 2 : 4;
+        return wide ? 0 : 3;
+    }
     struct Candidate {
         int config, bm, bn;
     };

@@ -102,6 +102,9 @@ EngineOptions options(bool half_state, std::size_t budget_mib = 6200, std::size_
     EngineOptions o;
     o.precision = Precision::F16;
     o.gemm_rows = 0;
+    // cuBLAS with float32 accumulators (the default before MultiplyPath::Auto): these tests measure what the state format costs, and the noise of
+    // binary16 accumulation (which a rounded state turns into different noise, not into a small difference) would hide it.
+    o.multiply_path = sepal::cuda::MultiplyPath::Cublas;
     o.max_call_tokens = max_tokens;
     o.max_call_rows = 256;
     o.state_slots = slots;

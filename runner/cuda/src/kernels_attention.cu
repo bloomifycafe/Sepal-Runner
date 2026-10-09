@@ -53,6 +53,7 @@ __device__ inline std::uint32_t run_row(const AttentionRows& rows, std::uint32_t
 
 // Tokens before the row's own segment.
 __device__ inline std::uint32_t context_tokens(const KvSegment* segments, const AttentionRowDesc& desc) {
+    if (desc.indexed != 0) return segments[desc.first_segment + desc.segment_count - 1].before;
     std::uint32_t n = 0;
     for (std::uint32_t k = 0; k + 1 < desc.segment_count; ++k) n += segments[desc.first_segment + k].tokens;
     return n;
@@ -61,6 +62,18 @@ __device__ inline std::uint32_t context_tokens(const KvSegment* segments, const 
 // The segment that holds key j of the chain, and j's index inside it. j must be below the chain's token count.
 __device__ inline const KvSegment* locate_key(const KvSegment* segments, const AttentionRowDesc& desc, std::uint32_t j,
                                               std::uint32_t& local) {
+    if (desc.indexed != 0) {
+        // The first context segment that ends after key j (segment ends never decrease); none: the row's own segment.
+        std::uint32_t lo = 0, hi = desc.segment_count - 1;
+        const KvSegment* first = segments + desc.first_segment;
+        while (lo < hi) {
+            const std::uint32_t mid = (lo + hi) / 2;
+            if (first[mid].before + first[mid].tokens > j) hi = mid;
+            else lo = mid + 1;
+        }
+        local = j - first[lo].before;
+        return first + lo;
+    }
     std::uint32_t base = 0;
     const KvSegment* seg = segments + desc.first_segment;
     for (std::uint32_t k = 0; k + 1 < desc.segment_count; ++k, ++seg) {
@@ -741,6 +754,10 @@ void check_attention_rows(std::span<const RowSpan> spans, std::span<const Attent
             const KvSegment& s = segments[d.first_segment + k];
             if (s.tokens != 0 && (s.keys == nullptr || s.values == nullptr)) {
                 throw std::invalid_argument(row + "a segment with tokens has a null keys or values pointer");
+            }
+            if (d.indexed != 0 && s.before != total) {
+                throw std::invalid_argument(row + "an indexed row's segment " + std::to_string(k) + " says " + std::to_string(s.before) +
+                                            " tokens before it but " + std::to_string(total) + " precede it");
             }
             total += s.tokens;
         }

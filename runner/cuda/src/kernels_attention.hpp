@@ -80,14 +80,17 @@ struct KvSegment {
     void* keys;
     void* values;
     std::uint32_t tokens;
-    std::uint32_t reserved; // keeps the entry at 24 bytes
+    std::uint32_t before; ///< tokens in the row's earlier segments (the sum of `tokens` over the segments before this one); read only when the row is `indexed`
 };
 
 struct AttentionRowDesc {
     std::uint32_t first_segment;  ///< index of the row's oldest segment in the segment array
     std::uint32_t segment_count;  ///< context segments plus the row's own, which comes last; at least 1
     std::uint32_t start_position; ///< position of the row's first token
-    std::uint32_t reserved;
+    /// 1: every segment of the row carries `before`, and a kernel finds the segment of a key by binary search. 0: `before` is
+    /// not set, and the kernel scans the segments from the first, which costs O(segments) per key (O(S^2) for a query over a
+    /// chain of S one-token links: 60 ms at 1,000 links). Both give the same bits; `check_attention_rows` verifies `before`.
+    std::uint32_t indexed;
 };
 
 /// The device tables of one launch. `run_rows` (device, may be null) lists the rows to run, in any order; null

@@ -364,6 +364,8 @@ struct CudaEngine::Impl {
     Impl(const ModelConfig& cfg, const TensorSource& source, const EngineOptions& opts);
 
     // ---- creation helpers ----
+    // MultiplyPath::Auto -> the explicit path and binary16 accumulation it stands for (see the enum); `options` then says what runs.
+    void resolve_multiply_path();
     void upload(const HostTensor& t, DType target, char* dst, std::size_t dst_offset_elems, DeviceBuffer<char>& staging);
     void place_weights(const TensorSource& source, char* base, DeviceBuffer<char>& staging, std::size_t& used);
     std::size_t call_buffer_bytes_needed(bool place);
@@ -380,6 +382,12 @@ struct CudaEngine::Impl {
               std::size_t ld_out, std::size_t rows, bool out_half = false, bool acc16 = false, const Q8Matrix* qm = nullptr,
               std::size_t q_row0 = 0);
     static const Q8Matrix* qp(const Q8Matrix& m) { return m.w != nullptr ? &m : nullptr; }
+    // Whether gemm(..., acc16, qm) runs on cuBLAS with binary16 accumulators, whose binary16 result can be left as it is
+    // (out_half) for a consumer that widens it, instead of being widened into float32 by a pass of its own. (The own kernel
+    // and the int8 kernels write float32 directly.)
+    bool cublas16_route(std::size_t n, std::size_t k, std::size_t ld_in, std::size_t ld_out, bool acc16, const Q8Matrix* qm) const {
+        return half && acc16 && qm == nullptr && !(options.multiply_path == MultiplyPath::Invariant && own_kernel_takes(n, k, ld_in, ld_out));
+    }
     std::size_t kv_layer_bytes(std::size_t tokens) const { return align_up(tokens * kv_layer_unit); }
     std::size_t kv_block_bytes(std::size_t tokens) const { return attn_layers * 2 * kv_layer_bytes(tokens); }
 };
@@ -404,6 +412,25 @@ struct CudaEngine::Impl::Phase {
     Phase(const Phase&) = delete;
     Phase& operator=(const Phase&) = delete;
 };
+
+void CudaEngine::Impl::resolve_multiply_path() {
+    if (options.multiply_path != MultiplyPath::Auto) return;
+    const Fp16Accumulate none;
+    const Fp16Accumulate& fa = options.fp16_accumulate;
+    if (fa.gate_up != none.gate_up || fa.down != none.down || fa.mixer_in != none.mixer_in || fa.mixer_out != none.mixer_out || fa.flush_k != none.flush_k) {
+        throw std::invalid_argument("EngineOptions: fp16_accumulate needs an explicit multiply_path (the default, Auto, chooses the accumulation itself)");
+    }
+    if (!half || options.int8_multiply.any()) {
+        // The float32 path has no choice to make; the groups that stay binary16 next to int8 ones are the measured profiles'.
+        options.multiply_path = MultiplyPath::Cublas;
+    } else if (options.gemm_rows == 0) {
+        options.multiply_path = MultiplyPath::Cublas;
+        options.fp16_accumulate = Fp16Accumulate{true, true, true, true, none.flush_k};
+    } else {
+        options.multiply_path = MultiplyPath::Invariant;
+        options.fp16_accumulate = Fp16Accumulate{true, true, true, true, 64};
+    }
+}
 
 // Copies a host tensor to the device in the target element type, converting on the device when they differ.
 // `dst` is the start of the destination region; the tensor lands at element `dst_offset_elems` of it.
@@ -587,6 +614,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     cap_rows = options.gemm_rows == 0 ? options.max_call_tokens : align_up(options.max_call_tokens, options.gemm_rows);
     // Room for the rows the last layer computes in full (see prune_last_layer); a call with more readouts runs unpruned.
     {
+        resolve_multiply_path();
         const Fp16Accumulate& fa = options.fp16_accumulate;
         if (fa.flush_k % 32 != 0) throw std::invalid_argument("EngineOptions: fp16_accumulate.flush_k must be a multiple of 32");
         // int8 multiplies (Int8Multiply): the float16 path only, and the kernels' shape requirements for every group chosen.
@@ -863,7 +891,8 @@ void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, st
         return;
     }
     const bool half_acc = half && acc16;
-    const std::size_t step = options.gemm_rows == 0 ? (half_acc ? acc_rows : rows) : options.gemm_rows;
+    // Natural mode, binary16 accumulators and a float32 result: chunks that fit the scratch the result is widened from.
+    const std::size_t step = options.gemm_rows == 0 ? (half_acc && !out_half ? acc_rows : rows) : options.gemm_rows;
     const float alpha = 1.0f, beta = 0.0f;
     const __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
     for (std::size_t at = 0; at < rows; at += step) {
@@ -1106,12 +1135,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             chain.clear();
             for (const KvBlock* b = plan[r].kv.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
             std::reverse(chain.begin(), chain.end());
-            descs[r] = AttentionRowDesc{u32(segment_total), u32(chain.size()), u32(plan[r].start_position), 0};
+            // indexed: each segment says how many tokens precede it, so the kernels find a key's segment by binary search.
+            descs[r] = AttentionRowDesc{u32(segment_total), u32(chain.size()), u32(plan[r].start_position), 1};
             for (std::size_t a = 0; a < attn_layers; ++a) {
+                std::uint32_t before = 0;
                 for (const KvBlock* b : chain) {
                     const std::size_t per_layer = kv_layer_bytes(b->tokens);
                     char* keys = heap + b->offset + a * 2 * per_layer;
-                    segments[a].push_back(KvSegment{keys, keys + per_layer, b->tokens, 0});
+                    segments[a].push_back(KvSegment{keys, keys + per_layer, b->tokens, before});
+                    before += b->tokens;
                 }
             }
             segment_total += chain.size();
@@ -1166,15 +1198,17 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                 for (const KvBlock* b = plan[r].kv->parent.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
                 std::reverse(chain.begin(), chain.end());
                 const std::size_t first = segs_u.size();
+                std::uint32_t before = 0;
                 const auto segment_of = [&](const KvBlock* b, std::size_t skip, std::uint32_t tokens) {
                     const std::size_t per_layer = kv_layer_bytes(b->tokens);
                     char* keys = heap + b->offset + last * 2 * per_layer + skip * kv_layer_unit;
-                    segs_u.push_back(KvSegment{keys, keys + per_layer, tokens, 0});
+                    segs_u.push_back(KvSegment{keys, keys + per_layer, tokens, before});
+                    before += tokens;
                 };
                 for (const KvBlock* b : chain) segment_of(b, 0, b->tokens);
                 if (o > 0) segment_of(plan[r].kv.get(), 0, u32(o));
                 segment_of(plan[r].kv.get(), o, 1);
-                descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 0});
+                descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 1});
             }
             check_attention_rows(spans_u, descs_u, segs_u);
             for (const std::uint32_t pos : readout_rows) {
@@ -1257,6 +1291,22 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     }
     const DeltaNetInputs dn_inputs{{p, p_width}, {p + conv_dim, p_width}, {p + conv_dim + value_dim, p_width},
                                    {p + conv_dim + value_dim + dim(config.dn_value_heads), p_width}};
+    // The same, for a DeltaNet input projection that cuBLAS left in binary16 (cublas16_route): p then holds binary16.
+    const __half* const ph = reinterpret_cast<const __half*>(p);
+    const DeltaNetInputsHalf dn_inputs_half{{ph, p_width}, {ph + conv_dim, p_width}, {ph + conv_dim + value_dim, p_width},
+                                            {ph + conv_dim + value_dim + dim(config.dn_value_heads), p_width}};
+    // The residual addition of the multiply result in `m`, which the output projection or the down projection left in
+    // binary16 (`m_half`) or in float32: a multiply that cuBLAS runs with binary16 accumulators hands its binary16 result on,
+    // and the addition widens it (exactly) as it reads it.
+    bool m_half = false;
+    const auto add_norm = [&](float* residual, std::size_t count, const float* norm_weight, void* norm_out) {
+        if (m_half) launch_add_rms_norm_half_m(residual, H, m, H, residual, H, norm_weight, count, H, eps, norm_out, elem, H, stream);
+        else launch_add_rms_norm(residual, H, m, H, residual, H, norm_weight, count, H, eps, norm_out, elem, H, stream);
+    };
+    const auto add_only = [&](float* residual, std::size_t count) {
+        if (m_half) launch_add_half_m(residual, H, m, H, residual, H, count, H, stream);
+        else launch_add(residual, H, m, H, residual, H, count, H, stream);
+    };
 
     for (std::size_t l = 0; l < layers; ++l) {
         const LayerWeights& w = weights.layers[l];
@@ -1304,12 +1354,13 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, ru);
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, false, fa.mixer_out, qp(w.q_mixer_out));
+                m_half = cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, m_half, fa.mixer_out, qp(w.q_mixer_out));
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
                 launch_gather_rows(x, H * 4, d_upos, ru, H * 4, xc, H * 4, stream);
-                launch_add_rms_norm(xc, H, m, H, xc, H, w.post_norm, ru, H, eps, a1c, elem, H, stream);
+                add_norm(xc, ru, w.post_norm, a1c);
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
@@ -1323,15 +1374,17 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 1, a3, I, ru);
-                gemm(a3, I, w.down, H, I, m, H, padded_u, false, fa.down, qp(w.q_down));
+                m_half = cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
+                gemm(a3, I, w.down, H, I, m, H, padded_u, m_half, fa.down, qp(w.q_down));
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
-                launch_add(xc, H, m, H, xc, H, ru, H, stream);
+                add_only(xc, ru);
             }
             break;
         }
         if (!w.attention) {
+            bool dn_in_half = false; // the input projection stays in binary16 for the scan (see cublas16_route)
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 2, a1, H, n);
@@ -1341,14 +1394,18 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                     launch_gemm_nt(a1, H, w.dn_ba, H, p + conv_dim + value_dim, p_width, false, padded, 2 * dim(config.dn_value_heads), H, GemmAccumulate::Float32, 0, -1,
                                    stream);
                 } else {
-                    gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, padded, false, fa.mixer_in);
+                    dn_in_half = cublas16_route(dn_in_width, H, H, p_width, fa.mixer_in, nullptr);
+                    gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, padded, dn_in_half, fa.mixer_in);
                 }
             }
             {
                 Phase phase(*this, &PhaseTimes::deltanet_ms);
                 for (std::size_t wv = 0; wv < waves; ++wv) {
                     const DeltaNetRows dn_rows{d_spans, d_in, d_out, d_waves + wave_start[wv], u32(wave_start[wv + 1] - wave_start[wv])};
-                    if (half) {
+                    if (dn_in_half) {
+                        launch_deltanet_wave<__half>(dn_geometry, w.deltanet, dn_inputs_half, dn_rows, dn_states[w.kind_index],
+                                                     reinterpret_cast<__half*>(a2), mix_width, stream);
+                    } else if (half) {
                         launch_deltanet_wave<__half>(dn_geometry, w.deltanet, dn_inputs, dn_rows, dn_states[w.kind_index],
                                                      reinterpret_cast<__half*>(a2), mix_width, stream);
                     } else {
@@ -1360,7 +1417,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, n);
-                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, false, fa.mixer_out, qp(w.q_mixer_out));
+                m_half = cublas16_route(H, value_dim, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
             }
         } else {
             {
@@ -1394,12 +1452,13 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, n);
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, false, fa.mixer_out, qp(w.q_mixer_out));
+                m_half = cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
             }
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
-            launch_add_rms_norm(x, H, m, H, x, H, w.post_norm, n, H, eps, a1, elem, H, stream);
+            add_norm(x, n, w.post_norm, a1);
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
@@ -1413,14 +1472,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
             observe(l, 1, a3, I, n);
-            gemm(a3, I, w.down, H, I, m, H, padded, false, fa.down, qp(w.q_down));
+            m_half = cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
+            gemm(a3, I, w.down, H, I, m, H, padded, m_half, fa.down, qp(w.q_down));
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
             if (l + 1 < layers) {
-                launch_add_rms_norm(x, H, m, H, x, H, weights.layers[l + 1].input_norm, n, H, eps, a1, elem, H, stream);
+                add_norm(x, n, weights.layers[l + 1].input_norm, a1);
             } else {
-                launch_add(x, H, m, H, x, H, n, H, stream);
+                add_only(x, n);
             }
         }
         for (std::size_t r = 0; r < rows.size(); ++r) {

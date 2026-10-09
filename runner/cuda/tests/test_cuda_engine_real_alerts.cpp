@@ -575,15 +575,20 @@ SEPAL_TEST(real_long, rows_of_8k_and_16k_tokens_whole_and_in_pieces) {
     for (const Alert& a : alerts) pool.insert(pool.end(), a.state.begin(), a.state.end());
     CHECK(pool.size() >= 16384);
     const std::size_t H = real().hidden;
+    // float16 cases: `fast` false is cuBLAS with float32 accumulators (the engine's default before MultiplyPath::Auto), true is the default engine
+    // (binary16 accumulators), whose long rows are measurably noisier: a bound of its own.
     struct Case {
         Precision precision;
         std::size_t total;
         std::vector<std::size_t> pieces;
+        bool fast = false;
     };
     std::vector<std::vector<float>> one_shot_f16_8k;
     std::map<std::string, std::vector<float>> by_name;
-    for (const Case& c : {Case{Precision::F32, 8192, {4096, 1024}}, Case{Precision::F16, 8192, {4096, 1024}}, Case{Precision::F16, 16384, {4096, 2048}}}) {
+    for (const Case& c : {Case{Precision::F32, 8192, {4096, 1024}}, Case{Precision::F16, 8192, {4096, 1024}}, Case{Precision::F16, 16384, {4096, 2048}},
+                          Case{Precision::F16, 8192, {4096, 1024}, true}, Case{Precision::F16, 16384, {4096, 2048}, true}}) {
         EngineOptions o = options(c.precision, 0);
+        if (c.precision == Precision::F16 && !c.fast) o.multiply_path = sepal::cuda::MultiplyPath::Cublas;
         o.max_call_tokens = 16384;
         o.max_call_rows = 8;
         o.state_slots = 6;
@@ -599,7 +604,7 @@ SEPAL_TEST(real_long, rows_of_8k_and_16k_tokens_whole_and_in_pieces) {
         const auto t0 = Clock::now();
         const auto one = run(engine, {whole});
         const double whole_s = since(t0);
-        const std::string tag = std::string(c.precision == Precision::F32 ? "float32 " : "float16 ") + std::to_string(c.total);
+        const std::string tag = std::string(c.precision == Precision::F32 ? "float32 " : c.fast ? "float16 default " : "float16 ") + std::to_string(c.total);
         by_name[tag] = one[0].hidden;
         std::cout << "  " << tag << " tokens in one row: " << std::fixed << std::setprecision(2) << whole_s << " s\n";
         for (const std::size_t piece : c.pieces) {
@@ -633,13 +638,16 @@ SEPAL_TEST(real_long, rows_of_8k_and_16k_tokens_whole_and_in_pieces) {
             }
             std::cout << "    in pieces of " << piece << ": largest hidden difference from the one-row run " << std::scientific << std::setprecision(2) << worst << ", largest |dp| " << worst_p << ", flips " << flips
                       << std::fixed << "\n";
-            CHECK(worst < (c.precision == Precision::F32 ? 1e-3 : 0.1));
+            CHECK(worst < (c.precision == Precision::F32 ? 1e-3 : c.fast ? 0.5 : 0.1));
+            CHECK(worst_p < (c.fast ? 3e-2 : 1e-2));
         }
     }
     // float16 against float32 on the same 8192 tokens, offset by offset: absolute and relative to the float32 state's size
-    const auto& a16 = by_name.at("float16 8192");
     const auto& b32 = by_name.at("float32 8192");
     const std::vector<std::size_t> offsets_8k = {0, 8191, 4096, 4095, 1023, 1024};
+    for (const char* which : {"float16 8192", "float16 default 8192"}) {
+    const auto& a16 = by_name.at(which);
+    std::cout << "  " << which << " against float32:\n";
     double worst_rel = 0;
     for (std::size_t i = 0; i < b32.size() / H; ++i) {
         double linf = 0, big = 0, num = 0, den = 0;
@@ -655,6 +663,7 @@ SEPAL_TEST(real_long, rows_of_8k_and_16k_tokens_whole_and_in_pieces) {
         std::cout << "    read-out " << i << " (offset " << (i < offsets_8k.size() ? std::to_string(offsets_8k[i]) : std::string("random")) << "): float16 vs float32 largest difference " << std::scientific << std::setprecision(2) << linf
                   << " of values up to " << big << ", relative L2 " << rel << std::fixed << "\n";
     }
-    std::cout << "  float16 vs float32, 8192 tokens: worst relative L2 distance " << std::scientific << std::setprecision(2) << worst_rel << std::fixed << "\n";
+    std::cout << "  " << which << " vs float32, 8192 tokens: worst relative L2 distance " << std::scientific << std::setprecision(2) << worst_rel << std::fixed << "\n";
     CHECK(worst_rel < 0.05);
+    }
 }

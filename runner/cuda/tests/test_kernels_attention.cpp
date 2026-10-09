@@ -263,6 +263,7 @@ struct PassOptions {
     bool gate_open = false;         // overwrite every gate with 30, for which sigmoid is exactly 1 in float32
     AttnElem out_type_override = AttnElem::F32;
     bool use_out_override = false;
+    bool indexed = false; // the segments carry `before` and the kernels find a key by binary search
 };
 
 std::vector<unsigned char> to_bytes(const std::vector<float>& values, AttnElem type) {
@@ -339,7 +340,8 @@ PassResult run_device(const Geometry& g, const Pool& pool, const NormWeights& we
         std::vector<const Node*> chain;
         for (const Node* n = rows[r].node.get(); n != nullptr; n = n->parent.get()) chain.push_back(n);
         std::reverse(chain.begin(), chain.end());
-        descs[r] = {static_cast<std::uint32_t>(segments.size()), static_cast<std::uint32_t>(chain.size()), rows[r].start, 0};
+        descs[r] = {static_cast<std::uint32_t>(segments.size()), static_cast<std::uint32_t>(chain.size()), rows[r].start, options.indexed ? 1u : 0u};
+        std::uint32_t before = 0;
         for (const Node* n : chain) {
             if (n->external) {
                 auto it = buffers.find(n);
@@ -353,7 +355,8 @@ PassResult run_device(const Geometry& g, const Pool& pool, const NormWeights& we
                 throw std::runtime_error("a node computed outside this pass is used as context; externalize it");
             }
             auto& pair = buffers.at(n);
-            segments.push_back({pair.first.data(), pair.second.data(), n->tokens, 0});
+            segments.push_back({pair.first.data(), pair.second.data(), n->tokens, options.indexed ? before : 0u});
+            before += n->tokens;
         }
     }
     sepal::cuda::check_attention_rows(spans, descs, segments);
@@ -1184,6 +1187,49 @@ SEPAL_TEST(tables, check_attention_rows) {
                  std::invalid_argument); // null pointer
     CHECK_THROWS(sepal::cuda::check_attention_rows(spans, std::vector<AttentionRowDesc>{{0, 1, 0xFFFFFFFFu, 0}}, std::vector<KvSegment>{ok}),
                  std::invalid_argument); // positions overflow
+    // An indexed row must say how many tokens precede each segment.
+    const std::vector<AttentionRowDesc> indexed = {{0, 2, 0, 1}};
+    sepal::cuda::check_attention_rows(spans, indexed, std::vector<KvSegment>{{&scratch, &scratch, 3, 0}, {&scratch, &scratch, 4, 3}});
+    CHECK_THROWS(sepal::cuda::check_attention_rows(spans, indexed, std::vector<KvSegment>{{&scratch, &scratch, 3, 0}, {&scratch, &scratch, 4, 2}}),
+                 std::invalid_argument); // the own segment's `before` is wrong
+    CHECK_THROWS(sepal::cuda::check_attention_rows(spans, indexed, std::vector<KvSegment>{{&scratch, &scratch, 3, 1}, {&scratch, &scratch, 4, 4}}),
+                 std::invalid_argument); // the first segment's `before` is not zero
+}
+
+// ---- suite: chains ----
+// A row over a long chain of snapshot links: finding a key's segment by binary search (indexed) gives the bits of the scan from
+// the first segment, in every kernel.
+
+SEPAL_TEST(chains, indexed_segments_give_the_bits_of_scanned_segments) {
+    for (const Geometry* g : {&tiny(), &preset("0.8b")}) {
+        for (const std::uint32_t links : {1u, 2u, 7u, 60u, 250u}) {
+            const Pool pool(*g, 80, 91 + links);
+            const NormWeights weights = make_weights(*g, 92);
+            NodePtr chain;
+            std::uint32_t context = 0;
+            for (std::uint32_t i = 0; i < links; ++i) {
+                const std::uint32_t tokens = 1 + (i * 7) % 5; // one-token links among longer ones
+                chain = external_node(*g, tokens, 93 + i, chain);
+                context += tokens;
+            }
+            // A long row, a one-token row, and a row of another chain, in one launch.
+            std::vector<RowPlan> rows;
+            rows.push_back(make_row(iota_ids(0, 37), context, chain));
+            rows.push_back(make_row(iota_ids(37, 1), context, chain));
+            rows.push_back(make_row(iota_ids(38, 11), 0, nullptr));
+            for (const Variant& variant : variants()) {
+                const PassResult scanned = run_device(*g, pool, weights, rows, variant);
+                PassOptions options;
+                options.indexed = true;
+                const PassResult binary = run_device(*g, pool, weights, rows, variant, options);
+                for (std::size_t r = 0; r < rows.size(); ++r) {
+                    char what[96];
+                    std::snprintf(what, sizeof what, "%s %u links row %zu", g->name.c_str(), links, r);
+                    CHECK(identical_rows(binary.rows[r], scanned.rows[r], what, variant.name));
+                }
+            }
+        }
+    }
 }
 
 SEPAL_TEST(tables, unsupported_geometry_and_paths) {

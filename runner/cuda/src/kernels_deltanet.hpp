@@ -77,20 +77,27 @@ struct DeltaNetWeights {
     const float* norm = nullptr;    // [value head dim], the stored weight itself (not 1 + weight)
 };
 
-/// A float32 matrix [N, width] over the flat token list: a pointer to its first element and a row stride in
-/// elements, so each input can be a band of columns of the multiply output.
-struct DeviceMatrixF32 {
-    const float* data = nullptr;
+/// A matrix [N, width] over the flat token list: a pointer to its first element and a row stride in elements, so each
+/// input can be a band of columns of the multiply output.
+template <class T>
+struct InputMatrix {
+    const T* data = nullptr;
     std::size_t stride = 0;
 };
+using DeviceMatrixF32 = InputMatrix<float>;
 
-/// The four projections of the normed layer input.
-struct DeltaNetInputs {
-    DeviceMatrixF32 mixed; // [N, conv_dim]
-    DeviceMatrixF32 z;     // [N, value_dim]
-    DeviceMatrixF32 b;     // [N, value heads]
-    DeviceMatrixF32 a;     // [N, value heads]
+/// The four projections of the normed layer input: float32, or binary16 (`__half`) when the multiply left its result in
+/// binary16 (cuBLAS with binary16 accumulators), which saves the pass that widens it. Widening is exact, so the results
+/// are bit for bit those of the same values as float32.
+template <class T>
+struct DeltaNetInputsT {
+    InputMatrix<T> mixed; // [N, conv_dim]
+    InputMatrix<T> z;     // [N, value_dim]
+    InputMatrix<T> b;     // [N, value heads]
+    InputMatrix<T> a;     // [N, value heads]
 };
+using DeltaNetInputs = DeltaNetInputsT<float>;
+using DeltaNetInputsHalf = DeltaNetInputsT<__half>;
 
 /// The rows to run and where their states are. All arrays are on the device.
 struct DeltaNetRows {
@@ -138,22 +145,24 @@ struct DeltaNetOptions {
 /// Steps 1 to 5 above for the rows of the wave: the whole scan kernel. `out` is [N, value_dim] with row stride
 /// `out_stride` elements, of type float or __half. Enqueues on `stream` and returns without waiting; throws
 /// std::invalid_argument for an unsupported geometry and std::runtime_error if the launch fails.
-template <class OutT>
+/// (Instantiated for float32 inputs with either output type, and binary16 inputs with binary16 output.)
+template <class OutT, class InT>
 void launch_deltanet_scan(const DeltaNetGeometry& geometry, const DeltaNetWeights& weights,
-                          const DeltaNetInputs& inputs, const DeltaNetRows& rows, const DeltaNetStates& states,
+                          const DeltaNetInputsT<InT>& inputs, const DeltaNetRows& rows, const DeltaNetStates& states,
                           OutT* out, std::size_t out_stride, cudaStream_t stream,
                           const DeltaNetOptions& options = {});
 
 /// The rows' new conv tails: the last K-1 conv inputs of (incoming tail, then the row's own inputs). Reads only
 /// `mixed` and the incoming tails, and may overwrite the incoming tail it reads (a row continued in place), so it
 /// must run AFTER launch_deltanet_scan of the same wave, on the same stream.
-void launch_deltanet_conv_tail(const DeltaNetGeometry& geometry, const DeltaNetInputs& inputs,
+template <class InT>
+void launch_deltanet_conv_tail(const DeltaNetGeometry& geometry, const DeltaNetInputsT<InT>& inputs,
                                const DeltaNetRows& rows, const DeltaNetStates& states, cudaStream_t stream);
 
 /// Both of the above: everything the mixer does for one wave.
-template <class OutT>
+template <class OutT, class InT>
 void launch_deltanet_wave(const DeltaNetGeometry& geometry, const DeltaNetWeights& weights,
-                          const DeltaNetInputs& inputs, const DeltaNetRows& rows, const DeltaNetStates& states,
+                          const DeltaNetInputsT<InT>& inputs, const DeltaNetRows& rows, const DeltaNetStates& states,
                           OutT* out, std::size_t out_stride, cudaStream_t stream,
                           const DeltaNetOptions& options = {}) {
     launch_deltanet_scan(geometry, weights, inputs, rows, states, out, out_stride, stream, options);
