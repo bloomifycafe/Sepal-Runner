@@ -67,6 +67,12 @@ void launch_add(const float* x, std::size_t x_stride, const float* m, std::size_
 void launch_swiglu(const float* gate, std::size_t gate_stride, const float* up, std::size_t up_stride, std::size_t n,
                    std::size_t width, void* out, Elem out_type, std::size_t out_stride, cudaStream_t stream);
 
+/// launch_swiglu with gate and up given as binary16 (the output of a multiply that rounds to binary16, which halves the
+/// bytes this launch and that multiply move). The inputs are widened exactly, so the result is the same as
+/// launch_swiglu's on the same values as float32. `gate` and `up` are `const __half*`.
+void launch_swiglu_half(const void* gate, std::size_t gate_stride, const void* up, std::size_t up_stride, std::size_t n,
+                        std::size_t width, void* out, Elem out_type, std::size_t out_stride, cudaStream_t stream);
+
 /// Readout: the final norm of chosen rows. out[j, :] = rms_norm(x[rows[j], :]) with the final norm's weight, for j
 /// in [0, count); float32 [count, width], row stride out_stride. x: the last layer's output, float32, row stride
 /// x_stride. rows: device array of `count` row indices into x (the host has checked them against x's row count).

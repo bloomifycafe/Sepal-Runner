@@ -61,6 +61,9 @@ struct EngineOptions {
     std::size_t memory_budget_bytes = 0;
     /// 0 natural, T > 0 strict: see the header comment. In strict mode T should be a multiple of 8.
     std::size_t gemm_rows = 0;
+    /// Float16 path only: the multiply of the MLP's gate and up projections writes binary16 instead of float32, as
+    /// PyTorch's float16 run has it. Halves the memory traffic of that multiply and of the SwiGLU product that reads it.
+    bool fp16_gate_up = true;
     /// Compute the last layer's queries, attention, output projection and MLP only for the tokens that are read out
     /// (its keys and values are still computed for every token). The last layer is always a full-attention layer.
     bool prune_last_layer = true;

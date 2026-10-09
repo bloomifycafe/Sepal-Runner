@@ -439,3 +439,64 @@ SEPAL_TEST(real_natural, drift_of_probabilities_across_batch_compositions) {
         CHECK(worst_p < (precision == Precision::F16 ? 0.01 : 1e-4));
     }
 }
+
+// ---- a second geometry: Qwen3.5-2B-Base (optional; there is no transformers golden for it) ----
+// SEPAL_REAL_MODEL_2B names its checkpoint directory. The float32 engine is compared with the CPU reference on a few
+// dozen tokens (the reference is slow), and the float16 engine with the float32 engine.
+
+SEPAL_TEST(real_2b, second_geometry_against_the_cpu_reference_and_float16_against_float32) {
+    const auto dir = environment("SEPAL_REAL_MODEL_2B");
+    if (!dir || !environment("SEPAL_REAL_GOLDEN")) {
+        std::cout << "SKIPPED: set SEPAL_REAL_MODEL_2B (a Qwen3.5-2B-Base checkpoint directory) and SEPAL_REAL_GOLDEN to run this\n";
+        return;
+    }
+    const LoadedModel model = LoadedModel::open(*dir);
+    const ModelConfig& cfg = model.config();
+    const std::size_t hidden = ref::dim(cfg.hidden_size);
+    std::vector<std::uint32_t> text = tokens_of(golden("case_iii").at("token_ids"));
+    text.resize(40);
+    // A 28-token state with two branches, and a separate 12-token row, in one call.
+    std::vector<EngineRow> rows = {row_of({text.begin(), text.begin() + 28}, {27}), row_of({text.begin() + 28, text.end()}, {11, 0})};
+    for (std::size_t b = 0; b < 2; ++b) {
+        EngineRow branch = row_of({text.begin() + 3 * (b + 1), text.begin() + 3 * (b + 1) + 5 + b}, {4 + b});
+        branch.parent = ParentRow{0};
+        branch.start_position = 28;
+        rows.push_back(branch);
+    }
+
+    const auto start = Clock::now();
+    const Weights<float> weights32 = model.weights<float>();
+    std::vector<ref::Row<float>> reference(rows.size());
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        reference[r].token_ids = rows[r].token_ids;
+        reference[r].readout_offsets = rows[r].readout_offsets;
+        reference[r].start_position = rows[r].start_position.value_or(0);
+        if (std::holds_alternative<ParentRow>(rows[r].parent)) reference[r].parent = ref::ParentRow{std::get<ParentRow>(rows[r].parent).index};
+    }
+    const std::unique_ptr<GemmProvider> gemm = make_reference_gemm();
+    const auto want = ref::run_rows<float>(*gemm, cfg, weights32, std::span<const ref::Row<float>>(reference));
+    std::cout << "  " << cfg.name << ": CPU reference on " << 28 + 12 + 5 + 6 << " tokens in " << std::fixed << std::setprecision(1) << seconds_since(start) << " s\n";
+
+    std::vector<std::vector<EngineRowResult>> got;
+    for (const Precision precision : {Precision::F32, Precision::F16}) {
+        CudaEngine engine(model, real_options(precision, 0, precision == Precision::F32 ? 9000 : 6000));
+        got.push_back(run(engine, rows));
+    }
+    double d32 = 0.0, d16_ref = 0.0, d16_32 = 0.0, sum16 = 0.0;
+    std::size_t count = 0;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        d32 = std::max(d32, max_abs_diff(got[0][r].hidden.data(), want[r].hidden.data(), got[0][r].hidden.size()));
+        d16_ref = std::max(d16_ref, max_abs_diff(got[1][r].hidden.data(), want[r].hidden.data(), got[1][r].hidden.size()));
+        for (std::size_t i = 0; i < got[1][r].hidden.size(); ++i) {
+            const double d = std::fabs(static_cast<double>(got[1][r].hidden[i]) - got[0][r].hidden[i]);
+            d16_32 = std::max(d16_32, d);
+            sum16 += d;
+            ++count;
+        }
+    }
+    std::cout << "  " << cfg.name << " (hidden " << hidden << ", " << cfg.num_layers << " layers): float32 engine vs CPU reference, largest |difference| " << std::scientific
+              << std::setprecision(3) << d32 << "; float16 engine vs float32 engine: largest " << d16_32 << ", mean " << sum16 / static_cast<double>(count) << std::fixed << "\n";
+    CHECK(d32 <= kHiddenTolerance);
+    CHECK(d16_32 < 0.05);
+    (void)d16_ref;
+}

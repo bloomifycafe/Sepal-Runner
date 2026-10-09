@@ -314,8 +314,8 @@ struct CudaEngine::Impl {
     // ---- a call ----
     struct Phase;
     std::vector<EngineRowResult> run(std::span<const EngineRow> rows);
-    void gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, float* out,
-              std::size_t ld_out, std::size_t rows);
+    void gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, void* out,
+              std::size_t ld_out, std::size_t rows, bool out_half = false);
     std::size_t kv_layer_bytes(std::size_t tokens) const { return align_up(tokens * kv_layer_unit); }
     std::size_t kv_block_bytes(std::size_t tokens) const { return attn_layers * 2 * kv_layer_bytes(tokens); }
 };
@@ -581,24 +581,25 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
 // Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: `rows` is a multiple of
 // gemm_rows and the multiply is cut into blocks of exactly that many rows (the call buffers hold zero rows up to the
 // next multiple, so the last block is a full one).
-void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, float* out,
-                            std::size_t ld_out, std::size_t rows) {
+void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, void* out,
+                            std::size_t ld_out, std::size_t rows, bool out_half) {
     const std::size_t step = options.gemm_rows == 0 ? rows : options.gemm_rows;
     const float alpha = 1.0f, beta = 0.0f;
     for (std::size_t at = 0; at < rows; at += step) {
         const std::size_t t = step;
         const char* xin = static_cast<const char*>(in) + at * ld_in * elem_bytes;
-        float* yout = out + at * ld_out;
+        const std::size_t out_bytes = out_half ? 2 : 4;
+        char* yout = static_cast<char*>(out) + at * ld_out * out_bytes;
         const int m_ = static_cast<int>(n), t_ = static_cast<int>(t), k_ = static_cast<int>(k);
         // Row-major X [t, k] is the column-major k x t matrix, and so on: Y^T (n x t) = W (n x k) * X^T (k x t).
         if (half) {
             check_blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha, w, CUDA_R_16F, k_, xin, CUDA_R_16F,
-                                    static_cast<int>(ld_in), &beta, yout, CUDA_R_32F, static_cast<int>(ld_out),
+                                    static_cast<int>(ld_in), &beta, yout, out_half ? CUDA_R_16F : CUDA_R_32F, static_cast<int>(ld_out),
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                        "cublasGemmEx", "[" + std::to_string(t) + " x " + std::to_string(k) + "] by [" + std::to_string(n) + " x " + std::to_string(k) + "]");
         } else {
             check_blas(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha, static_cast<const float*>(w), k_,
-                                   reinterpret_cast<const float*>(xin), static_cast<int>(ld_in), &beta, yout,
+                                   reinterpret_cast<const float*>(xin), static_cast<int>(ld_in), &beta, reinterpret_cast<float*>(yout),
                                    static_cast<int>(ld_out)),
                        "cublasSgemm", "[" + std::to_string(t) + " x " + std::to_string(k) + "] by [" + std::to_string(n) + " x " + std::to_string(k) + "]");
         }
@@ -926,6 +927,17 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     // extra rows being zero.
     const std::size_t padded = align_up(n, pad_step);
     const float eps = static_cast<float>(config.rms_norm_eps);
+    // The gate and up halves of the MLP's first multiply: float32, or on the float16 path optionally binary16 straight out
+    // of the multiply (as PyTorch's float16 run has them), which halves the traffic of that multiply and of SwiGLU.
+    const bool half_gate_up = half && options.fp16_gate_up;
+    const auto swiglu = [&](std::size_t rows_) {
+        if (half_gate_up) {
+            const __half* gu = reinterpret_cast<const __half*>(p);
+            launch_swiglu_half(gu, 2 * I, gu + I, 2 * I, rows_, I, a3, elem, I, stream);
+        } else {
+            launch_swiglu(p, 2 * I, p + I, 2 * I, rows_, I, a3, elem, I, stream);
+        }
+    };
     {
         Phase phase(*this, &PhaseTimes::elementwise_ms);
         // Strict mode multiplies whole blocks of gemm_rows rows: the rows past the end of the call must be zero.
@@ -1002,11 +1014,11 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u);
+                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up);
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
-                launch_swiglu(p, 2 * I, p + I, 2 * I, ru, I, a3, elem, I, stream);
+                swiglu(ru);
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
@@ -1069,11 +1081,11 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
-            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded);
+            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up);
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
-            launch_swiglu(p, 2 * I, p + I, 2 * I, n, I, a3, elem, I, stream);
+            swiglu(n);
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);

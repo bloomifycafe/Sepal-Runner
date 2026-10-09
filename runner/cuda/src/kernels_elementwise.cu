@@ -228,14 +228,14 @@ __device__ inline float softplus_f(float x) { return fmaxf(x, 0.0f) + log1pf(exp
 /// x * sigmoid(x) with sigmoid(x) = exp(-softplus(-x)).
 __device__ inline float silu_f(float x) { return __fmul_rn(x, expf(-softplus_f(-x))); }
 
-template <class Out>
-__global__ void swiglu_kernel(const float* gate, std::size_t gate_stride, const float* up, std::size_t up_stride,
+template <class In, class Out>
+__global__ void swiglu_kernel(const In* gate, std::size_t gate_stride, const In* up, std::size_t up_stride,
                               std::size_t n, std::size_t width, Out* out, std::size_t out_stride, bool aligned) {
     const std::size_t c = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c * 4 >= width) return;
     for (std::size_t row = blockIdx.y; row < n; row += gridDim.y) {
-        const float4 g = load4(gate + row * gate_stride, c * 4, width, aligned);
-        const float4 u = load4(up + row * up_stride, c * 4, width, aligned);
+        const float4 g = load4_widened(gate + row * gate_stride, c * 4, width, aligned);
+        const float4 u = load4_widened(up + row * up_stride, c * 4, width, aligned);
         store4(out + row * out_stride, c * 4, width, aligned,
                make_float4(__fmul_rn(silu_f(g.x), u.x), __fmul_rn(silu_f(g.y), u.y), __fmul_rn(silu_f(g.z), u.z),
                            __fmul_rn(silu_f(g.w), u.w)));
@@ -419,11 +419,36 @@ void launch_swiglu(const float* gate, std::size_t gate_stride, const float* up, 
     const bool aligned = gate_stride % 4 == 0 && up_stride % 4 == 0 && out_stride % 4 == 0 && aligned16(gate) &&
                          aligned16(up) && aligned16(out);
     if (out_type == Elem::F32) {
-        swiglu_kernel<float><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
+        swiglu_kernel<float, float><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
             gate, gate_stride, up, up_stride, n, width, static_cast<float*>(out), out_stride, aligned);
     } else {
-        swiglu_kernel<__half><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
+        swiglu_kernel<float, __half><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
             gate, gate_stride, up, up_stride, n, width, static_cast<__half*>(out), out_stride, aligned);
+    }
+    check_launch();
+}
+
+void launch_swiglu_half(const void* gate, std::size_t gate_stride, const void* up, std::size_t up_stride, std::size_t n,
+                        std::size_t width, void* out, Elem out_type, std::size_t out_stride, cudaStream_t stream) {
+    require_output_type(out_type);
+    require_matrix(n, width, gate_stride, "launch_swiglu_half: gate_stride is smaller than width");
+    require_matrix(n, width, up_stride, "launch_swiglu_half: up_stride is smaller than width");
+    require_matrix(n, width, out_stride, "launch_swiglu_half: out_stride is smaller than width");
+    if (n == 0 || width == 0) return;
+    const std::size_t out_bytes = out_type == Elem::F32 ? sizeof(float) : sizeof(std::uint16_t);
+    const Extent o = extent_of(out, n, width, out_stride, out_bytes);
+    require(!overlap(o, extent_of(gate, n, width, gate_stride, 2)) && !overlap(o, extent_of(up, n, width, up_stride, 2)),
+            "launch_swiglu_half: out overlaps gate or up");
+    const bool aligned = gate_stride % 4 == 0 && up_stride % 4 == 0 && out_stride % 4 == 0 && aligned16(gate) &&
+                         aligned16(up) && aligned16(out);
+    if (out_type == Elem::F32) {
+        swiglu_kernel<__half, float><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
+            static_cast<const __half*>(gate), gate_stride, static_cast<const __half*>(up), up_stride, n, width,
+            static_cast<float*>(out), out_stride, aligned);
+    } else {
+        swiglu_kernel<__half, __half><<<grid_for_chunks(n, width), kBlock, 0, stream>>>(
+            static_cast<const __half*>(gate), gate_stride, static_cast<const __half*>(up), up_stride, n, width,
+            static_cast<__half*>(out), out_stride, aligned);
     }
     check_launch();
 }

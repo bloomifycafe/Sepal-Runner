@@ -53,6 +53,7 @@ struct Options {
     std::size_t budget_mib = 0;
     std::size_t state_slots = 0;
     bool prune_last_layer = true;
+    bool fp16_gate_up = true;
     bool prefill = true, alerts = true, cached = true, profile = true;
 };
 
@@ -60,7 +61,7 @@ struct Options {
     std::fprintf(stderr,
                  "%s\nusage: sepal-cuda-engine-bench --model <dir> --workload <json> [--precision f16|f32] [--gemm-rows N] [--reps N]\n"
                  "       [--warmup N] [--json out.json] [--sections prefill,alerts,cached,profile] [--max-call-tokens N] [--budget-mib N]\n"
-                 "       [--state-slots N] [--prune-last-layer 0|1]\n",
+                 "       [--state-slots N] [--prune-last-layer 0|1] [--fp16-gate-up 0|1]\n",
                  why.c_str());
     std::exit(2);
 }
@@ -97,6 +98,8 @@ Options parse(int argc, char** argv) {
             o.budget_mib = std::stoul(value);
         } else if (flag == "--state-slots") {
             o.state_slots = std::stoul(value);
+        } else if (flag == "--fp16-gate-up") {
+            o.fp16_gate_up = value != "0";
         } else if (flag == "--prune-last-layer") {
             o.prune_last_layer = value != "0";
         } else if (flag == "--sections") {
@@ -275,6 +278,7 @@ int main(int argc, char** argv) {
         eo.memory_budget_bytes = opt.budget_mib << 20;
         eo.state_slots = opt.state_slots;
         eo.prune_last_layer = opt.prune_last_layer;
+        eo.fp16_gate_up = opt.fp16_gate_up;
         const auto created = std::chrono::steady_clock::now();
         CudaEngine engine(model, eo);
         const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count();
@@ -294,6 +298,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(cfg.num_layers), static_cast<unsigned long long>(cfg.hidden_size), opt.precision == Precision::F16 ? "float16" : "float32",
                     opt.gemm_rows == 0 ? "natural" : ("strict, gemm_rows " + std::to_string(opt.gemm_rows)).c_str(), create_s);
         std::printf("  last layer computed for the read-out tokens only: %s\n", opt.prune_last_layer ? "yes" : "no");
+        std::printf("  gate and up of the MLP written as binary16 by the multiply: %s\n", opt.precision == Precision::F16 && opt.fp16_gate_up ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",
                     static_cast<double>(mem0.weights_bytes) / (1 << 20), static_cast<double>(mem0.call_buffer_bytes) / (1 << 20), mem0.slots_total,
                     static_cast<double>(mem0.slot_bytes) / (1 << 20), static_cast<double>(mem0.kv_heap_bytes) / (1 << 20), static_cast<double>(mem0.budget_bytes) / (1 << 20));
