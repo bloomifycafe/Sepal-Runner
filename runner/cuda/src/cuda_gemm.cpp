@@ -368,6 +368,12 @@ void CudaGemm::gemm_f(MatRef x, MatRef w, MatView y, float beta) const {
     s.host_gemm(x, w_dev, w.rows, y, beta);
 }
 
+void CudaGemm::gemm_f64(ConstMatViewD x, ConstMatViewD w, MatViewD y, double beta) const {
+    // The float64 product is the reference path, not a device path: it is computed on the host.
+    static const std::unique_ptr<GemmProvider> reference = make_reference_gemm();
+    reference->gemm_f64(x, w, y, beta);
+}
+
 void CudaGemm::gemm_f(MatRef x, WeightId w, MatView y, float beta) const {
     Impl& s = *impl_;
     const std::lock_guard<std::mutex> lock(s.mutex);
