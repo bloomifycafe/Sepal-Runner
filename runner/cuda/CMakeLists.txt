@@ -229,6 +229,16 @@ foreach(suite gemmk_convert gemmk_accuracy gemmk_invariance gemmk_edge)
   set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
 
+# ---- the int8 multiply kernels ----
+add_executable(sepal_cuda_kernel_s8_tests tests/test_gemm_s8_kernels.cpp src/gemm_s8_kernels.cu ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_s8_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_kernel_s8_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_kernel_s8_tests PRIVATE sepal_core sepal_cuda_flags)
+foreach(suite s8_quantize s8_gemm s8_invariance s8_edge)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_s8_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
+endforeach()
+
 # ---- engine tests ----
 # The real-model suite is skipped, with a message, unless SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN are set.
 add_executable(sepal_cuda_engine_tests
@@ -247,7 +257,7 @@ add_executable(sepal_cuda_engine_tests
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply engine_int8 attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")

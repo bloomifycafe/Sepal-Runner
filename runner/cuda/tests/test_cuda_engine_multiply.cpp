@@ -268,3 +268,161 @@ SEPAL_TEST(engine_multiply, repeated_runs_of_the_own_kernel_are_bit_identical) {
         }
     }
 }
+
+// ---- int8 multiplies (EngineOptions::int8_multiply) ---------------------------------------------------------------------
+
+namespace {
+
+// kernel_config() has H = 24, which the int8 kernels refuse (K a multiple of 16); this one has H = 32 and I = 48.
+ModelConfig int8_config() {
+    ModelConfig c = kernel_config();
+    c.name = "tiny-int8";
+    c.hidden_size = 32;
+    c.intermediate_size = 48;
+    return c;
+}
+
+sepal::cuda::Int8Multiply int8_groups(bool gate_up, bool down, bool mixer_in, bool mixer_out, bool int8_activations) {
+    sepal::cuda::Int8Multiply q;
+    q.gate_up = gate_up;
+    q.down = down;
+    q.mixer_in = mixer_in;
+    q.mixer_out = mixer_out;
+    q.int8_activations = int8_activations;
+    return q;
+}
+
+EngineOptions int8_options(const sepal::cuda::Int8Multiply& q, MultiplyPath path, std::size_t gemm_rows) {
+    EngineOptions o = options_with(path, false, gemm_rows);
+    o.int8_multiply = q;
+    return o;
+}
+
+} // namespace
+
+SEPAL_TEST(engine_int8, defaults_and_refusals) {
+    const EngineOptions defaults;
+    CHECK(!defaults.int8_multiply.any());
+    CHECK(defaults.int8_multiply.int8_activations);
+    const auto refused = [](auto&& make) {
+        try {
+            make();
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    const ModelConfig good = int8_config();
+    // The float32 path has no int8 multiply.
+    CHECK(refused([&] {
+        EngineOptions o = int8_options(int8_groups(true, true, true, true, true), MultiplyPath::Cublas, 0);
+        o.precision = Precision::F32;
+        CudaEngine engine(good, weights_of(good, 1), o);
+    }));
+    // H = 24 is not a multiple of 16, whichever group is chosen first.
+    const ModelConfig bad = kernel_config();
+    CHECK(refused([&] { CudaEngine engine(bad, weights_of(bad, 1), int8_options(int8_groups(true, false, false, false, true), MultiplyPath::Cublas, 0)); }));
+    CHECK(refused([&] { CudaEngine engine(bad, weights_of(bad, 1), int8_options(int8_groups(false, false, true, false, false), MultiplyPath::Invariant, 0)); }));
+    CudaEngine fine(good, weights_of(good, 1), int8_options(int8_groups(true, true, true, true, true), MultiplyPath::Cublas, 0));
+    CHECK(fine.options().int8_multiply.any());
+}
+
+SEPAL_TEST(engine_int8, weights_take_less_memory_and_the_variants_stay_close_to_the_float32_engine) {
+    const ModelConfig cfg = int8_config();
+    const Weights<float>& weights = weights_of(cfg, 15);
+    EngineOptions f32;
+    f32.precision = Precision::F32;
+    f32.memory_budget_bytes = std::size_t{192} << 20;
+    f32.max_call_tokens = 4096;
+    f32.state_slots = 128;
+    CudaEngine reference(cfg, weights, f32);
+    CudaEngine plain(cfg, weights, options_with(MultiplyPath::Cublas, false, 0));
+    struct Variant {
+        const char* name;
+        sepal::cuda::Int8Multiply q;
+        double mean_allowed;
+    };
+    const std::vector<Variant> variants = {
+        {"W8A16, all four", int8_groups(true, true, true, true, false), 0.06},
+        {"W8A8, all four", int8_groups(true, true, true, true, true), 0.15},
+        {"W8A8, gate_up", int8_groups(true, false, false, false, true), 0.08},
+        {"W8A8, down", int8_groups(false, true, false, false, true), 0.08},
+        {"W8A8, mixer_in", int8_groups(false, false, true, false, true), 0.08},
+        {"W8A8, mixer_out", int8_groups(false, false, false, true, true), 0.08},
+        {"W8A16, mixer_in", int8_groups(false, false, true, false, false), 0.06},
+    };
+    for (const Variant& v : variants) {
+        CudaEngine engine(cfg, weights, int8_options(v.q, MultiplyPath::Cublas, 0));
+        const auto mem = engine.memory();
+        CHECK(mem.weights_bytes < plain.memory().weights_bytes);
+        Rng rng(31);
+        double worst = 0, mean_sum = 0;
+        std::size_t calls = 0;
+        for (std::size_t call = 0; call < 24; ++call) {
+            const std::vector<EngineRow> request = others(rng, 200);
+            const auto want = run(reference, request);
+            const auto got = run(engine, request);
+            for (const auto& g : got) CHECK(all_finite(g.hidden));
+            mean_sum += mean_distance(got, want, &worst);
+            ++calls;
+        }
+        const double mean = mean_sum / static_cast<double>(calls);
+        std::cout << "  " << v.name << " against the float32 engine on the tiny geometry: mean |difference| " << std::scientific << std::setprecision(2) << mean << ", largest "
+                  << worst << std::fixed << "; weights " << mem.weights_bytes << " bytes (binary16: " << plain.memory().weights_bytes << ")\n";
+        CHECK(mean < v.mean_allowed);
+    }
+}
+
+SEPAL_TEST(engine_int8, every_batch_composition_gives_the_same_bits) {
+    const ModelConfig cfg = int8_config();
+    const Weights<float>& weights = weights_of(cfg, 16);
+    struct Setup {
+        const char* name;
+        sepal::cuda::Int8Multiply q;
+        MultiplyPath path;
+    };
+    const std::vector<Setup> setups = {
+        {"W8A8 all four", int8_groups(true, true, true, true, true), MultiplyPath::Cublas},
+        {"W8A16 all four", int8_groups(true, true, true, true, false), MultiplyPath::Cublas},
+        {"W8A8 mixer_in only, cuBLAS for the rest", int8_groups(false, false, true, false, true), MultiplyPath::Cublas},
+        {"W8A8 down only, own kernel for the rest", int8_groups(false, true, false, false, true), MultiplyPath::Invariant},
+    };
+    for (const Setup& s : setups) {
+        for (const std::size_t gemm_rows : {std::size_t{0}, std::size_t{16}, std::size_t{48}}) {
+            // Natural mode with cuBLAS groups left in is not invariant (cuBLAS picks its kernel by shape); strict mode is.
+            const bool all_own = s.path == MultiplyPath::Invariant || (s.q.gate_up && s.q.down && s.q.mixer_in && s.q.mixer_out);
+            if (gemm_rows == 0 && !all_own) continue;
+            CudaEngine engine(cfg, weights, int8_options(s.q, s.path, gemm_rows));
+            const Counts c = family_invariance(engine, 900 + gemm_rows, 8);
+            std::cout << "  " << s.name << ", gemm_rows " << gemm_rows << ": " << c.identical << " of " << c.trials
+                      << " rows bit-identical alone, among other rows, and continued from a stored snapshot\n";
+            CHECK_EQ(c.identical, c.trials);
+        }
+    }
+}
+
+SEPAL_TEST(engine_int8, strict_pruned_and_full_last_layers_agree_and_repeated_runs_are_identical) {
+    const ModelConfig cfg = int8_config();
+    const Weights<float>& weights = weights_of(cfg, 17);
+    for (const bool w8a8 : {true, false}) {
+        EngineOptions with = int8_options(int8_groups(true, true, true, true, w8a8), MultiplyPath::Cublas, 16);
+        EngineOptions without = with;
+        without.prune_last_layer = false;
+        CudaEngine pruned(cfg, weights, with);
+        CudaEngine full(cfg, weights, without);
+        Rng rng(77);
+        std::size_t compared = 0, identical = 0;
+        for (std::size_t trial = 0; trial < 20; ++trial) {
+            const std::vector<EngineRow> request = others(rng, trial % 2 == 0 ? 300 : 40);
+            const auto a = run(pruned, request);
+            const auto again = run(pruned, request);
+            const auto b = run(full, request);
+            for (std::size_t r = 0; r < a.size(); ++r) {
+                ++compared;
+                if (same_bits(a[r].hidden, b[r].hidden) && same_bits(a[r].hidden, again[r].hidden)) ++identical;
+            }
+        }
+        std::cout << "  " << (w8a8 ? "W8A8" : "W8A16") << " strict: " << identical << " of " << compared << " rows identical between pruned and full last layer and across repeated runs\n";
+        CHECK_EQ(identical, compared);
+    }
+}
