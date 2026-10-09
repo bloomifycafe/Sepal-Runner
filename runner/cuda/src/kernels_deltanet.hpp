@@ -102,9 +102,18 @@ struct DeltaNetRows {
 };
 
 /// The slot arrays.
+///
+/// Storage. `half_storage` false: both arrays are float32. True: both are binary16 (__half): the kernels widen what they
+/// load and round to nearest even what they store, all arithmetic stays float32. A stored value beyond +-65504 is
+/// clamped to +-65504 (never infinity) and, when `saturations` is not null, counted there. A row's results depend on its
+/// incoming state as stored, so a state handed over inside one pass (parent row, child row in a later wave) goes through
+/// the same rounding as a stored one: the strict-mode guarantee (a branch from a snapshot equals the branch run with its
+/// state) holds with either storage.
 struct DeltaNetStates {
-    float* conv_tails = nullptr; // [slots, K-1, conv_dim]
-    float* recurrent = nullptr;  // [slots, value heads, dk, dv]
+    void* conv_tails = nullptr; // [slots, K-1, conv_dim]
+    void* recurrent = nullptr;  // [slots, value heads, dk, dv]
+    bool half_storage = false;
+    unsigned* saturations = nullptr; // device counter, binary16 storage only
 };
 
 /// Optional copies of intermediate values, for tests. Null pointers cost nothing.

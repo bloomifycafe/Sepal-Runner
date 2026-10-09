@@ -24,6 +24,7 @@
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
 #include "kernels_elementwise.hpp"
+#include "snapshot_file.hpp"
 
 namespace sepal::cuda {
 
@@ -294,6 +295,10 @@ struct CudaEngine::Impl {
 
     std::shared_ptr<Pools> pools;
     std::size_t state_conv_floats = 0, state_recurrent_floats = 0;
+    std::size_t state_elem = 4;          // bytes of one stored state element: 4, or 2 with EngineOptions::half_state
+    DeviceBuffer<unsigned> saturation_counter; // binary16 state: values clamped on a store, summed by the kernels
+    std::uint64_t saturations_seen = 0;
+    std::optional<std::uint64_t> weight_fp_cache;
     std::size_t slot_layer_stride = 0, slot_recurrent_offset = 0; // bytes, per DeltaNet layer within the slot pool
     std::size_t kv_layer_unit = 0;                                 // bytes of keys (or values) of one token
 
@@ -327,6 +332,10 @@ struct CudaEngine::Impl {
     // ---- a call ----
     struct Phase;
     std::vector<EngineRowResult> run(std::span<const EngineRow> rows);
+    // Snapshot tiers; the caller holds run_mutex.
+    SnapshotIdentity identity();
+    HostSnapshot to_host(const DeviceSnapshot& snapshot, HostMemory memory);
+    DeviceSnapshot to_device(const HostSnapshot& snapshot);
     void gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, void* out,
               std::size_t ld_out, std::size_t rows, bool out_half = false, bool acc16 = false);
     std::size_t kv_layer_bytes(std::size_t tokens) const { return align_up(tokens * kv_layer_unit); }
@@ -516,6 +525,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
                                 u32(dim(config.attn_rotary_dims())), config.rope_theta, config.rms_norm_eps};
     state_conv_floats = dn_geometry.conv_tail_floats();
     state_recurrent_floats = dn_geometry.recurrent_floats();
+    state_elem = options.half_state ? 2 : 4;
     kv_layer_unit = attn_kv_width * elem_bytes;
 
     check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
@@ -563,7 +573,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     // Pools: slots first (fixed size), the heap gets the rest.
     const std::size_t remaining = budget - floor_needed;
-    const std::size_t slot_bytes_each = dn_layers * (state_conv_floats * 4 + state_recurrent_floats * 4);
+    const std::size_t slot_bytes_each = dn_layers * (state_conv_floats * state_elem + state_recurrent_floats * state_elem);
     std::size_t slots = 0;
     if (dn_layers != 0) {
         slots = options.state_slots != 0 ? options.state_slots
@@ -571,8 +581,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
         slots = std::max<std::size_t>(slots, 2);
     }
     // The slot pool is laid out per layer as [conv tails of all slots][recurrent states of all slots].
-    slot_recurrent_offset = align_up(slots * state_conv_floats * 4);
-    slot_layer_stride = slot_recurrent_offset + align_up(slots * state_recurrent_floats * 4);
+    slot_recurrent_offset = align_up(slots * state_conv_floats * state_elem);
+    slot_layer_stride = slot_recurrent_offset + align_up(slots * state_recurrent_floats * state_elem);
     const std::size_t slot_pool_bytes = dn_layers * slot_layer_stride;
     if (slot_pool_bytes >= remaining) {
         throw BudgetExceeded("the memory budget of " + mib(budget) + " leaves " + mib(remaining) + " after the weights and call buffers, " +
@@ -585,6 +595,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     {
         DeviceBuffer<char> staging(kUploadChunk);
         weight_memory = DeviceBuffer<char>(weights_bytes);
+        // The padding between tensors is zero, so that the weights' fingerprint (snapshot files) is a function of the weights.
+        check_cuda(cudaMemset(weight_memory.data(), 0, weights_bytes), "cudaMemset", "weight memory");
         std::size_t used = 0;
         place_weights(source, weight_memory.data(), staging, used);
     }
@@ -593,6 +605,10 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     check_blas(cublasSetWorkspace(blas, call_memory.data() + call_needed - kCublasWorkspace, kCublasWorkspace),
                "cublasSetWorkspace");
     call_bytes = call_needed;
+    if (options.half_state) {
+        saturation_counter = DeviceBuffer<unsigned>(1);
+        saturation_counter.zero();
+    }
     pools->slot_memory = DeviceBuffer<char>(slot_pool_bytes);
     pools->kv_memory = DeviceBuffer<char>(kv_bytes);
     pools->kv_capacity = kv_bytes;
@@ -1019,7 +1035,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     std::vector<DeltaNetStates> dn_states(dn_layers);
     for (std::size_t d = 0; d < dn_layers; ++d) {
         char* base = pools->slot_memory.data() + d * slot_layer_stride;
-        dn_states[d] = DeltaNetStates{reinterpret_cast<float*>(base), reinterpret_cast<float*>(base + slot_recurrent_offset)};
+        dn_states[d] = DeltaNetStates{base, base + slot_recurrent_offset, options.half_state,
+                                      options.half_state ? saturation_counter.data() : nullptr};
     }
     const DeltaNetInputs dn_inputs{{p, p_width}, {p + conv_dim, p_width}, {p + conv_dim + value_dim, p_width},
                                    {p + conv_dim + value_dim + dim(config.dn_value_heads), p_width}};
@@ -1195,6 +1212,12 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         check_cuda(cudaMemcpyAsync(hidden.data(), m, hidden.size() * 4, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "readout");
     }
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "end of call");
+    if (options.half_state) {
+        unsigned count = 0;
+        check_cuda(cudaMemcpy(&count, saturation_counter.data(), sizeof count, cudaMemcpyDeviceToHost), "cudaMemcpy", "saturation counter");
+        saturations_seen += count;
+        if (count != 0) saturation_counter.zero();
+    }
 
     // ---- results ----
     std::size_t taken = 0;
@@ -1290,6 +1313,243 @@ void CudaEngine::set_profiling(bool on) {
 PhaseTimes CudaEngine::last_profile() const {
     std::lock_guard<std::mutex> lock(impl_->run_mutex); // waits for a call in progress: the profile is written by run()
     return impl_->profile;
+}
+
+// ---- snapshot tiers -------------------------------------------------------------------------------------------
+
+namespace {
+
+std::uint64_t bits_of(double v) {
+    std::uint64_t b;
+    std::memcpy(&b, &v, sizeof b);
+    return b;
+}
+
+std::uint64_t fingerprint_of(const std::vector<std::uint64_t>& fields, std::uint64_t seed) {
+    return hash64(fields.data(), fields.size() * sizeof(std::uint64_t), seed);
+}
+
+} // namespace
+
+SnapshotIdentity CudaEngine::Impl::identity() {
+    SnapshotIdentity id;
+    const ModelConfig& c = config;
+    // Every field of the geometry that sizes a state or a key/value, and the rest that shapes the numbers.
+    std::vector<std::uint64_t> geometry = {c.num_layers, c.full_attention_interval, c.hidden_size, c.intermediate_size, c.attn_heads,
+                                           c.attn_kv_heads, c.attn_head_dim, c.dn_key_heads, c.dn_value_heads, c.dn_key_head_dim,
+                                           c.dn_value_head_dim, c.conv_kernel, c.vocab_size, bits_of(c.rms_norm_eps), bits_of(c.rope_theta),
+                                           bits_of(c.partial_rotary_factor)};
+    id.geometry_fp = fingerprint_of(geometry, 0x5E9A1ull);
+    if (!weight_fp_cache) {
+        DeviceBuffer<unsigned long long> partials(hash_partial_count());
+        launch_hash_words(weight_memory.data(), weights_bytes, partials.data(), stream);
+        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "weight fingerprint");
+        const std::vector<unsigned long long> values = partials.download();
+        weight_fp_cache = hash64(&weights_bytes, sizeof weights_bytes, fold_hashes(values));
+    }
+    id.weight_fp = *weight_fp_cache;
+    const Fp16Accumulate& fa = options.fp16_accumulate;
+    const std::vector<std::uint64_t> compute = {options.gemm_rows, options.fp16_gate_up ? 1u : 0u, static_cast<std::uint64_t>(options.multiply_path),
+                                                options.prune_last_layer ? 1u : 0u, fa.gate_up ? 1u : 0u, fa.down ? 1u : 0u,
+                                                fa.mixer_in ? 1u : 0u, fa.mixer_out ? 1u : 0u, fa.flush_k};
+    id.compute_fp = fingerprint_of(compute, 0xC0FFEEull);
+    id.precision = half ? 0u : 1u;
+    id.state_format = options.half_state ? 1u : 0u;
+    id.kv_format = 0;
+    id.dn_layers = static_cast<std::uint32_t>(dn_layers);
+    id.attn_layers = static_cast<std::uint32_t>(attn_layers);
+    id.conv_tail_elems = dn_layers != 0 ? state_conv_floats : 0;
+    id.recurrent_elems = dn_layers != 0 ? state_recurrent_floats : 0;
+    id.kv_unit_bytes = kv_layer_unit;
+    return id;
+}
+
+HostSnapshot CudaEngine::Impl::to_host(const DeviceSnapshot& snapshot, HostMemory memory) {
+    if (!snapshot.valid()) throw std::invalid_argument("to_host: the snapshot is empty");
+    if (snapshot.data()->engine_id != engine_id) throw std::invalid_argument("to_host: the snapshot was made by another engine");
+    check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
+    auto data = std::make_shared<HostSnapshot::Data>();
+    data->identity = identity();
+    const SnapshotIdentity& id = data->identity;
+    std::vector<const KvBlock*> chain;
+    for (const KvBlock* b = snapshot.data()->kv.get(); b != nullptr; b = b->parent.get()) chain.push_back(b);
+    std::reverse(chain.begin(), chain.end());
+
+    data->state_bytes = static_cast<std::size_t>(id.state_bytes());
+    std::size_t total = data->state_bytes;
+    for (const KvBlock* b : chain) {
+        HostBlock hb;
+        hb.tokens = b->tokens;
+        hb.start_position = b->start_position;
+        hb.kv_bytes = id.kv_bytes(b->tokens);
+        hb.kv_offset = total;
+        total += static_cast<std::size_t>(hb.kv_bytes);
+        data->blocks.push_back(hb);
+    }
+    data->total_bytes = total;
+    data->tokens = snapshot.tokens();
+    data->end_position = snapshot.end_position();
+    data->pinned = memory == HostMemory::Pinned;
+    data->memory = allocate_host_memory(total, data->pinned);
+    std::byte* host = data->memory.get();
+
+    if (dn_layers != 0) {
+        const DeviceSnapshot::Data& sd = *snapshot.data();
+        if (!sd.slot) throw std::logic_error("to_host: a snapshot of a model with DeltaNet layers has no state slot");
+        const std::size_t slot = sd.slot->slot;
+        const std::size_t conv_bytes = state_conv_floats * state_elem, rec_bytes = state_recurrent_floats * state_elem;
+        for (std::size_t d = 0; d < dn_layers; ++d) {
+            const char* base = pools->slot_memory.data() + d * slot_layer_stride;
+            std::byte* out = host + d * (conv_bytes + rec_bytes);
+            check_cuda(cudaMemcpyAsync(out, base + slot * conv_bytes, conv_bytes, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "to_host state");
+            check_cuda(cudaMemcpyAsync(out + conv_bytes, base + slot_recurrent_offset + slot * rec_bytes, rec_bytes, cudaMemcpyDeviceToHost, stream),
+                       "cudaMemcpyAsync", "to_host state");
+        }
+    }
+    const char* heap = pools->kv_memory.data();
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        const KvBlock& b = *chain[i];
+        const std::size_t per_layer = kv_layer_bytes(b.tokens);
+        const std::size_t used = static_cast<std::size_t>(b.tokens) * kv_layer_unit;
+        std::byte* out = host + data->blocks[i].kv_offset;
+        for (std::size_t a = 0; a < attn_layers; ++a) {
+            const char* keys = heap + b.offset + a * 2 * per_layer;
+            check_cuda(cudaMemcpyAsync(out + (2 * a) * used, keys, used, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "to_host keys");
+            check_cuda(cudaMemcpyAsync(out + (2 * a + 1) * used, keys + per_layer, used, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "to_host values");
+        }
+    }
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "to_host");
+    return HostSnapshot(std::move(data));
+}
+
+DeviceSnapshot CudaEngine::Impl::to_device(const HostSnapshot& snapshot) {
+    if (!snapshot.valid()) throw std::invalid_argument("to_device: the snapshot is empty");
+    const HostSnapshot::Data& hd = *snapshot.data();
+    const SnapshotIdentity mine = identity();
+    if (!(hd.identity == mine)) {
+        throw SnapshotFileError("to_device: the host snapshot is not of this engine's kind (another model, weights, geometry, precision, "
+                                "state storage or compute options)");
+    }
+    check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
+    // Slot first, then the blocks; whatever fails, the leases and blocks made so far give their memory back.
+    std::shared_ptr<SlotLease> lease;
+    if (dn_layers != 0) {
+        std::vector<std::uint32_t> taken;
+        if (!pools->take_slots(1, taken)) {
+            std::lock_guard<std::mutex> guard(pools->mutex);
+            throw BudgetExceeded("to_device needs a state slot (" + mib(pools->slot_bytes) + ") but only " + std::to_string(pools->free_slots.size()) + " of " +
+                                 std::to_string(pools->slots_total) + " are free; release snapshots, or raise the memory budget or state_slots");
+        }
+        lease = std::make_shared<SlotLease>(pools, taken[0]);
+    }
+    std::shared_ptr<const KvBlock> parent;
+    std::uint64_t chain_tokens = 0;
+    char* const heap = pools->kv_memory.data();
+    const std::byte* host = hd.memory.get();
+    for (const HostBlock& hb : hd.blocks) {
+        auto block = std::make_shared<KvBlock>();
+        block->pools = pools;
+        block->tokens = hb.tokens;
+        block->start_position = hb.start_position;
+        chain_tokens += hb.tokens;
+        block->chain_tokens = chain_tokens;
+        block->parent = parent;
+        const std::size_t need = attn_layers == 0 ? 0 : kv_block_bytes(hb.tokens);
+        if (need != 0) {
+            std::size_t offset = 0;
+            if (!pools->heap_alloc(need, offset)) {
+                const std::size_t largest = pools->largest_free();
+                std::lock_guard<std::mutex> guard(pools->mutex);
+                throw BudgetExceeded("to_device needs " + mib(need) + " of keys and values for a block of " + std::to_string(hb.tokens) +
+                                     " tokens but the largest free block is " + mib(largest) + " (" + mib(pools->kv_capacity - pools->kv_in_use) +
+                                     " free of " + mib(pools->kv_capacity) + "); release snapshots or raise the memory budget");
+            }
+            block->offset = offset;
+            block->bytes = need;
+            check_cuda(cudaMemsetAsync(heap + offset, 0, need, stream), "cudaMemsetAsync", "to_device");
+            const std::size_t per_layer = kv_layer_bytes(hb.tokens);
+            const std::size_t used = static_cast<std::size_t>(hb.tokens) * kv_layer_unit;
+            for (std::size_t a = 0; a < attn_layers; ++a) {
+                char* keys = heap + offset + a * 2 * per_layer;
+                check_cuda(cudaMemcpyAsync(keys, host + hb.kv_offset + (2 * a) * used, used, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync", "to_device keys");
+                check_cuda(cudaMemcpyAsync(keys + per_layer, host + hb.kv_offset + (2 * a + 1) * used, used, cudaMemcpyHostToDevice, stream),
+                           "cudaMemcpyAsync", "to_device values");
+            }
+        }
+        parent = std::move(block);
+    }
+    if (lease) {
+        const std::size_t slot = lease->slot;
+        const std::size_t conv_bytes = state_conv_floats * state_elem, rec_bytes = state_recurrent_floats * state_elem;
+        for (std::size_t d = 0; d < dn_layers; ++d) {
+            char* base = pools->slot_memory.data() + d * slot_layer_stride;
+            const std::byte* in = host + d * (conv_bytes + rec_bytes);
+            check_cuda(cudaMemcpyAsync(base + slot * conv_bytes, in, conv_bytes, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync", "to_device state");
+            check_cuda(cudaMemcpyAsync(base + slot_recurrent_offset + slot * rec_bytes, in + conv_bytes, rec_bytes, cudaMemcpyHostToDevice, stream),
+                       "cudaMemcpyAsync", "to_device state");
+        }
+    }
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "to_device");
+    auto out = std::make_shared<DeviceSnapshot::Data>();
+    out->engine_id = engine_id;
+    out->slot = lease;
+    out->kv = parent;
+    out->slot_bytes = lease ? pools->slot_bytes : 0;
+    return DeviceSnapshot(std::move(out));
+}
+
+HostSnapshot CudaEngine::to_host(const DeviceSnapshot& snapshot, HostMemory memory) {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex);
+    return impl_->to_host(snapshot, memory);
+}
+
+DeviceSnapshot CudaEngine::to_device(const HostSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex);
+    return impl_->to_device(snapshot);
+}
+
+void CudaEngine::save(const DeviceSnapshot& snapshot, const std::filesystem::path& path) {
+    const HostSnapshot host = to_host(snapshot, HostMemory::Pageable);
+    write_snapshot_file(*host.data(), path);
+}
+
+void CudaEngine::save(const HostSnapshot& snapshot, const std::filesystem::path& path) {
+    if (!snapshot.valid()) throw std::invalid_argument("save: the snapshot is empty");
+    write_snapshot_file(*snapshot.data(), path);
+}
+
+HostSnapshot CudaEngine::load_host(const std::filesystem::path& path) {
+    SnapshotIdentity id;
+    {
+        std::lock_guard<std::mutex> lock(impl_->run_mutex);
+        check_cuda(cudaSetDevice(impl_->options.device), "cudaSetDevice");
+        id = impl_->identity();
+    }
+    return read_snapshot_file(path, id, false);
+}
+
+DeviceSnapshot CudaEngine::load(const std::filesystem::path& path) { return to_device(load_host(path)); }
+
+std::uint64_t CudaEngine::state_saturations() const {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex);
+    return impl_->saturations_seen;
+}
+
+std::uint64_t CudaEngine::weight_fingerprint() {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex);
+    check_cuda(cudaSetDevice(impl_->options.device), "cudaSetDevice");
+    return impl_->identity().weight_fp;
+}
+
+// ---- HostSnapshot --------------------------------------------------------------------------------------------
+
+std::uint64_t HostSnapshot::tokens() const { return data_ ? data_->tokens : 0; }
+std::uint64_t HostSnapshot::end_position() const { return data_ ? data_->end_position : 0; }
+std::size_t HostSnapshot::bytes() const { return data_ ? data_->total_bytes : 0; }
+std::size_t HostSnapshot::chain_length() const { return data_ ? data_->blocks.size() : 0; }
+bool HostSnapshot::pinned() const { return data_ && data_->pinned; }
+std::span<const std::byte> HostSnapshot::state_bytes() const {
+    return data_ ? std::span<const std::byte>(data_->memory.get(), data_->state_bytes) : std::span<const std::byte>();
 }
 
 } // namespace sepal::cuda

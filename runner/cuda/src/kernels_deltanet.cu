@@ -84,8 +84,9 @@ struct WaveArgs {
     std::size_t mixed_stride, z_stride, b_stride, a_stride;
     const RowSpan* rows;
     const std::uint32_t *in_slots, *out_slots, *wave;
-    float* conv_tails;
-    float* recurrent;
+    void* conv_tails;  // float, or __half when the kernel is built for binary16 state storage
+    void* recurrent;
+    unsigned* saturations; // counts values that did not fit binary16 on a store (null: not counted)
     void* out;
     std::size_t out_stride;
     float* tap_conv;
@@ -196,12 +197,35 @@ __device__ __forceinline__ void token_pass(Tile& t, Acc& acc_q, Acc& acc_k, cons
     }
 }
 
+// ---- state storage: float32, or binary16 (computation stays float32: widen on load, round on store) ----
+
+__device__ __forceinline__ float load_state(const void* base, std::size_t index, std::true_type /*half*/) {
+    return __half2float(static_cast<const __half*>(base)[index]);
+}
+__device__ __forceinline__ float load_state(const void* base, std::size_t index, std::false_type) {
+    return static_cast<const float*>(base)[index];
+}
+// Round to nearest even; a value beyond the binary16 range is clamped to +-65504 (never infinity) and counted.
+__device__ __forceinline__ void store_state(void* base, std::size_t index, float value, unsigned* saturations, std::true_type) {
+    constexpr float kMax = 65504.0f;
+    float v = value;
+    if (v > kMax || v < -kMax) {
+        v = v > 0.0f ? kMax : -kMax;
+        if (saturations != nullptr) atomicAdd(saturations, 1u);
+    }
+    static_cast<__half*>(base)[index] = __float2half_rn(v);
+}
+__device__ __forceinline__ void store_state(void* base, std::size_t index, float value, unsigned*, std::false_type) {
+    static_cast<float*>(base)[index] = value;
+}
+
 // ---- the scan kernel ----
 
 // TAPS: the number of conv taps the kernel is built for; kMaxTaps means any number up to that (a runtime count).
-template <class OutT, int TAPS>
+template <class OutT, int TAPS, bool HS>
 __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const WaveArgs args) {
     extern __shared__ float smem[];
+    constexpr std::integral_constant<bool, HS> kHalfState{};
 
     const std::uint32_t head = blockIdx.x;
     const std::uint32_t row = args.wave[blockIdx.y];
@@ -244,8 +268,8 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
         const bool quad_valid = valid[0];
         Tile tile;
         {
-            const float* source = in_slot == kNoSlot ? nullptr
-                                                     : args.recurrent + (static_cast<std::size_t>(in_slot) * args.value_heads + head) * dk * dv;
+            const std::size_t source_base = (static_cast<std::size_t>(in_slot) * args.value_heads + head) * dk * dv;
+            const bool has_source = in_slot != kNoSlot;
             #pragma unroll
             for (int m = 0; m < kGroups; ++m) {
                 #pragma unroll
@@ -253,7 +277,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                     const std::uint32_t i = 4u * static_cast<std::uint32_t>(p + kKeyLanes * m + 0) + static_cast<std::uint32_t>(c);
                     #pragma unroll
                     for (int cc = 0; cc < kCols; ++cc) {
-                        tile.s[cc][m * 4 + c] = (source != nullptr && valid[cc] && i < dk) ? source[i * dv + col[cc]] : 0.0f;
+                        tile.s[cc][m * 4 + c] = (has_source && valid[cc] && i < dk) ? load_state(args.recurrent, source_base + i * dv + col[cc], kHalfState) : 0.0f;
                     }
                 }
             }
@@ -398,7 +422,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                     for (int i = 0; i < kGroups * 4; ++i) tile.s[cc][i] = __fmul_rn(tile.s[cc][i], g_end);
                 }
             }
-            float* target = args.recurrent + (static_cast<std::size_t>(out_slot) * args.value_heads + head) * dk * dv;
+            const std::size_t target_base = (static_cast<std::size_t>(out_slot) * args.value_heads + head) * dk * dv;
             #pragma unroll
             for (int m = 0; m < kGroups; ++m) {
                 #pragma unroll
@@ -407,7 +431,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                     if (i < dk) {
                         #pragma unroll
                         for (int cc = 0; cc < kCols; ++cc) {
-                            if (valid[cc]) target[i * dv + col[cc]] = tile.s[cc][m * 4 + c];
+                            if (valid[cc]) store_state(args.recurrent, target_base + i * dv + col[cc], tile.s[cc][m * 4 + c], args.saturations, kHalfState);
                         }
                     }
                 }
@@ -485,7 +509,7 @@ __global__ void __launch_bounds__(128 + kAuxThreads) deltanet_scan_kernel(const 
                             const std::uint32_t w = c0 + static_cast<std::uint32_t>(i); // position in (tail, inputs)
                             if (w < taps - 1) {
                                 if (in_slot != kNoSlot) {
-                                    x[r][i] = args.conv_tails[(static_cast<std::size_t>(in_slot) * (taps - 1) + w) * conv_dim + channel[r]];
+                                    x[r][i] = load_state(args.conv_tails, (static_cast<std::size_t>(in_slot) * (taps - 1) + w) * conv_dim + channel[r], kHalfState);
                                 }
                             } else {
                                 x[r][i] = args.mixed[static_cast<std::size_t>(span.offset + w - (taps - 1)) * args.mixed_stride + channel[r]];
@@ -723,12 +747,15 @@ struct TailArgs {
     std::size_t mixed_stride;
     const RowSpan* rows;
     const std::uint32_t *in_slots, *out_slots, *wave;
-    float* conv_tails;
+    void* conv_tails;
+    unsigned* saturations;
 };
 
 // Thread (row, channel) writes the channel's K-1 new tail values in increasing order. When a row is continued in
 // place that order reads every old value before it is overwritten.
+template <bool HS>
 __global__ void deltanet_conv_tail_kernel(const TailArgs args) {
+    constexpr std::integral_constant<bool, HS> kHalfState{};
     const std::uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= args.conv_dim) return;
     const std::uint32_t row = args.wave[blockIdx.y];
@@ -742,11 +769,11 @@ __global__ void deltanet_conv_tail_kernel(const TailArgs args) {
         float value;
         if (w < history) {
             value = in_slot == kNoSlot ? 0.0f
-                                       : args.conv_tails[(static_cast<std::size_t>(in_slot) * history + w) * args.conv_dim + channel];
+                                       : load_state(args.conv_tails, (static_cast<std::size_t>(in_slot) * history + w) * args.conv_dim + channel, kHalfState);
         } else {
             value = args.mixed[static_cast<std::size_t>(span.offset + w - history) * args.mixed_stride + channel];
         }
-        args.conv_tails[(static_cast<std::size_t>(out_slot) * history + i) * args.conv_dim + channel] = value;
+        store_state(args.conv_tails, (static_cast<std::size_t>(out_slot) * history + i) * args.conv_dim + channel, value, args.saturations, kHalfState);
     }
 }
 
@@ -778,7 +805,7 @@ void validate(const DeltaNetGeometry& g, const DeltaNetRows& rows) {
     if (rows.wave_size > 65535u) throw std::invalid_argument("deltanet: a wave of more than 65535 rows");
 }
 
-template <class OutT, int TAPS>
+template <class OutT, int TAPS, bool HS>
 void run_scan(const detail::WaveArgs& args, std::uint32_t wave_size, std::uint32_t value_heads, std::uint32_t dv,
               cudaStream_t stream) {
     const std::size_t smem_bytes =
@@ -787,7 +814,7 @@ void run_scan(const detail::WaveArgs& args, std::uint32_t wave_size, std::uint32
     static const bool configured = [] {
         constexpr int kMaxDv = static_cast<int>(kDeltaNetMaxHeadDim);
         constexpr int max_bytes = (2 * detail::stage_floats(kMaxDv) + 2 * detail::kChunk * kMaxDv) * static_cast<int>(sizeof(float));
-        check(cudaFuncSetAttribute(detail::deltanet_scan_kernel<OutT, TAPS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        check(cudaFuncSetAttribute(detail::deltanet_scan_kernel<OutT, TAPS, HS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    max_bytes),
               "cudaFuncSetAttribute");
         return true;
@@ -797,7 +824,7 @@ void run_scan(const detail::WaveArgs& args, std::uint32_t wave_size, std::uint32
     const std::uint32_t quads = (dv + detail::kCols - 1) / detail::kCols;
     const std::uint32_t scan_threads = std::max(32u, (quads * detail::kKeyLanes + 31) / 32 * 32);
     const dim3 grid(value_heads, wave_size);
-    detail::deltanet_scan_kernel<OutT, TAPS><<<grid, dim3(scan_threads + detail::kAuxThreads), smem_bytes, stream>>>(args);
+    detail::deltanet_scan_kernel<OutT, TAPS, HS><<<grid, dim3(scan_threads + detail::kAuxThreads), smem_bytes, stream>>>(args);
 }
 
 } // namespace
@@ -847,6 +874,7 @@ void launch_deltanet_scan(const DeltaNetGeometry& g, const DeltaNetWeights& w, c
     args.wave = rows.wave;
     args.conv_tails = states.conv_tails;
     args.recurrent = states.recurrent;
+    args.saturations = states.saturations;
     args.out = out;
     args.out_stride = out_stride;
     args.tap_conv = options.taps.conv_act;
@@ -854,10 +882,13 @@ void launch_deltanet_scan(const DeltaNetGeometry& g, const DeltaNetWeights& w, c
     args.tap_reads = options.taps.reads;
     args.tap_reads_stride = options.taps.reads_stride;
 
+    constexpr int kMaxTapsT = static_cast<int>(kDeltaNetMaxConvKernel);
     if (g.conv_kernel == 4) {
-        run_scan<OutT, 4>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
+        if (states.half_storage) run_scan<OutT, 4, true>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
+        else run_scan<OutT, 4, false>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
     } else {
-        run_scan<OutT, static_cast<int>(kDeltaNetMaxConvKernel)>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
+        if (states.half_storage) run_scan<OutT, kMaxTapsT, true>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
+        else run_scan<OutT, kMaxTapsT, false>(args, rows.wave_size, g.value_heads, g.value_head_dim, stream);
     }
     check(cudaGetLastError(), "deltanet scan kernel launch");
 }
@@ -886,9 +917,11 @@ void launch_deltanet_conv_tail(const DeltaNetGeometry& g, const DeltaNetInputs& 
     args.out_slots = rows.out_slots;
     args.wave = rows.wave;
     args.conv_tails = states.conv_tails;
+    args.saturations = states.saturations;
     constexpr std::uint32_t kThreads = 128;
     const dim3 grid((g.conv_dim() + kThreads - 1) / kThreads, rows.wave_size);
-    detail::deltanet_conv_tail_kernel<<<grid, dim3(kThreads), 0, stream>>>(args);
+    if (states.half_storage) detail::deltanet_conv_tail_kernel<true><<<grid, dim3(kThreads), 0, stream>>>(args);
+    else detail::deltanet_conv_tail_kernel<false><<<grid, dim3(kThreads), 0, stream>>>(args);
     check(cudaGetLastError(), "deltanet conv tail kernel launch");
 }
 

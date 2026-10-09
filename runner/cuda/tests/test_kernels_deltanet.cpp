@@ -268,19 +268,49 @@ struct JobResult {
 
 class Rig {
 public:
-    Rig(const Problem& p, std::size_t slots)
-        : p_(p),
+    /// `half_storage`: the slots are binary16 (DeltaNetStates::half_storage); set_slot rounds, get_slot widens.
+    Rig(const Problem& p, std::size_t slots, bool half_storage = false)
+        : half_storage_(half_storage),
+          p_(p),
           conv_w_(p.conv_w),
           a_log_(p.a_log),
           dt_bias_(p.dt_bias),
           norm_w_(p.norm_w),
-          tails_(slots * p.g.conv_tail_floats()),
-          states_(slots * p.g.recurrent_floats()) {
+          tails_(half_storage ? 0 : slots * p.g.conv_tail_floats()),
+          states_(half_storage ? 0 : slots * p.g.recurrent_floats()),
+          tails_h_(half_storage ? slots * p.g.conv_tail_floats() : 0),
+          states_h_(half_storage ? slots * p.g.recurrent_floats() : 0),
+          saturations_(1) {
         tails_.zero();
         states_.zero();
+        tails_h_.zero();
+        states_h_.zero();
+        saturations_.zero();
+    }
+
+    unsigned saturations() const {
+        unsigned n = 0;
+        check(cudaMemcpy(&n, saturations_.data(), sizeof n, cudaMemcpyDeviceToHost), "cudaMemcpy");
+        return n;
+    }
+
+    /// The raw binary16 words of a slot (half storage only): conv tail, recurrent state.
+    std::pair<std::vector<std::uint16_t>, std::vector<std::uint16_t>> get_slot_bits(std::uint32_t slot) {
+        std::vector<std::uint16_t> tail(p_.g.conv_tail_floats()), state(p_.g.recurrent_floats());
+        check(cudaMemcpy(tail.data(), tails_h_.data() + slot * p_.g.conv_tail_floats(), tail.size() * 2, cudaMemcpyDeviceToHost), "cudaMemcpy");
+        check(cudaMemcpy(state.data(), states_h_.data() + slot * p_.g.recurrent_floats(), state.size() * 2, cudaMemcpyDeviceToHost), "cudaMemcpy");
+        return {std::move(tail), std::move(state)};
     }
 
     void set_slot(std::uint32_t slot, const std::vector<float>& tail, const std::vector<float>& state) {
+        if (half_storage_) {
+            std::vector<__half> t(tail.size()), s(state.size());
+            for (std::size_t i = 0; i < tail.size(); ++i) t[i] = __float2half_rn(tail[i]);
+            for (std::size_t i = 0; i < state.size(); ++i) s[i] = __float2half_rn(state[i]);
+            check(cudaMemcpy(tails_h_.data() + slot * p_.g.conv_tail_floats(), t.data(), t.size() * 2, cudaMemcpyHostToDevice), "cudaMemcpy");
+            check(cudaMemcpy(states_h_.data() + slot * p_.g.recurrent_floats(), s.data(), s.size() * 2, cudaMemcpyHostToDevice), "cudaMemcpy");
+            return;
+        }
         check(cudaMemcpy(tails_.data() + slot * p_.g.conv_tail_floats(), tail.data(), tail.size() * sizeof(float),
                          cudaMemcpyHostToDevice),
               "cudaMemcpy");
@@ -291,6 +321,12 @@ public:
 
     std::pair<std::vector<float>, std::vector<float>> get_slot(std::uint32_t slot) {
         std::vector<float> tail(p_.g.conv_tail_floats()), state(p_.g.recurrent_floats());
+        if (half_storage_) {
+            const auto [tb, sb] = get_slot_bits(slot);
+            for (std::size_t i = 0; i < tail.size(); ++i) tail[i] = __half2float(std::bit_cast<__half>(tb[i]));
+            for (std::size_t i = 0; i < state.size(); ++i) state[i] = __half2float(std::bit_cast<__half>(sb[i]));
+            return {std::move(tail), std::move(state)};
+        }
         check(cudaMemcpy(tail.data(), tails_.data() + slot * p_.g.conv_tail_floats(), tail.size() * sizeof(float),
                          cudaMemcpyDeviceToHost),
               "cudaMemcpy");
@@ -367,6 +403,7 @@ public:
                               {d_proj.data() + b_off, stride},
                               {d_proj.data() + a_off, stride}};
         DeltaNetStates states{tails_.data(), states_.data()};
+        if (half_storage_) states = DeltaNetStates{tails_h_.data(), states_h_.data(), true, saturations_.data()};
         DeltaNetOptions launch;
         launch.lanes_per_column = options.lanes;
         launch.taps.conv_act = d_conv_tap.data();
@@ -442,9 +479,12 @@ public:
     }
 
 private:
+    bool half_storage_ = false;
     const Problem& p_;
     DeviceBuffer<float> conv_w_, a_log_, dt_bias_, norm_w_;
     DeviceBuffer<float> tails_, states_;
+    DeviceBuffer<__half> tails_h_, states_h_;
+    DeviceBuffer<unsigned> saturations_;
     bool pads_intact_ = true;
 };
 
@@ -1050,4 +1090,85 @@ SEPAL_TEST(edge, rejects_bad_geometry) {
     g.value_heads = 4;
     g.key_head_dim = 129;
     CHECK_THROWS(sepal::cuda::launch_deltanet_conv_tail(g, inputs, rows, states, nullptr), std::invalid_argument);
+}
+
+// ---- storage: the state in binary16 ----
+
+// Rounding happens at the store and nowhere else: a row run with binary16 slots from a state that binary16 holds exactly
+// gives the very bits the float32 slots give, and what it stores is the float32 result rounded to nearest even.
+SEPAL_TEST(storage, half_slots_are_the_float_result_rounded_at_the_store) {
+    for (const char* name : {"tiny", "0.8b"}) {
+        const sepal::ModelConfig cfg = std::string(name) == "tiny" ? sepal::tiny_test_config() : preset("0.8b");
+        const Problem p = make_problem(cfg, 301);
+        const std::size_t len = std::string(name) == "tiny" ? 41 : 150;
+        // First row from nothing, then a second row continuing the first one's stored state, then a third.
+        const RowData r1 = make_row(p, len, 302, false), r2 = make_row(p, len / 2 + 1, 303, false), r3 = make_row(p, 7, 304, false);
+        Rig f(p, 4), h(p, 4, true);
+        const auto o1f = f.run({{&r1, kNoSlot, 0}});
+        const auto o1h = h.run({{&r1, kNoSlot, 0}});
+        CHECK(same_bits(o1f[0].out, o1h[0].out)); // the row's own outputs never see the rounding
+        const auto [tf, sf] = f.get_slot(0);
+        const auto [tb, sb] = h.get_slot_bits(0);
+        for (std::size_t i = 0; i < sf.size(); ++i) {
+            if (sb[i] != std::bit_cast<std::uint16_t>(__float2half_rn(sf[i]))) { CHECK(false); break; }
+        }
+        for (std::size_t i = 0; i < tf.size(); ++i) {
+            if (tb[i] != std::bit_cast<std::uint16_t>(__float2half_rn(tf[i]))) { CHECK(false); break; }
+        }
+        // Float32 slots holding the widened values stand in for the binary16 slots.
+        const auto [th, sh] = h.get_slot(0);
+        f.set_slot(1, th, sh);
+        const auto o2f = f.run({{&r2, 1, 2}});
+        const auto o2h = h.run({{&r2, 0, 1}});
+        CHECK(same_bits(o2f[0].out, o2h[0].out));
+        const auto [t2f, s2f] = f.get_slot(2);
+        const auto [t2b, s2b] = h.get_slot_bits(1);
+        bool all = true;
+        for (std::size_t i = 0; i < s2f.size(); ++i) all = all && s2b[i] == std::bit_cast<std::uint16_t>(__float2half_rn(s2f[i]));
+        for (std::size_t i = 0; i < t2f.size(); ++i) all = all && t2b[i] == std::bit_cast<std::uint16_t>(__float2half_rn(t2f[i]));
+        CHECK(all);
+        // In place (read and write the same slot) and a row with an out slot but no in slot both work.
+        const auto [t2h, s2h] = h.get_slot(1);
+        f.set_slot(3, t2h, s2h);
+        const auto o3f = f.run({{&r3, 3, 3}});
+        const auto o3h = h.run({{&r3, 1, 1}});
+        CHECK(same_bits(o3f[0].out, o3h[0].out));
+        CHECK_EQ(h.saturations(), 0u);
+        std::printf("[measure] storage %s: binary16 slots = float32 result rounded at the store, outputs equal bit for bit\n", name);
+    }
+}
+
+// A value beyond the binary16 range is clamped to +-65504, never infinity, and counted; the same input with float32 slots
+// really does hold values beyond the range.
+SEPAL_TEST(storage, values_beyond_the_range_are_clamped_and_counted) {
+    const Problem p = make_problem(sepal::tiny_test_config(), 311);
+    RowData big = make_row(p, 24, 312, false);
+    for (std::size_t t = 0; t < big.len; ++t) {
+        // large positive v channels: SiLU keeps them, the state grows to about beta * v
+        for (std::size_t c = 2 * p.g.key_dim(); c < p.conv_dim; ++c) big.mixed[t * p.conv_dim + c] = 4.0e6f;
+    }
+    Rig f(p, 2), h(p, 2, true);
+    f.run({{&big, kNoSlot, 0}});
+    h.run({{&big, kNoSlot, 0}});
+    const auto [tf, sf] = f.get_slot(0);
+    float worst = 0.0f;
+    for (const float v : sf) worst = std::max(worst, std::fabs(v));
+    CHECK(worst > 65504.0f);
+    const auto [tb, sb] = h.get_slot_bits(0);
+    float worst_h = 0.0f;
+    for (const std::uint16_t b : sb) {
+        const float v = __half2float(std::bit_cast<__half>(b));
+        CHECK(std::isfinite(v));
+        worst_h = std::max(worst_h, std::fabs(v));
+    }
+    CHECK_EQ(worst_h, 65504.0f);
+    CHECK(h.saturations() > 0);
+    // The conv tail holds the raw inputs (4e6 here): clamped as well.
+    for (const std::uint16_t b : tb) CHECK(std::isfinite(__half2float(std::bit_cast<__half>(b))));
+    (void)tf;
+    // An in-range input counts nothing.
+    Rig h2(p, 2, true);
+    const RowData ok = make_row(p, 24, 313, false);
+    h2.run({{&ok, kNoSlot, 0}});
+    CHECK_EQ(h2.saturations(), 0u);
 }

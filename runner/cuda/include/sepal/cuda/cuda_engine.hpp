@@ -25,6 +25,14 @@
 // must not be destroyed while a call is running, and all of an engine's calls use its own CUDA device whichever
 // thread makes them.
 //
+// Snapshot tiers. A snapshot lives on the device (DeviceSnapshot). `to_host` copies it into host memory (HostSnapshot,
+// pageable or pinned), `save` writes it to a file, `load_host` reads a file into host memory and `to_device` / `load`
+// bring it back as a DeviceSnapshot that can be a parent like any other. Every step is a byte copy of what the engine
+// stores (never a conversion), so a promoted snapshot continues with the very bits the original does. A chain (a
+// snapshot whose keys and values continue its parent's) is saved with all of its ancestors' keys and values, block by
+// block, so it comes back as the same chain. A file is checked in full before anything is allocated or uploaded; a file
+// that is truncated, corrupted or made by another model, geometry or storage setting is refused (SnapshotFileError).
+//
 // Precision. F16: weights, activations that feed a multiply and the keys and values are binary16, the residual
 // stream, multiply outputs and states are float32 (conventions in src/device.hpp). F32: all float32.
 //
@@ -42,6 +50,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -115,6 +124,15 @@ struct EngineOptions {
     /// DeltaNet state slots (one slot holds every DeltaNet layer's state of one row). 0 gives the slots 40% of the
     /// memory left after the weights and call buffers, and the keys and values the rest.
     std::size_t state_slots = 0;
+    /// Keep the DeltaNet state of snapshots (recurrent state and conv tail) in binary16 instead of float32, which halves
+    /// the slots. Computation stays float32: a row widens the state it continues when it loads it and rounds (to nearest
+    /// even) the state it leaves. The state a row hands to a child row of the SAME call goes through the same slot and so
+    /// through the same rounding as a stored one: in strict mode a branch run with its state and the same branch run from
+    /// its stored snapshot still agree bit for bit. A value beyond +-65504 is clamped (not made infinite) and counted
+    /// (`CudaEngine::state_saturations`). The row's own outputs are unaffected; only rows that continue a stored or handed-over
+    /// state see the rounding. README.md, "Snapshot density", has the measured cost. Off by default. Snapshot files record this
+    /// setting and are refused by an engine with the other one.
+    bool half_state = false;
 };
 
 /// A parent that is another row of the same call, by its index in the call.
@@ -136,6 +154,42 @@ public:
     std::uint64_t end_position() const;
     /// Device bytes this snapshot holds on its own (its slot and its own keys and values), not its ancestors'.
     std::size_t own_bytes() const;
+    const std::shared_ptr<const Data>& data() const noexcept { return data_; }
+
+private:
+    std::shared_ptr<const Data> data_;
+};
+
+/// A file is not a snapshot of this engine: unreadable, truncated, corrupted, of another version, or made by another model,
+/// geometry or storage setting. what() says which check refused it. Nothing is allocated on the device before the checks.
+class SnapshotFileError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+/// Where `to_host` puts a snapshot. Pinned memory copies faster and cannot be paged out, and is a scarce resource.
+enum class HostMemory { Pageable, Pinned };
+
+/// A snapshot in host memory: the engine's own bytes for the DeltaNet state (as stored: float32 or binary16 by
+/// `half_state`) and for the keys and values of the whole chain, block by block. Immutable, reference counted, cheap to
+/// copy, independent of the engine and of the device (it may outlive both). A default-constructed handle is empty.
+class HostSnapshot {
+public:
+    struct Data;
+    HostSnapshot() = default;
+    explicit HostSnapshot(std::shared_ptr<const Data> data) : data_(std::move(data)) {}
+    bool valid() const noexcept { return data_ != nullptr; }
+    /// Tokens of the whole chain, as DeviceSnapshot::tokens.
+    std::uint64_t tokens() const;
+    std::uint64_t end_position() const;
+    /// Host bytes held: the state and the keys and values of every block of the chain.
+    std::size_t bytes() const;
+    /// The blocks of the chain, oldest first (1 for a snapshot that continues nothing).
+    std::size_t chain_length() const;
+    bool pinned() const;
+    /// The DeltaNet state as stored, layer by layer: [conv tail, recurrent state] of each DeltaNet layer, float32 or
+    /// binary16 (see EngineOptions::half_state). For diagnostics; empty for a model without DeltaNet layers.
+    std::span<const std::byte> state_bytes() const;
     const std::shared_ptr<const Data>& data() const noexcept { return data_; }
 
 private:
@@ -221,6 +275,34 @@ public:
     EngineMemory memory() const;
     /// Resets the pools' peak counters to their present use.
     void reset_peaks();
+
+    // ---- snapshot tiers (see the header comment) ----
+    // All of these take the engine's call lock: they wait for a call in progress and one runs at a time.
+
+    /// Copies a snapshot, with the keys and values of its ancestors, into host memory. std::invalid_argument for an empty
+    /// handle or a snapshot of another engine.
+    HostSnapshot to_host(const DeviceSnapshot& snapshot, HostMemory memory = HostMemory::Pageable);
+    /// Brings a host snapshot back to the device: a new slot and new heap blocks (the chain's blocks are re-created
+    /// one for one). BudgetExceeded, with nothing taken, when the pools cannot hold it; SnapshotFileError when the snapshot
+    /// is not one of this engine's kind (another model, geometry or storage setting).
+    DeviceSnapshot to_device(const HostSnapshot& snapshot);
+    /// Writes a snapshot to `path` (written under a temporary name and renamed, so a failure leaves no half file; an existing
+    /// file is replaced). The same bytes always give the same file. SnapshotFileError on an I/O failure.
+    void save(const DeviceSnapshot& snapshot, const std::filesystem::path& path);
+    void save(const HostSnapshot& snapshot, const std::filesystem::path& path);
+    /// Reads and validates a file into host memory. Untrusted input: the size of every allocation is bounded by the size of the
+    /// file, every length and offset is checked before it is used, and a hash over the header and one over the payload are
+    /// verified. SnapshotFileError for anything wrong with the file, whatever it is.
+    HostSnapshot load_host(const std::filesystem::path& path);
+    /// load_host + to_device.
+    DeviceSnapshot load(const std::filesystem::path& path);
+
+    /// Values the binary16 state storage had to clamp to +-65504 since the engine was made (0 unless `half_state`). Any
+    /// non-zero value means the state left the binary16 range: do not use `half_state` for that workload.
+    std::uint64_t state_saturations() const;
+    /// Hash of the weights as they sit on the device (what goes into a snapshot file as the weight fingerprint). Computed on
+    /// first use, a few milliseconds.
+    std::uint64_t weight_fingerprint();
 
     /// While on, every phase of a call is timed with the stream synchronised around it (which slows the call
     /// down); last_profile() then has the times of the last call. Off by default.

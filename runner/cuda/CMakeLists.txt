@@ -158,7 +158,7 @@ target_link_libraries(sepal_cuda_kernel_deltanet_tests PRIVATE sepal_cuda_deltan
 add_executable(sepal-cuda-deltanet-bench tools/bench_deltanet.cpp)
 target_link_libraries(sepal-cuda-deltanet-bench PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
 
-foreach(suite stages growth geometry continuation waves invariance edge)
+foreach(suite stages growth geometry continuation waves invariance edge storage)
   add_test(NAME cuda_deltanet_${suite} COMMAND sepal_cuda_kernel_deltanet_tests ${suite})
   set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900)
 endforeach()
@@ -202,7 +202,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu src/gemm_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/engine_kernels.cu src/gemm_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
@@ -237,12 +237,13 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_attack_geometry.cpp
   tests/test_cuda_engine_soak.cpp
   tests/test_cuda_engine_real_alerts.cpp
+  tests/test_cuda_engine_snapshots.cpp
   ../tests/test_main.cpp
 )
-target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
+target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests src)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
