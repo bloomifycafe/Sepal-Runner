@@ -303,13 +303,19 @@ struct CudaEngine::Impl {
     PhaseTimes profile;
     cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
 
-    ~Impl() {
+    // The stream, events and cuBLAS handle. Also called when the constructor fails: a destructor does not run for an
+    // object whose constructor threw, and the handle alone holds megabytes of device memory.
+    void release_handles() noexcept {
         if (stream != nullptr) cudaStreamSynchronize(stream);
         if (ev_start != nullptr) cudaEventDestroy(ev_start);
         if (ev_stop != nullptr) cudaEventDestroy(ev_stop);
         if (blas != nullptr) cublasDestroy(blas);
         if (stream != nullptr) cudaStreamDestroy(stream);
+        ev_start = ev_stop = nullptr;
+        blas = nullptr;
+        stream = nullptr;
     }
+    ~Impl() { release_handles(); }
 
     Impl(const ModelConfig& cfg, const TensorSource& source, const EngineOptions& opts);
 
@@ -480,6 +486,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     if (options.gemm_rows != 0 && options.gemm_rows % 8 != 0) {
         throw std::invalid_argument("EngineOptions: gemm_rows must be 0 (natural) or a multiple of 8");
     }
+    // The last-layer pruning gathers rows of the operand type four bytes at a time; an odd float16 hidden size cannot.
+    if ((H * elem_bytes) % 4 != 0) options.prune_last_layer = false;
     cap_rows = options.gemm_rows == 0 ? options.max_call_tokens : align_up(options.max_call_tokens, options.gemm_rows);
     // Room for the rows the last layer computes in full (see prune_last_layer); a call with more readouts runs unpruned.
     {
@@ -533,6 +541,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     memory_stats.budget_bytes = budget;
 
+    try {
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
     check_cuda(cudaEventCreate(&ev_start), "cudaEventCreate");
     check_cuda(cudaEventCreate(&ev_stop), "cudaEventCreate");
@@ -601,6 +610,10 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     memory_stats.slot_bytes = slot_bytes_each;
     check_cuda(cudaMemGetInfo(&free_now, &total), "cudaMemGetInfo");
     memory_stats.device_free_min = std::min(memory_stats.device_free_min, free_now);
+    } catch (...) {
+        release_handles();
+        throw;
+    }
 }
 
 // Y[t, n] = sum_k X[t, k] W[n, k] for `rows` rows. Natural mode: one multiply. Strict mode: `rows` is a multiple of
@@ -686,6 +699,8 @@ private:
 
 std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> rows) {
     std::lock_guard<std::mutex> lock(run_mutex);
+    // The calling thread may not be the one that made the engine; the CUDA device is a per-thread setting.
+    check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
     const auto wall_start = std::chrono::steady_clock::now();
     if (profiling) profile = PhaseTimes{};
     std::vector<EngineRowResult> results(rows.size());
@@ -1017,6 +1032,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             const AttentionRows full_rows{d_spans, d_descs, reinterpret_cast<const KvSegment*>(tables + off_segments[w.kind_index]),
                                           nullptr, u32(rows.size()), max_row_tokens};
             const AttentionRows u_rows{d_spans_u, d_descs_u, d_segs_u, nullptr, u32(ru), 1};
+            // Keys and values of every token here; queries and gates of the read-out tokens further down. In strict mode the
+            // unpruned pass runs these same two multiplies (see the last layer below), so pruning changes no bit.
             const char* w_kv = static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes;
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
@@ -1238,19 +1255,23 @@ DeviceInfo CudaEngine::device_info() const { return impl_->info; }
 
 EngineMemory CudaEngine::memory() const {
     Impl& s = *impl_;
-    EngineMemory m = s.memory_stats;
+    // memory_stats is written here, so concurrent callers (and the pools' users) are serialised on the pools' mutex.
+    EngineMemory m;
     {
         std::lock_guard<std::mutex> lock(s.pools->mutex);
+        m = s.memory_stats;
         m.slots_in_use = s.pools->slots_in_use;
         m.slots_peak = s.pools->slots_peak;
         m.kv_in_use_bytes = s.pools->kv_in_use;
         m.kv_peak_bytes = s.pools->kv_peak;
-    }
-    m.kv_largest_free_bytes = s.pools->largest_free();
-    std::size_t free_now = 0, total = 0;
-    if (cudaMemGetInfo(&free_now, &total) == cudaSuccess) {
-        m.device_free_min = std::min(m.device_free_min, free_now);
-        s.memory_stats.device_free_min = m.device_free_min;
+        std::size_t largest = 0;
+        for (const auto& [offset, size] : s.pools->free_blocks) largest = std::max(largest, size);
+        m.kv_largest_free_bytes = largest;
+        std::size_t free_now = 0, total = 0;
+        if (cudaMemGetInfo(&free_now, &total) == cudaSuccess) {
+            m.device_free_min = std::min(m.device_free_min, free_now);
+            s.memory_stats.device_free_min = m.device_free_min;
+        }
     }
     return m;
 }
@@ -1266,6 +1287,9 @@ void CudaEngine::set_profiling(bool on) {
     impl_->profiling = on;
 }
 
-PhaseTimes CudaEngine::last_profile() const { return impl_->profile; }
+PhaseTimes CudaEngine::last_profile() const {
+    std::lock_guard<std::mutex> lock(impl_->run_mutex); // waits for a call in progress: the profile is written by run()
+    return impl_->profile;
+}
 
 } // namespace sepal::cuda

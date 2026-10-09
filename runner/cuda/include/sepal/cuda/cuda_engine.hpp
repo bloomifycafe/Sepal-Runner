@@ -17,6 +17,14 @@
 // the engine stays usable. Snapshots keep their slot and their keys and values (and, through the keys and values,
 // the rows they continue) alive; the last handle's destruction returns the memory.
 //
+// Threads. `run` may be called from any number of threads on one engine: an internal mutex serialises the calls (one
+// call at a time uses the device; a second caller waits for the first and its results do not depend on the wait).
+// `memory`, `set_profiling` and `last_profile` may be called at any time from any thread; `last_profile` and
+// `set_profiling` wait for a call in progress. A DeviceSnapshot handle may be copied, used as a parent and destroyed
+// on any thread, also while a call that does not own it is running, and may outlive the engine. The engine itself
+// must not be destroyed while a call is running, and all of an engine's calls use its own CUDA device whichever
+// thread makes them.
+//
 // Precision. F16: weights, activations that feed a multiply and the keys and values are binary16, the residual
 // stream, multiply outputs and states are float32 (conventions in src/device.hpp). F32: all float32.
 //
