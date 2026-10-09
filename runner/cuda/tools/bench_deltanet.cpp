@@ -3,11 +3,11 @@
 //   sepal-cuda-deltanet-bench [--presets 0.8b,2b] [--reps 30] [--device 0]
 //
 // Shapes: (a) 16 rows x 640 tokens; (b) 1 row x 4096 tokens; (c) 8 rows x 640 tokens in a first wave and 64 rows x 27
-// tokens in a second wave (alert-shaped: states plus short branches that continue them, 8 per state). Random inputs,
-// the output of the layer is binary16 (the input of the out_proj multiply). Each repetition is timed with CUDA events
-// around the launches and ends with a wait for the device; the table reports the MINIMUM over the repetitions,
-// because other processes share the GPU and the median is noisy. For each shape the thread mapping
-// (lanes per column) is measured at 1, 2, 4 and 8 and as chosen automatically.
+// tokens in a second wave (alert-shaped: states plus short branches that continue them, 8 per state); (d) 1 row x 600
+// and (e) 1 row x 2048 tokens, the single-row calls of the engine benchmark. Random inputs, the output of the layer is
+// binary16 (the input of the out_proj multiply). Each repetition is timed with CUDA events around the launches and
+// ends with a wait for the device; the table reports the MINIMUM over the repetitions, because other processes share
+// the GPU and the median is noisy.
 
 #include <algorithm>
 #include <cstdint>
@@ -192,6 +192,8 @@ int main(int argc, char** argv) {
             {"(a) 16 x 640", std::vector<std::uint32_t>(16, 640), {}},
             {"(b) 1 x 4096", {4096}, {}},
             {"(c) 8 x 640 + 64 x 27", std::vector<std::uint32_t>(8, 640), std::vector<std::uint32_t>(64, 27)},
+            {"(d) 1 x 600", {600}, {}},
+            {"(e) 1 x 2048", {2048}, {}},
         };
         for (const std::string& name : options.presets) {
             const auto preset = sepal::find_preset(name);
@@ -208,24 +210,12 @@ int main(int argc, char** argv) {
             g.rms_norm_eps = preset->rms_norm_eps;
             std::printf("\n%s: %u key heads, %u value heads, dk %u, dv %u, K %u; per layer, ms\n", name.c_str(),
                         g.key_heads, g.value_heads, g.key_head_dim, g.value_head_dim, g.conv_kernel);
-            std::printf("%-24s %7s %6s | %9s %9s %9s | %12s\n", "shape", "tokens", "lanes", "scan", "conv tail", "total",
-                        "us / 1k tok");
+            std::printf("%-24s %7s | %9s %9s %9s | %12s\n", "shape", "tokens", "scan", "conv tail", "total", "us / 1k tok");
             for (const Shape& shape : shapes) {
-                double best_total = 1e30;
-                int best_lanes = 0;
-                for (const int lanes : {0, 1, 2, 4, 8}) {
-                    std::size_t tokens = 0;
-                    const Timing t = run_shape(g, shape, lanes, options.reps, &tokens);
-                    std::printf("%-24s %7zu %6s | %9.3f %9.3f %9.3f | %12.1f\n", shape.label, tokens,
-                                lanes == 0 ? "auto" : std::to_string(lanes).c_str(), t.scan_ms, t.tail_ms, t.total_ms,
-                                1000.0 * t.total_ms / (static_cast<double>(tokens) / 1000.0) / 1000.0);
-                    if (lanes != 0 && t.total_ms < best_total) {
-                        best_total = t.total_ms;
-                        best_lanes = lanes;
-                    }
-                }
-                std::printf("%-24s fastest fixed mapping: %d lanes per column, %.3f ms\n", shape.label, best_lanes,
-                            best_total);
+                std::size_t tokens = 0;
+                const Timing t = run_shape(g, shape, 0, options.reps, &tokens);
+                std::printf("%-24s %7zu | %9.3f %9.3f %9.3f | %12.1f\n", shape.label, tokens, t.scan_ms, t.tail_ms,
+                            t.total_ms, 1000.0 * t.total_ms / (static_cast<double>(tokens) / 1000.0) / 1000.0);
             }
         }
         return 0;

@@ -660,11 +660,20 @@ void continuation_for(const Problem& p, std::size_t total, const std::vector<std
         reads.insert(reads.end(), results[1].reads.begin(), results[1].reads.end());
         const auto [tail, state] = rig.get_slot(2);
         const auto [mid_tail, mid_state] = rig.get_slot(1);
-        const bool ok = same_bits(out, reference_run.result.out) && same_bits(conv_act, reference_run.result.conv_act) &&
-                        same_bits(reads, reference_run.result.reads) && same_bits(tail, reference_run.tail) &&
-                        same_bits(state, reference_run.state);
-        if (!ok) std::printf("[measure] continuation %zu + %zu of %s: NOT bit-identical\n", a, total - a, p.cfg.name.c_str());
-        CHECK(ok);
+        // The convolution, the normalisation and the conv tail do not depend on where a row is cut: bit-identical.
+        // The recurrence keeps its state scaled by an outstanding decay factor that restarts at the cut, so out, reads
+        // and the state agree with the uncut row to rounding only (the cut row is bit-identical to ITSELF in every
+        // batch, which the invariance and waves suites check).
+        const bool exact = same_bits(conv_act, reference_run.result.conv_act) && same_bits(tail, reference_run.tail);
+        const Diff d_out = compare(out, reference_run.result.out);
+        const Diff d_reads = compare(reads, reference_run.result.reads);
+        const Diff d_state = compare(state, reference_run.state);
+        std::printf("[measure] continuation %zu + %zu of %s: vs the uncut row out %.2e reads %.2e state %.2e (max_abs / rms)\n", a,
+                    total - a, p.cfg.name.c_str(), d_out.rel_rms, d_reads.rel_rms, d_state.rel_rms);
+        CHECK(exact);
+        CHECK(d_out.rel_rms < 2e-5);
+        CHECK(d_reads.rel_rms < 2e-5);
+        CHECK(d_state.rel_rms < 2e-5);
         // The middle slot holds exactly what a row of the first part alone leaves.
         const SingleRun first_alone = run_single(p, first);
         CHECK(same_bits(mid_tail, first_alone.tail));
@@ -677,19 +686,19 @@ void continuation_for(const Problem& p, std::size_t total, const std::vector<std
 SEPAL_TEST(continuation, tiny) {
     const Problem p = make_problem(sepal::tiny_test_config(), 101);
     continuation_for(p, 70, {1, 2, 3, 4, 5, 15, 16, 17, 32, 35, 69});
-    std::printf("[measure] continuation, tiny, 11 split points of 70 tokens: bit-identical\n");
+    std::printf("[measure] continuation, tiny, 11 split points of 70 tokens: within rounding\n");
 }
 
 SEPAL_TEST(continuation, real_0_8b) {
     const Problem p = make_problem(preset("0.8b"), 102);
     continuation_for(p, 90, {1, 2, 3, 4, 17, 45, 89});
-    std::printf("[measure] continuation, 0.8B, 7 split points of 90 tokens: bit-identical\n");
+    std::printf("[measure] continuation, 0.8B, 7 split points of 90 tokens: within rounding\n");
 }
 
 SEPAL_TEST(continuation, real_4b) {
     const Problem p = make_problem(preset("4b"), 103);
     continuation_for(p, 40, {1, 3, 16, 25});
-    std::printf("[measure] continuation, 4B, 4 split points of 40 tokens: bit-identical\n");
+    std::printf("[measure] continuation, 4B, 4 split points of 40 tokens: within rounding\n");
 }
 
 // ---- waves: a state row and eight branches that continue it, in one pass ----
@@ -892,6 +901,64 @@ SEPAL_TEST(edge, zero_inputs) {
             for (std::size_t j = 0; j < p.value_dim; ++j) exact_zero = exact_zero && run.result.reads[t * p.value_dim + j] == 0.0f;
         }
         CHECK(exact_zero);
+    }
+}
+
+// The recurrence keeps its state scaled by the cumulative decay and folds the scale back in when it falls below 2^-40.
+// Decays this strong (down to exactly zero) make that happen every few tokens, in every position of a chunk.
+SEPAL_TEST(edge, strong_decay_folds_the_scale_into_the_state) {
+    for (const char* which : {"tiny", "0.8b"}) {
+        Problem p = make_problem(std::string(which) == "tiny" ? sepal::tiny_test_config() : preset("0.8b"), 221);
+        // decay = exp(-exp(a_log) * softplus(a + dt_bias)): from 0.97 for the first head to e^-300 (zero in float32)
+        // for the last ones, per token.
+        for (std::size_t h = 0; h < p.hv; ++h) {
+            const double frac = static_cast<double>(h) / static_cast<double>(std::max<std::size_t>(p.hv - 1, 1));
+            p.a_log[h] = static_cast<float>(std::log(0.03 + frac * 200.0));
+            p.dt_bias[h] = 0.5f;
+        }
+        for (const std::size_t len : {1u, 5u, 16u, 17u, 33u, 70u}) {
+            const RowData row = make_row(p, len, 222 + len);
+            const SingleRun run = run_single(p, row);
+            const StageDiffs vs_d = compare_run(run, reference<double>(p, row));
+            print_stage_diffs((std::string("strong decay, ") + which + " len " + std::to_string(len)).c_str(), vs_d);
+            check_parity(vs_d, 1e-4);
+            // and the same row inside a crowd of other rows gives the same bits
+            const RowData other = make_row(p, 21, 230 + len);
+            Rig rig(p, 4);
+            rig.set_slot(0, row.tail0, row.state0);
+            rig.set_slot(2, other.tail0, other.state0);
+            const std::vector<JobResult> results = rig.run({{&other, 2, 3}, {&row, 0, 1}});
+            const auto [tail, state] = rig.get_slot(1);
+            CHECK(same_bits(results[1].out, run.result.out));
+            CHECK(same_bits(state, run.state));
+        }
+    }
+}
+
+// The convolution window is a compile-time size for the usual 4 taps and a run-time one for the others.
+SEPAL_TEST(edge, other_conv_tap_counts) {
+    for (const std::uint64_t taps : {1u, 2u, 3u, 5u, 8u}) {
+        sepal::ModelConfig cfg = sepal::tiny_test_config();
+        cfg.conv_kernel = taps;
+        const Problem p = make_problem(cfg, 241 + taps);
+        for (const std::size_t len : {1u, 7u, 16u, 20u, 35u}) {
+            const RowData row = make_row(p, len, 250 + len);
+            const SingleRun run = run_single(p, row);
+            const StageDiffs vs_d = compare_run(run, reference<double>(p, row));
+            print_stage_diffs(("taps " + std::to_string(taps) + " len " + std::to_string(len)).c_str(), vs_d);
+            check_parity(vs_d, 1e-4);
+        }
+    }
+}
+
+SEPAL_TEST(edge, chunk_boundaries_at_real_size) {
+    const Problem p = make_problem(preset("0.8b"), 261);
+    for (const std::size_t len : {15u, 16u, 17u, 31u, 32u, 33u, 48u, 64u, 65u}) {
+        const RowData row = make_row(p, len, 270 + len);
+        const SingleRun run = run_single(p, row);
+        const StageDiffs vs_d = compare_run(run, reference<double>(p, row));
+        print_stage_diffs(("0.8b len " + std::to_string(len)).c_str(), vs_d);
+        check_parity(vs_d, 1e-4);
     }
 }
 
