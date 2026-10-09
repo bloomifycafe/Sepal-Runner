@@ -84,6 +84,29 @@ else()
   set_target_properties(sepal_cublas PROPERTIES IMPORTED_LOCATION "${SEPAL_CUBLAS_SO}")
 endif()
 
+# ---- cuBLASLt: the same arrangement (DLL and header from the wheel, import library built from a .def) ----
+add_library(sepal_cublaslt SHARED IMPORTED GLOBAL)
+target_include_directories(sepal_cublaslt SYSTEM INTERFACE "${SEPAL_CUDA_INCLUDE}")
+if(WIN32)
+  set(SEPAL_CUBLASLT_IMPLIB "${CMAKE_CURRENT_BINARY_DIR}/cublasLt64_13.lib")
+  add_custom_command(
+    OUTPUT "${SEPAL_CUBLASLT_IMPLIB}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${CMAKE_CURRENT_SOURCE_DIR}/cublasLt64_13.def"
+            "/out:${SEPAL_CUBLASLT_IMPLIB}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cublasLt64_13.def"
+    COMMENT "Building the cuBLASLt import library from cublasLt64_13.def"
+    VERBATIM)
+  add_custom_target(sepal_cublaslt_implib DEPENDS "${SEPAL_CUBLASLT_IMPLIB}")
+  add_dependencies(sepal_cublaslt sepal_cublaslt_implib)
+  set_target_properties(sepal_cublaslt PROPERTIES
+    IMPORTED_IMPLIB "${SEPAL_CUBLASLT_IMPLIB}"
+    IMPORTED_LOCATION "${SEPAL_CUDA_DLL_DIR}/cublasLt64_13.dll")
+else()
+  find_library(SEPAL_CUBLASLT_SO NAMES cublasLt libcublasLt.so.13 HINTS "${SEPAL_CUDA_ROOT}/lib" "${SEPAL_CUDA_ROOT}/lib64"
+               REQUIRED)
+  set_target_properties(sepal_cublaslt PROPERTIES IMPORTED_LOCATION "${SEPAL_CUBLASLT_SO}")
+endif()
+
 # ---- the provider ----
 add_library(sepal_cuda STATIC
   src/cuda_gemm.cpp
@@ -95,6 +118,11 @@ target_link_libraries(sepal_cuda PUBLIC sepal_core PRIVATE sepal_cublas sepal_cu
 
 add_executable(sepal-cuda-bench tools/sepal_cuda_bench.cpp)
 target_link_libraries(sepal-cuda-bench PRIVATE sepal_cuda sepal_cuda_flags)
+
+add_executable(sepal-cuda-gemm-probe tools/gemm_probe.cpp src/gemm_kernels.cu)
+target_include_directories(sepal-cuda-gemm-probe PRIVATE src)
+target_include_directories(sepal-cuda-gemm-probe SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-cuda-gemm-probe PRIVATE sepal_cublas sepal_cublaslt sepal_cuda sepal_cuda_flags)
 
 add_executable(sepal_cuda_tests tests/test_cuda_gemm.cpp)
 target_link_libraries(sepal_cuda_tests PRIVATE sepal_cuda sepal_cuda_flags)
@@ -174,7 +202,7 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
 endforeach()
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/engine_kernels.cu src/gemm_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
@@ -183,6 +211,16 @@ target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
 add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
 target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
 
+# ---- the multiply kernels (binary16 accumulation with a float32 flush, 2-D widening) ----
+add_executable(sepal_cuda_kernel_gemm_tests tests/test_gemm_kernels.cpp src/gemm_kernels.cu ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_gemm_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_kernel_gemm_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_kernel_gemm_tests PRIVATE sepal_core sepal_cuda_flags)
+foreach(suite gemmk_convert gemmk_accuracy gemmk_invariance gemmk_edge)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_gemm_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
+endforeach()
+
 # ---- engine tests ----
 # The real-model suite is skipped, with a message, unless SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN are set.
 add_executable(sepal_cuda_engine_tests
@@ -190,12 +228,13 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_props.cpp
   tests/test_cuda_engine_real.cpp
   tests/test_cuda_engine_diag.cpp
+  tests/test_cuda_engine_multiply.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative real_f32 real_f16 real_strict real_natural real_2b)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply real_f32 real_f16 real_strict real_natural real_2b)
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")

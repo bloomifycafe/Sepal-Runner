@@ -20,6 +20,7 @@
 #include "convert_kernels.hpp"
 #include "device.hpp"
 #include "engine_kernels.hpp"
+#include "gemm_kernels.hpp"
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
 #include "kernels_elementwise.hpp"
@@ -31,6 +32,8 @@ namespace {
 constexpr std::size_t kAlign = 256;
 constexpr std::size_t kTableBytes = std::size_t{8} << 20;     // row tables of one call, on the device
 constexpr std::size_t kCublasWorkspace = std::size_t{32} << 20;
+// Rows per multiply that accumulates in binary16 in natural mode: its result goes through a scratch buffer of this many rows.
+constexpr std::size_t kAccumulateChunkRows = 2048;
 constexpr std::size_t kUploadChunk = std::size_t{32} << 20;   // staging for weights that need converting
 
 constexpr std::size_t align_up(std::size_t n, std::size_t a = kAlign) noexcept { return (n + a - 1) / a * a; }
@@ -284,6 +287,10 @@ struct CudaEngine::Impl {
     float* xc = nullptr;     // their residual stream [cap_compact, H]
     std::size_t cap_compact = 0;
     char* tables = nullptr;  // row tables of one call
+    char* hbuf = nullptr;    // binary16 results of the multiplies that accumulate in binary16, before they are widened [acc_rows, p_width]
+    std::size_t acc_rows = 0;
+    bool invariant_all = false; // the own kernel takes every multiply of the model: strict mode pads nothing
+    static bool own_kernel_takes(std::size_t n, std::size_t k, std::size_t ld_in, std::size_t ld_out) { return gemm_nt_supports(n, k, ld_in, k, ld_out); }
 
     std::shared_ptr<Pools> pools;
     std::size_t state_conv_floats = 0, state_recurrent_floats = 0;
@@ -315,7 +322,7 @@ struct CudaEngine::Impl {
     struct Phase;
     std::vector<EngineRowResult> run(std::span<const EngineRow> rows);
     void gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, void* out,
-              std::size_t ld_out, std::size_t rows, bool out_half = false);
+              std::size_t ld_out, std::size_t rows, bool out_half = false, bool acc16 = false);
     std::size_t kv_layer_bytes(std::size_t tokens) const { return align_up(tokens * kv_layer_unit); }
     std::size_t kv_block_bytes(std::size_t tokens) const { return attn_layers * 2 * kv_layer_bytes(tokens); }
 };
@@ -441,6 +448,7 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
     take(cap_compact * H * elem_bytes, a1c);
     take(cap_compact * H * 4, xc);
     take(kTableBytes, tables);
+    take(acc_rows * p_width * 2, hbuf);
     used += kCublasWorkspace; // taken last: its address is call_memory + used - workspace
     return used;
 }
@@ -474,6 +482,23 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     cap_rows = options.gemm_rows == 0 ? options.max_call_tokens : align_up(options.max_call_tokens, options.gemm_rows);
     // Room for the rows the last layer computes in full (see prune_last_layer); a call with more readouts runs unpruned.
+    {
+        const Fp16Accumulate& fa = options.fp16_accumulate;
+        if (fa.flush_k % 32 != 0) throw std::invalid_argument("EngineOptions: fp16_accumulate.flush_k must be a multiple of 32");
+        // Does the engine's own kernel take every multiply of this model? Then strict mode needs no padding.
+        if (half && options.multiply_path == MultiplyPath::Invariant) {
+            invariant_all = own_kernel_takes(2 * I, H, H, 2 * I) && own_kernel_takes(H, I, I, H);
+            if (dn_layers != 0) invariant_all = invariant_all && own_kernel_takes(dn_in_width, H, H, p_width) && own_kernel_takes(H, value_dim, mix_width, H);
+            if (attn_layers != 0) {
+                invariant_all = invariant_all && own_kernel_takes(attn_in_width, H, H, p_width) && own_kernel_takes(2 * attn_width, H, H, p_width) &&
+                                own_kernel_takes(2 * attn_kv_width, H, H, p_width) && own_kernel_takes(H, attn_width, mix_width, H) &&
+                                (2 * attn_width * H) % 8 == 0;
+            }
+        }
+        // Scratch for the multiplies that cuBLAS runs with binary16 accumulators (their result is widened afterwards).
+        const bool any = half && (fa.gate_up || fa.down || fa.mixer_in || fa.mixer_out) && !invariant_all;
+        acc_rows = !any ? 0 : (options.gemm_rows == 0 ? std::min(cap_rows, kAccumulateChunkRows) : options.gemm_rows);
+    }
     cap_compact = std::min(cap_rows, options.gemm_rows == 0 ? std::size_t{1024} : align_up(std::size_t{1024}, options.gemm_rows));
 
     dn_geometry = DeltaNetGeometry{u32(dim(config.dn_key_heads)), u32(dim(config.dn_value_heads)),
@@ -582,26 +607,46 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
 // gemm_rows and the multiply is cut into blocks of exactly that many rows (the call buffers hold zero rows up to the
 // next multiple, so the last block is a full one).
 void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, std::size_t n, std::size_t k, void* out,
-                            std::size_t ld_out, std::size_t rows, bool out_half) {
-    const std::size_t step = options.gemm_rows == 0 ? rows : options.gemm_rows;
+                            std::size_t ld_out, std::size_t rows, bool out_half, bool acc16) {
+    if (half && options.multiply_path == MultiplyPath::Invariant && own_kernel_takes(n, k, ld_in, ld_out)) {
+        // The engine's own kernel: one launch over all rows, in natural and strict mode alike (a row's bits do not depend
+        // on how many rows there are, so there is no block size to fix).
+        if (rows == 0) return;
+        launch_gemm_nt(in, ld_in, w, k, out, ld_out, out_half, rows, n, k, acc16 ? GemmAccumulate::Float16Flush : GemmAccumulate::Float32,
+                       acc16 ? options.fp16_accumulate.flush_k : 0, -1, stream);
+        return;
+    }
+    const bool half_acc = half && acc16;
+    const std::size_t step = options.gemm_rows == 0 ? (half_acc ? acc_rows : rows) : options.gemm_rows;
     const float alpha = 1.0f, beta = 0.0f;
+    const __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
     for (std::size_t at = 0; at < rows; at += step) {
-        const std::size_t t = step;
+        // Strict mode: always exactly `step` rows (the buffers hold zero rows up to the next multiple). Natural: what is left.
+        const std::size_t t = options.gemm_rows == 0 ? std::min(step, rows - at) : step;
         const char* xin = static_cast<const char*>(in) + at * ld_in * elem_bytes;
         const std::size_t out_bytes = out_half ? 2 : 4;
         char* yout = static_cast<char*>(out) + at * ld_out * out_bytes;
         const int m_ = static_cast<int>(n), t_ = static_cast<int>(t), k_ = static_cast<int>(k);
+        const std::string context = "[" + std::to_string(t) + " x " + std::to_string(k) + "] by [" + std::to_string(n) + " x " + std::to_string(k) + "]";
         // Row-major X [t, k] is the column-major k x t matrix, and so on: Y^T (n x t) = W (n x k) * X^T (k x t).
-        if (half) {
+        if (half_acc) {
+            // binary16 accumulators and binary16 result; widened into the float32 output unless that is binary16 itself.
+            void* target = out_half ? static_cast<void*>(yout) : static_cast<void*>(hbuf);
+            const int ld_target = out_half ? static_cast<int>(ld_out) : m_;
+            check_blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha_h, w, CUDA_R_16F, k_, xin, CUDA_R_16F,
+                                    static_cast<int>(ld_in), &beta_h, target, CUDA_R_16F, ld_target, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT),
+                       "cublasGemmEx", context);
+            if (!out_half) launch_half_to_float_2d(hbuf, n, yout, ld_out, t, n, stream);
+        } else if (half) {
             check_blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha, w, CUDA_R_16F, k_, xin, CUDA_R_16F,
                                     static_cast<int>(ld_in), &beta, yout, out_half ? CUDA_R_16F : CUDA_R_32F, static_cast<int>(ld_out),
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-                       "cublasGemmEx", "[" + std::to_string(t) + " x " + std::to_string(k) + "] by [" + std::to_string(n) + " x " + std::to_string(k) + "]");
+                       "cublasGemmEx", context);
         } else {
             check_blas(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha, static_cast<const float*>(w), k_,
                                    reinterpret_cast<const float*>(xin), static_cast<int>(ld_in), &beta, reinterpret_cast<float*>(yout),
                                    static_cast<int>(ld_out)),
-                       "cublasSgemm", "[" + std::to_string(t) + " x " + std::to_string(k) + "] by [" + std::to_string(n) + " x " + std::to_string(k) + "]");
+                       "cublasSgemm", context);
         }
     }
 }
@@ -837,7 +882,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     // Each such token becomes a "row" of one token whose context is its own row up to it: the same keys, read in place.
     bool prune = options.prune_last_layer && attn_layers != 0 && readouts != 0;
     for (const EngineRow& row : rows) prune = prune && !row.capture_layers;
-    const std::size_t pad_step = options.gemm_rows != 0 ? options.gemm_rows : 1;
+    const std::size_t pad_step = options.gemm_rows != 0 && !invariant_all ? options.gemm_rows : 1;
     std::vector<std::uint32_t> upos, readout_compact;
     std::vector<RowSpan> spans_u;
     std::vector<AttentionRowDesc> descs_u;
@@ -926,6 +971,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     // Rows of every multiply: all n of them in natural mode; in strict mode n rounded up to whole blocks of gemm_rows, the
     // extra rows being zero.
     const std::size_t padded = align_up(n, pad_step);
+    const Fp16Accumulate& fa = options.fp16_accumulate;
     const float eps = static_cast<float>(config.rms_norm_eps);
     // The gate and up halves of the MLP's first multiply: float32, or on the float16 path optionally binary16 straight out
     // of the multiply (as PyTorch's float16 run has them), which halves the traffic of that multiply and of SwiGLU.
@@ -974,7 +1020,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             const char* w_kv = static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes;
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded); // keys and values of every token
+                gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded, false, fa.mixer_in); // keys and values of every token
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -993,7 +1039,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u); // queries and gates of the read-out tokens
+                gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u, false, fa.mixer_in); // queries and gates of the read-out tokens
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -1005,7 +1051,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u);
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, false, fa.mixer_out);
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1014,7 +1060,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up);
+                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up, fa.gate_up);
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1022,7 +1068,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a3, I, w.down, H, I, m, H, padded_u);
+                gemm(a3, I, w.down, H, I, m, H, padded_u, false, fa.down);
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1033,7 +1079,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         if (!w.attention) {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, padded);
+                gemm(a1, H, w.mixer_in, dn_in_width, H, p, p_width, padded, false, fa.mixer_in);
             }
             {
                 Phase phase(*this, &PhaseTimes::deltanet_ms);
@@ -1050,12 +1096,22 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded);
+                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, false, fa.mixer_out);
             }
         } else {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1, H, w.mixer_in, attn_in_width, H, p, p_width, padded);
+                if (options.gemm_rows != 0 && !invariant_all && l + 1 == layers) {
+                    // Strict mode, last layer, which a pruned call computes as two multiplies (keys and values of every token; queries
+                    // and gates of the read-out tokens): an unpruned call must run the very same multiplies, or the keys and values it
+                    // leaves in a snapshot could differ in bits from the pruned call's. (With float32 accumulation cuBLAS happens to give
+                    // the same bits for both shapes; with binary16 accumulation it does not.)
+                    const char* w_kv = static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes;
+                    gemm(a1, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded, false, fa.mixer_in);
+                    gemm(a1, H, w_kv, 2 * attn_kv_width, H, p + 2 * attn_width, p_width, padded, false, fa.mixer_in);
+                } else {
+                    gemm(a1, H, w.mixer_in, attn_in_width, H, p, p_width, padded, false, fa.mixer_in);
+                }
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -1072,7 +1128,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded);
+                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, false, fa.mixer_out);
             }
         }
         {
@@ -1081,7 +1137,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
-            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up);
+            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up, fa.gate_up);
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1089,7 +1145,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
-            gemm(a3, I, w.down, H, I, m, H, padded);
+            gemm(a3, I, w.down, H, I, m, H, padded, false, fa.down);
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);

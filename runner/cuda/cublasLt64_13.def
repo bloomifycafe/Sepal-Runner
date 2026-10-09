@@ -1,0 +1,17 @@
+; Module definition for the cuBLASLt entry points the probe (and, once it wins, the engine) calls. Like cublas64_13.def:
+; the wheel ships the DLL and the header but no import library, so CMakeLists.txt builds one with `lib /def`.
+LIBRARY cublasLt64_13.dll
+EXPORTS
+    cublasLtCreate
+    cublasLtDestroy
+    cublasLtMatmulDescCreate
+    cublasLtMatmulDescDestroy
+    cublasLtMatmulDescSetAttribute
+    cublasLtMatrixLayoutCreate
+    cublasLtMatrixLayoutDestroy
+    cublasLtMatrixLayoutSetAttribute
+    cublasLtMatmulPreferenceCreate
+    cublasLtMatmulPreferenceDestroy
+    cublasLtMatmulPreferenceSetAttribute
+    cublasLtMatmulAlgoGetHeuristic
+    cublasLtMatmul

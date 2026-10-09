@@ -500,3 +500,187 @@ SEPAL_TEST(real_2b, second_geometry_against_the_cpu_reference_and_float16_agains
     CHECK(d16_32 < 0.05);
     (void)d16_ref;
 }
+
+// ---- the multiply options on the real checkpoints ----
+
+namespace {
+
+using sepal::cuda::Fp16Accumulate;
+using sepal::cuda::MultiplyPath;
+
+struct MultiplyVariant {
+    const char* name;
+    MultiplyPath path;
+    bool binary16;
+    unsigned flush_k;
+    double probability_gate; // largest |dp| allowed against the float32 golden
+};
+
+EngineOptions variant_options(const MultiplyVariant& v, std::size_t gemm_rows, std::size_t budget_mib) {
+    EngineOptions o = real_options(Precision::F16, gemm_rows, budget_mib);
+    o.multiply_path = v.path;
+    o.fp16_accumulate = Fp16Accumulate{v.binary16, v.binary16, v.binary16, v.binary16, v.flush_k};
+    return o;
+}
+
+const std::vector<MultiplyVariant>& multiply_variants() {
+    static const std::vector<MultiplyVariant> variants = {
+        {"cuBLAS, float32 accumulation (the default)", MultiplyPath::Cublas, false, 0, 2e-3},
+        {"cuBLAS, binary16 accumulation", MultiplyPath::Cublas, true, 0, 1e-2},
+        {"own kernel, float32 accumulation", MultiplyPath::Invariant, false, 0, 2e-3},
+        {"own kernel, binary16 accumulation, flush every 64", MultiplyPath::Invariant, true, 64, 2e-3},
+        {"own kernel, binary16 accumulation, flush every 128", MultiplyPath::Invariant, true, 128, 4e-3},
+        {"own kernel, binary16 accumulation, flush every 256", MultiplyPath::Invariant, true, 256, 6e-3},
+    };
+    return variants;
+}
+
+} // namespace
+
+SEPAL_TEST(real_f16, multiply_variants_against_the_float32_golden) {
+    if (skipped()) return;
+    Real& r = real();
+    for (const MultiplyVariant& v : multiply_variants()) {
+        CudaEngine engine(r.model, variant_options(v, 0, 4000));
+        F16Report all;
+        for (const char* name : {"case_i", "case_ii", "case_iii"}) {
+            const SafetensorsFile file = golden(name);
+            const std::vector<std::uint32_t> tokens = tokens_of(file.at("token_ids"));
+            const auto got = run(engine, {row_of(tokens, {tokens.size() - 1})});
+            CHECK(all_finite(got[0].hidden));
+            compare_prompt(all, got[0].hidden, 4, file.at("final_hidden"), file.at("probs"), file, "");
+        }
+        const CaseIV c = load_case_iv();
+        const auto together = run(engine, case_iv_call(c));
+        for (std::size_t k = 0; k < 3; ++k) {
+            const std::string q = "q" + std::to_string(k);
+            CHECK(all_finite(together[k + 1].hidden));
+            compare_prompt(all, together[k + 1].hidden, c.options[k], c.file.at(q + ".final_hidden"), c.file.at(q + ".probs"), c.file, q + ".");
+        }
+        print_report(v.name, all);
+        CHECK(all.probability.max <= v.probability_gate);
+        CHECK(all.probability.max <= kF16ProbabilityGate);
+        CHECK_EQ(all.flips, 0u);
+    }
+}
+
+namespace {
+
+struct StrictCounts {
+    std::size_t alone_trials = 0, alone_identical = 0, hits = 0, hit_identical = 0;
+};
+
+// Case iv's family alone, then among other rows at a random place, then with the state stored by an earlier call.
+StrictCounts strict_counts(CudaEngine& engine, const CaseIV& c, const std::vector<std::vector<std::uint32_t>>& corpus, std::uint64_t seed) {
+    StrictCounts counts;
+    const auto alone = run(engine, case_iv_call(c));
+    Rng rng(seed);
+    for (std::size_t trial = 0; trial < 4; ++trial) {
+        const std::vector<EngineRow> others = real_others(rng, corpus, 2 + rng.below(8));
+        const std::size_t pos = rng.below(others.size() + 1);
+        std::vector<EngineRow> shifted = others;
+        for (EngineRow& o : shifted) o.parent = std::monostate{};
+        std::vector<EngineRow> call(shifted.begin(), shifted.begin() + static_cast<std::ptrdiff_t>(pos));
+        for (EngineRow f : case_iv_call(c)) {
+            if (auto* p = std::get_if<ParentRow>(&f.parent)) p->index += pos;
+            call.push_back(f);
+        }
+        call.insert(call.end(), shifted.begin() + static_cast<std::ptrdiff_t>(pos), shifted.end());
+        const auto among = run(engine, call);
+        for (std::size_t k = 1; k <= 3; ++k) {
+            ++counts.alone_trials;
+            if (same_bits(alone[k].hidden, among[pos + k].hidden)) ++counts.alone_identical;
+        }
+        const auto stored = run(engine, {row_of(c.state, {}, true)});
+        std::vector<EngineRow> branch_call = real_others(rng, corpus, 1 + rng.below(6));
+        const std::size_t at = rng.below(branch_call.size() + 1);
+        const std::vector<EngineRow> branches = case_iv_from_store(c, stored[0].snapshot);
+        branch_call.insert(branch_call.begin() + static_cast<std::ptrdiff_t>(at), branches.begin(), branches.end());
+        const auto hit = run(engine, branch_call);
+        for (std::size_t k = 0; k < 3; ++k) {
+            ++counts.hits;
+            if (same_bits(alone[k + 1].hidden, hit[at + k].hidden)) ++counts.hit_identical;
+        }
+    }
+    return counts;
+}
+
+} // namespace
+
+SEPAL_TEST(real_strict, multiply_options_keep_strict_mode_bit_identical) {
+    if (skipped()) return;
+    Real& r = real();
+    const CaseIV c = load_case_iv();
+    const auto corpus = corpus_of_goldens();
+    // cuBLAS with binary16 accumulation needs the padding of strict mode and the same multiplies for the last layer
+    // whether it is pruned or not; the own kernel needs no padding at all, so any gemm_rows only says "strict".
+    struct Strict {
+        MultiplyVariant variant;
+        std::size_t gemm_rows;
+    };
+    const std::vector<Strict> cases = {
+        {{"cuBLAS, binary16 accumulation", MultiplyPath::Cublas, true, 0, 0}, 128},
+        {{"own kernel, float32 accumulation", MultiplyPath::Invariant, false, 0, 0}, 128},
+        {{"own kernel, binary16 accumulation, flush 64", MultiplyPath::Invariant, true, 64, 0}, 128},
+        {{"own kernel, binary16 accumulation, flush 64, natural mode", MultiplyPath::Invariant, true, 64, 0}, 0},
+    };
+    for (const Strict& s : cases) {
+        CudaEngine engine(r.model, variant_options(s.variant, s.gemm_rows, 4000));
+        const StrictCounts n = strict_counts(engine, c, corpus, 4242 + s.gemm_rows);
+        std::cout << "  " << s.variant.name << ", gemm_rows " << s.gemm_rows << ": " << n.alone_identical << " of " << n.alone_trials
+                  << " branch rows bit-identical alone vs among other rows; " << n.hit_identical << " of " << n.hits
+                  << " branches from a stored snapshot identical to the same branch run with its state\n";
+        CHECK_EQ(n.alone_identical, n.alone_trials);
+        CHECK_EQ(n.hit_identical, n.hits);
+    }
+}
+
+SEPAL_TEST(real_2b, multiply_variants_against_the_float32_engine) {
+    const auto dir = environment("SEPAL_REAL_MODEL_2B");
+    if (!dir || !environment("SEPAL_REAL_GOLDEN")) {
+        std::cout << "SKIPPED: set SEPAL_REAL_MODEL_2B (a Qwen3.5-2B-Base checkpoint directory) and SEPAL_REAL_GOLDEN to run this\n";
+        return;
+    }
+    const LoadedModel model = LoadedModel::open(*dir);
+    std::vector<std::uint32_t> text = tokens_of(golden("case_iii").at("token_ids"));
+    text.resize(60);
+    std::vector<EngineRow> rows = {row_of({text.begin(), text.begin() + 40}, {39}), row_of({text.begin() + 40, text.end()}, {19, 0})};
+    EngineRow branch = row_of({text.begin() + 5, text.begin() + 12}, {6});
+    branch.parent = ParentRow{0};
+    branch.start_position = 40;
+    rows.push_back(branch);
+    std::vector<EngineRowResult> want;
+    {
+        CudaEngine engine(model, real_options(Precision::F32, 0, 9000));
+        want = run(engine, rows);
+    }
+    for (const MultiplyVariant& v : multiply_variants()) {
+        CudaEngine engine(model, variant_options(v, 0, 6000));
+        const auto got = run(engine, rows);
+        double worst = 0, sum = 0;
+        std::size_t count = 0;
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            CHECK(all_finite(got[r].hidden));
+            for (std::size_t i = 0; i < got[r].hidden.size(); ++i) {
+                const double d = std::fabs(static_cast<double>(got[r].hidden[i]) - want[r].hidden[i]);
+                worst = std::max(worst, d);
+                sum += d;
+                ++count;
+            }
+        }
+        std::cout << "  Qwen3.5-2B, " << v.name << ", against the float32 engine: largest |dh| " << std::scientific << std::setprecision(2) << worst << ", mean "
+                  << sum / static_cast<double>(count) << std::fixed << "\n";
+        CHECK(sum / static_cast<double>(count) < 0.02);
+    }
+    // Strict mode on the second geometry: a row alone and among others.
+    {
+        MultiplyVariant v{"own kernel, binary16 accumulation, flush 64", MultiplyPath::Invariant, true, 64, 0};
+        CudaEngine engine(model, variant_options(v, 128, 6000));
+        const auto alone = run(engine, {rows[0], rows[1]});
+        std::vector<EngineRow> crowd = {rows[1], rows[0], rows[1]};
+        const auto among = run(engine, crowd);
+        CHECK(same_bits(alone[0].hidden, among[1].hidden));
+        CHECK(same_bits(alone[1].hidden, among[0].hidden));
+        CHECK(same_bits(alone[1].hidden, among[2].hidden));
+    }
+}

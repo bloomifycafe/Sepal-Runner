@@ -28,6 +28,8 @@
 //           A row's result is then independent of the other rows of the call, of their number and of the row's
 //           place in the call, and a branch continued from a stored snapshot has the same bits as the same
 //           branch run in the same call as its state.
+// With `multiply_path = Invariant` the multiplies are the engine's own kernel, which is batch-invariant by construction:
+// strict mode then needs no padding (any gemm_rows > 0 just means strict), and natural mode is invariant too.
 #pragma once
 
 #include <cstddef>
@@ -54,6 +56,33 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+/// Which multiplies of the float16 path accumulate in binary16 instead of float32. On the RTX 3060 the tensor cores run
+/// about 1.8 times faster with binary16 accumulators (README.md, "Multiply throughput"), at the price of a larger rounding
+/// error per multiply. How large depends on who multiplies:
+///   - cuBLAS (MultiplyPath::Cublas): CUBLAS_COMPUTE_16F over the whole inner dimension, about 2e-3 to 5e-3 of the output rms
+///     (against 2e-4 for float32 accumulation and a binary16 result), and the result is rounded to binary16;
+///   - the engine's own kernel (MultiplyPath::Invariant): binary16 accumulators that are added to float32 ones every
+///     `flush_k` values of k, about 4e-4 (flush_k 64) to 8e-4 (256) of the output rms. flush_k = 0 never flushes.
+struct Fp16Accumulate {
+    bool gate_up = false;   // the MLP's gate and up projections
+    bool down = false;      // the MLP's down projection
+    bool mixer_in = false;  // the DeltaNet and attention input projections
+    bool mixer_out = false; // the DeltaNet and attention output projections
+    unsigned flush_k = 128; // own kernel only: a multiple of 32
+};
+
+/// Who computes the matrix multiplies of the float16 path.
+enum class MultiplyPath {
+    /// cuBLAS. A row's bits depend on how many rows share its multiply (cuBLAS picks its kernel from the shape), which is
+    /// what `gemm_rows` works around by padding.
+    Cublas,
+    /// The engine's own tensor-core kernel (src/gemm_kernels.cu). Float32 accumulators unless Fp16Accumulate says
+    /// otherwise. A row's bits depend on that row only, so strict mode (gemm_rows > 0) pads nothing. A multiply whose shape
+    /// the kernel does not take (an inner dimension that is not a multiple of 8, say) goes to cuBLAS, and strict mode then
+    /// pads as before.
+    Invariant,
+};
+
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
@@ -64,6 +93,10 @@ struct EngineOptions {
     /// Float16 path only: the multiply of the MLP's gate and up projections writes binary16 instead of float32, as
     /// PyTorch's float16 run has it. Halves the memory traffic of that multiply and of the SwiGLU product that reads it.
     bool fp16_gate_up = true;
+    /// Float16 path only: who multiplies, see MultiplyPath. Default: cuBLAS.
+    MultiplyPath multiply_path = MultiplyPath::Cublas;
+    /// Float16 path only: multiplies that accumulate in binary16. Default: none.
+    Fp16Accumulate fp16_accumulate;
     /// Compute the last layer's queries, attention, output projection and MLP only for the tokens that are read out
     /// (its keys and values are still computed for every token). The last layer is always a full-attention layer.
     bool prune_last_layer = true;

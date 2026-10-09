@@ -54,6 +54,8 @@ struct Options {
     std::size_t state_slots = 0;
     bool prune_last_layer = true;
     bool fp16_gate_up = true;
+    sepal::cuda::Fp16Accumulate fp16_accumulate;
+    sepal::cuda::MultiplyPath multiply_path = sepal::cuda::MultiplyPath::Cublas;
     bool prefill = true, alerts = true, cached = true, profile = true;
 };
 
@@ -100,6 +102,16 @@ Options parse(int argc, char** argv) {
             o.state_slots = std::stoul(value);
         } else if (flag == "--fp16-gate-up") {
             o.fp16_gate_up = value != "0";
+        } else if (flag == "--multiply-path") { // cublas (default) or invariant (the engine's own batch-invariant kernel)
+            if (value != "cublas" && value != "invariant") usage("unknown multiply path " + value);
+            o.multiply_path = value == "invariant" ? sepal::cuda::MultiplyPath::Invariant : sepal::cuda::MultiplyPath::Cublas;
+        } else if (flag == "--fp16-flush-k") {
+            o.fp16_accumulate.flush_k = static_cast<unsigned>(std::stoul(value));
+        } else if (flag == "--fp16-accumulate") { // comma list of gate_up,down,mixer_in,mixer_out, or all, or none
+            o.fp16_accumulate.gate_up = value.find("gate_up") != std::string::npos || value == "all";
+            o.fp16_accumulate.down = value.find("down") != std::string::npos || value == "all";
+            o.fp16_accumulate.mixer_in = value.find("mixer_in") != std::string::npos || value == "all";
+            o.fp16_accumulate.mixer_out = value.find("mixer_out") != std::string::npos || value == "all";
         } else if (flag == "--prune-last-layer") {
             o.prune_last_layer = value != "0";
         } else if (flag == "--sections") {
@@ -279,6 +291,8 @@ int main(int argc, char** argv) {
         eo.state_slots = opt.state_slots;
         eo.prune_last_layer = opt.prune_last_layer;
         eo.fp16_gate_up = opt.fp16_gate_up;
+        eo.fp16_accumulate = opt.fp16_accumulate;
+        eo.multiply_path = opt.multiply_path;
         const auto created = std::chrono::steady_clock::now();
         CudaEngine engine(model, eo);
         const double create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count();
@@ -299,6 +313,10 @@ int main(int argc, char** argv) {
                     opt.gemm_rows == 0 ? "natural" : ("strict, gemm_rows " + std::to_string(opt.gemm_rows)).c_str(), create_s);
         std::printf("  last layer computed for the read-out tokens only: %s\n", opt.prune_last_layer ? "yes" : "no");
         std::printf("  gate and up of the MLP written as binary16 by the multiply: %s\n", opt.precision == Precision::F16 && opt.fp16_gate_up ? "yes" : "no");
+        std::printf("  multiplies by %s", opt.multiply_path == sepal::cuda::MultiplyPath::Invariant ? "the engine's own batch-invariant kernel" : "cuBLAS");
+        if (opt.multiply_path == sepal::cuda::MultiplyPath::Invariant) std::printf(" (binary16 flush every %u)", opt.fp16_accumulate.flush_k);
+        std::printf("\n  multiplies accumulating in binary16: gate_up %s, down %s, mixer_in %s, mixer_out %s\n", opt.fp16_accumulate.gate_up ? "yes" : "no",
+                    opt.fp16_accumulate.down ? "yes" : "no", opt.fp16_accumulate.mixer_in ? "yes" : "no", opt.fp16_accumulate.mixer_out ? "yes" : "no");
         std::printf("  memory: weights %.0f MiB, call buffers %.0f MiB, %zu state slots of %.1f MiB, key/value heap %.0f MiB (budget %.0f MiB)\n",
                     static_cast<double>(mem0.weights_bytes) / (1 << 20), static_cast<double>(mem0.call_buffer_bytes) / (1 << 20), mem0.slots_total,
                     static_cast<double>(mem0.slot_bytes) / (1 << 20), static_cast<double>(mem0.kv_heap_bytes) / (1 << 20), static_cast<double>(mem0.budget_bytes) / (1 << 20));
