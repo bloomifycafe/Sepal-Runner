@@ -172,3 +172,27 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
   add_test(NAME cuda_elem_${suite} COMMAND sepal_cuda_kernel_elem_tests ${suite})
   set_tests_properties(cuda_elem_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
+
+# ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp)
+target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
+target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
+  PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cuda_flags)
+
+# ---- engine tests ----
+# The real-model suite is skipped, with a message, unless SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN are set.
+add_executable(sepal_cuda_engine_tests
+  tests/test_cuda_engine.cpp
+  tests/test_cuda_engine_props.cpp
+  tests/test_cuda_engine_diag.cpp
+  ../tests/test_main.cpp
+)
+target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests)
+target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
+foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative)
+  add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
+  set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
