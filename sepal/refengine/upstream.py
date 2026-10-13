@@ -73,6 +73,23 @@ def model_config(upstream_text_config: Any, pointer_dim: int = 256) -> ModelConf
     return config
 
 
+PYTORCH_FUNCTIONS = ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn", "causal_conv1d_update")
+
+
+def use_pytorch_functions() -> None:
+    """Bind upstream's own PyTorch functions for the delta rule and the causal convolution.
+
+    transformers binds flash-linear-attention's Triton kernels at import time whenever that package is installed (it is, in the
+    ``train`` dependency group), and those kernels fail on CPU tensors. This check runs on the CPU, in float64, on the functions this
+    package reads and cites, so it takes the wrapped PyTorch ones (what ``execution_path`` calls the "pure PyTorch fallback").
+    It rebinds module attributes of transformers for the rest of the process, and does nothing when they are already the PyTorch ones."""
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as modeling
+
+    for name in PYTORCH_FUNCTIONS:
+        fast = getattr(modeling, name)
+        setattr(modeling, name, getattr(fast, "__wrapped__", fast))
+
+
 def random_text_model(config: ModelConfig, seed: int, **overrides: Any):
     """A float64 upstream text model of this geometry in eval mode, with every parameter random.
 
@@ -82,6 +99,7 @@ def random_text_model(config: ModelConfig, seed: int, **overrides: Any):
     import torch
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
+    use_pytorch_functions()
     model = Qwen3_5TextModel(text_config(config, **overrides)).double().eval()
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
