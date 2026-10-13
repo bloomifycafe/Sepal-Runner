@@ -1004,7 +1004,7 @@ memory grows with the total sequence, which the planner bounds by `max_length`.
   executor, the oneDNN provider, the C ABI, the Python wheel, and now the Clef head. All of these except the head are
   independent of the decision. The planner's pointer-head sizing is superseded (section 8).
 - **Outside the stage list.** The FP64 reference of R1's scope was written in Python (`sepal/refengine/`) with the old readouts, and the
-  token layouts of the old design as `sepal/model/layouts.py`; neither is the new contract. The C++ encoder must instead
+  token layouts of the old design as `sepal/model/layouts.py` (removed 2026-10-14; it is in git history); neither is the new contract. The C++ encoder must instead
   reproduce `encode_record` token for token (section 17).
 
 ## 17. First two weeks
