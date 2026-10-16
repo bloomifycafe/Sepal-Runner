@@ -1513,3 +1513,23 @@ The whole CTest suite on the merged tree (main at 46f3b7d), with all the real-mo
   per-layer choice of which layers go on int8 (the first and last layers were not tried apart); calibration on text other than the alert prompt (the six `real_f16` prompts are worse with the more aggressive alphas); weight quantisation better than per output channel (groups of channels along k, or error-feedback rounding), the only thing that could lower the flips below the weights' floor.
 * int8 embedding, int8 attention or K/V, int4 weights, an int8 route for the CPU reference.
 * No 9B run; llama.cpp was not re-measured (its figures are from the earlier section).
+
+## The decision engine on the GPU (rt-gpu status, 2026-10-16/17)
+
+`GpuDecisionEngine` (`include/sepal/cuda/gpu_decision_engine.hpp`) is the trained model on `CudaEngine` plus the CUDA Clef head
+(`clef_head_cuda.hpp`, `src/clef_head.cpp`, `src/clef_head_kernels.cu`): LoRA merged in float32 then rounded once to the profile's
+type, `prune_last_layer` off, the trunk's final-normed hidden state of every token goes to the head on the device (a hook inside
+`CudaEngine::run`), only logits come back. Requests are cut into groups that fit the head's capacity, a group is one batch of rows
+(no padding), long requests are chunked, and with `prefix_cache` on a snapshot of the trunk plus the head's memory rows at a cut before
+the first question span is reused (RUNNER.md section 7). Profiles `gpu-f16` and `gpu-f32`; `sepal_runner_cuda` is the C ABI library
+(`sepal-score --library` works; extra keys `prefix_cache`, `max_call_tokens`, `trunk_budget_mib`, `prefix_entries`).
+Tools: `sepal-gpu-parity` (golden), `sepal-gpu-bench` (workloads; `--batch N`, `--phases on`, `--call-tokens N`, `--dump/--compare`).
+
+Parity on the golden set (20 cases), RTX 3090, CUDA 12.8 build, measured: head alone (hidden_fp32 -> logits_fp32) max |dlogit|
+1.9e-6; gpu-f32 end to end max |dlogit| 2.6e-5, max |dp| 3.6e-6 (T=1) and 2.3e-6 (calibrated), 0 flips, batch 1 and 20;
+gpu-f16 max |dp| 7.9e-3 (batch 1) / 1.06e-2 (batch 20), p99 <= 7.5e-3, 0 flips. Prefix reuse against no reuse: 1.1e-5 in f32.
+
+Where the time goes (3090, `--phases on`, summed over 2 reps, batch 1): t16k_q8 DeltaNet 6.6 s, multiplies 3.4 s, attention 2.6 s,
+elementwise 0.5 s; t4k_q8 DeltaNet 4.2 s, multiplies 2.3 s, attention 0.6 s. A Gated DeltaNet scan is one block per (row, head):
+a single 16k row uses 16 blocks on 82 SMs. Several rows per call help (`max_call_tokens` auto 65536 on >=20 GiB free: 16k shapes
+28k -> 39k tok/s). The next step is splitting a head's value columns (independent in the recurrence) over several blocks.
