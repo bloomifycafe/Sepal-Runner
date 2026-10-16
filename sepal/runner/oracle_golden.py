@@ -355,8 +355,13 @@ def stage_long(device: str, threads: int, only: list[str] | None) -> None:
     """fp32 oracle for the long cases (fp32 weights, no autocast), on the CPU or on a GPU (fp32 at 32k tokens needs the 24 GB card)."""
     if device == "cpu":
         oracle.hide_gpu()
+    else:
+        sys.modules["fla"] = None            # Triton kernels dot in TF32 (~3e-3 logit noise, measured): use transformers' reference PyTorch gated delta rule
     import torch
 
+    if device != "cpu":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     torch.set_num_threads(threads)
     o = oracle.Fp32Oracle(device=device)
     from sepal.train.unsloth_arm import fitted_temperatures
