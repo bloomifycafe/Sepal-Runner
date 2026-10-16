@@ -134,6 +134,13 @@ SEPAL_TEST(ref_engine_golden, shortest_cases) {
     std::size_t count = 3;
     if (const auto n = env_value("SEPAL_REF_CASES")) count = std::stoull(*n);
     cases.resize(std::min(count, cases.size()));
+    // SEPAL_REF_ONLY=<case file name>: just that case (lets a driver run one process per case in parallel)
+    if (const auto only = env_value("SEPAL_REF_ONLY")) {
+        cases.clear();
+        for (const json::Value& entry : manifest.at("cases").items()) {
+            if (entry.at("file").as_string() == *only) cases.emplace_back(entry.at("tokens").as_uint(), *only);
+        }
+    }
     const bool fp64 = env_value("SEPAL_REF_FP64").has_value();
 
     EngineOptions options;
