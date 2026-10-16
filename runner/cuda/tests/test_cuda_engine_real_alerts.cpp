@@ -463,8 +463,8 @@ SEPAL_TEST(real_diag, strict_float32_state_in_the_call_versus_stored) {
                 std::size_t eq = 0, eq2 = 0;
                 double worst = 0;
                 for (std::size_t q = 0; q < 3; ++q) {
-                    eq += same_bits(together[1 + q].hidden, stored[q].hidden) ? 1 : 0;
-                    eq2 += same_bits(together[1 + q].hidden, stored2[q].hidden) ? 1 : 0;
+                    eq += same_bits(together[1 + q].hidden, stored[q].hidden) ? 1U : 0U;
+                    eq2 += same_bits(together[1 + q].hidden, stored2[q].hidden) ? 1U : 0U;
                     worst = std::max(worst, max_abs_diff(together[1 + q].hidden.data(), stored[q].hidden.data(), real().hidden));
                 }
                 CHECK_EQ(eq, std::size_t{3});

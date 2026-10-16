@@ -102,9 +102,9 @@ struct Buffers {
 };
 
 void alloc_buffers(Buffers& b, int t, int n, int k) {
-    b.w_count = static_cast<std::size_t>(n) * k;
-    b.x_count = static_cast<std::size_t>(t) * k;
-    b.y_count = static_cast<std::size_t>(t) * n;
+    b.w_count = static_cast<std::size_t>(n) * static_cast<std::size_t>(k);
+    b.x_count = static_cast<std::size_t>(t) * static_cast<std::size_t>(k);
+    b.y_count = static_cast<std::size_t>(t) * static_cast<std::size_t>(n);
     std::mt19937 rng(12345);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     const float wscale = 1.0f / std::sqrt(static_cast<float>(k));
@@ -175,13 +175,13 @@ double rel_rms(const Buffers& b, int t, int n, int k, Out out) {
     }
     double sq_err = 0, sq_ref = 0;
     for (int r = 0; r < rows; ++r) {
-        const float* x = &b.hx[static_cast<std::size_t>(r) * k];
+        const float* x = &b.hx[static_cast<std::size_t>(r) * static_cast<std::size_t>(k)];
         for (int c = 0; c < n; ++c) {
-            const float* w = &b.hw[static_cast<std::size_t>(c) * k];
+            const float* w = &b.hw[static_cast<std::size_t>(c) * static_cast<std::size_t>(k)];
             double acc = 0;
             for (int i = 0; i < k; ++i) acc += static_cast<double>(x[i]) * w[i];
-            const double got = out == Out::F16 ? static_cast<double>(__half2float(y16[static_cast<std::size_t>(r) * n + c]))
-                                               : static_cast<double>(y32[static_cast<std::size_t>(r) * n + c]);
+            const double got = out == Out::F16 ? static_cast<double>(__half2float(y16[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)]))
+                                               : static_cast<double>(y32[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)]);
             sq_err += (got - acc) * (got - acc);
             sq_ref += acc * acc;
         }

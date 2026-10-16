@@ -258,7 +258,7 @@ SEPAL_TEST(attack_memory, budget_exceeded_in_the_middle_of_a_long_session_then_b
         CHECK(!a.failed.empty());
         CHECK_EQ(a.digests.size(), b.digests.size());
         std::size_t equal = 0;
-        for (std::size_t i = 0; i < std::min(a.digests.size(), b.digests.size()); ++i) equal += a.digests[i] == b.digests[i] ? 1 : 0;
+        for (std::size_t i = 0; i < std::min(a.digests.size(), b.digests.size()); ++i) equal += a.digests[i] == b.digests[i] ? 1U : 0U;
         std::cout << "    " << equal << " of " << a.digests.size() << " calls bit-identical to the same session on a roomy engine that never refused\n";
         CHECK_EQ(equal, a.digests.size());
         const EngineMemory m = tight->memory();
@@ -387,8 +387,8 @@ SEPAL_TEST(attack_memory, two_engines_alive_on_the_device_do_not_disturb_each_ot
         const auto xa = run(*a, {ra}), xb = run(*b, {rb});        // interleaved
         const auto ya = run(*a_alone, {ra2}), yb = run(*b_alone, {rb2});
         total += 2;
-        same += same_hidden(xa, ya) ? 1 : 0;
-        same += same_hidden(xb, yb) ? 1 : 0;
+        same += same_hidden(xa, ya) ? 1U : 0U;
+        same += same_hidden(xb, yb) ? 1U : 0U;
         sa = xa[0].snapshot;
         sb = xb[0].snapshot;
         sa2 = ya[0].snapshot;
@@ -476,7 +476,7 @@ SEPAL_TEST(attack_memory, a_call_whose_row_tables_do_not_fit_is_refused_cleanly_
     many.resize(100);
     const auto got = run(*engine, many);
     std::size_t same = 0;
-    for (std::size_t i = 0; i < 100; i += 11) same += same_bits(got[i].hidden, run(*engine, {many[i]})[0].hidden) ? 1 : 0;
+    for (std::size_t i = 0; i < 100; i += 11) same += same_bits(got[i].hidden, run(*engine, {many[i]})[0].hidden) ? 1U : 0U;
     CHECK_EQ(same, std::size_t{10});
 }
 
@@ -683,13 +683,13 @@ SEPAL_TEST(attack_concurrency, two_threads_on_one_engine_are_serialised_and_ever
         }
     };
     std::vector<std::vector<std::uint64_t>> want(kThreads), got(kThreads);
-    for (int t = 0; t < kThreads; ++t) work(*serial, t, want[t]);
+    for (int t = 0; t < kThreads; ++t) work(*serial, t, want[static_cast<std::size_t>(t)]);
     std::vector<std::thread> threads;
     std::atomic<int> failures{0};
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             try {
-                work(*engine, t, got[t]);
+                work(*engine, t, got[static_cast<std::size_t>(t)]);
             } catch (const std::exception& e) {
                 std::cerr << "thread " << t << ": " << e.what() << "\n";
                 ++failures;
@@ -700,9 +700,9 @@ SEPAL_TEST(attack_concurrency, two_threads_on_one_engine_are_serialised_and_ever
     CHECK_EQ(failures.load(), 0);
     std::size_t same = 0, total = 0;
     for (int t = 0; t < kThreads; ++t) {
-        for (std::size_t i = 0; i < want[t].size() && i < got[t].size(); ++i) {
+        for (std::size_t i = 0; i < want[static_cast<std::size_t>(t)].size() && i < got[static_cast<std::size_t>(t)].size(); ++i) {
             ++total;
-            same += want[t][i] == got[t][i] ? 1 : 0;
+            same += want[static_cast<std::size_t>(t)][i] == got[static_cast<std::size_t>(t)][i] ? 1U : 0U;
         }
     }
     std::cout << "  " << kThreads << " threads x " << kCalls << " calls on one engine: " << same << " of " << total << " results bit-identical to the same calls made serially\n";

@@ -335,7 +335,7 @@ SEPAL_TEST(snap_tiers, memory_goes_back_to_zero) {
     {
         std::vector<DeviceSnapshot> held;
         for (int i = 0; i < 6; ++i) {
-            const DeviceSnapshot s = make_chain(*engine, 1 + i % 3, 70 + static_cast<std::uint64_t>(i));
+            const DeviceSnapshot s = make_chain(*engine, static_cast<std::size_t>(1 + i % 3), 70 + static_cast<std::uint64_t>(i));
             engine->save(s, file);
             held.push_back(engine->load(file));
             held.push_back(engine->to_device(engine->to_host(s)));
@@ -471,7 +471,7 @@ SEPAL_TEST(snap_tiers, int8_multiply_engines_round_trip_and_do_not_mix_with_the_
         EngineOptions o = options_of(k);
         o.half_state = half_state;
         o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
-        if (int8) o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+        if (int8) o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true, {}};
         return std::make_unique<CudaEngine>(cfg, weights, o);
     };
     const fs::path file = scratch_dir() / "int8.snap";
@@ -490,7 +490,7 @@ SEPAL_TEST(snap_tiers, int8_multiply_engines_round_trip_and_do_not_mix_with_the_
     EngineOptions o;
     o.precision = Precision::F16;
     o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
-    o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+    o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true, {}};
     o.max_call_tokens = 1024;
     CudaEngine defaults(cfg, weights, o);
     CHECK_EQ(defaults.memory().slots_total, std::size_t{64});
@@ -601,7 +601,7 @@ SEPAL_TEST(snap_fuzz, every_truncation_is_refused) {
     const std::size_t n = f.good.size();
     std::size_t refused = 0;
     for (std::size_t len = 0; len < n; len += (len < 400 || len + 400 > n) ? 1 : 7) {
-        refused += f.refused(std::vector<char>(f.good.begin(), f.good.begin() + static_cast<std::ptrdiff_t>(len))) ? 1 : 0;
+        refused += f.refused(std::vector<char>(f.good.begin(), f.good.begin() + static_cast<std::ptrdiff_t>(len))) ? 1U : 0U;
     }
     std::vector<char> longer = f.good;
     longer.push_back(0);
@@ -786,7 +786,7 @@ SEPAL_TEST(snap_tiers, smoothed_int8_engines_do_not_mix_with_other_smoothing) {
         k.max_tokens = 1024;
         EngineOptions o = options_of(k);
         o.multiply_path = sepal::cuda::MultiplyPath::Invariant;
-        o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true};
+        o.int8_multiply = sepal::cuda::Int8Multiply{true, true, true, true, true, {}};
         o.int8_multiply.smoothing.stats = s;
         o.int8_multiply.smoothing.alpha = alpha;
         o.int8_multiply.smoothing.statistic = statistic;

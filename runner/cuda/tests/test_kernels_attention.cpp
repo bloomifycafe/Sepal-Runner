@@ -1014,7 +1014,7 @@ void invariance_case(const Geometry& g, const std::vector<std::uint32_t>& length
         const PassResult base = run_device(g, pool, weights, alone, variant);
         for (int trial = 0; trial < trials; ++trial) {
             std::uint32_t next_id = target_length;
-            const NodePtr shared = external_node(g, contexts[rng.below(static_cast<std::uint32_t>(contexts.size()))] + 1, 85 + trial, nullptr);
+            const NodePtr shared = external_node(g, contexts[rng.below(static_cast<std::uint32_t>(contexts.size()))] + 1, 85 + static_cast<std::uint64_t>(trial), nullptr);
             std::vector<RowPlan> others;
             const std::uint32_t count = 2 + rng.below(5);
             for (std::uint32_t i = 0; i < count; ++i) {
