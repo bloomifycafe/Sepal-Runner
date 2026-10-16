@@ -44,6 +44,21 @@ add_library(sepal_core STATIC
 target_include_directories(sepal_core PUBLIC include)
 target_link_libraries(sepal_core PRIVATE sepal_build_flags)
 
+# The fast CPU backend: own kernels, runtime dispatch between AVX2+FMA and AVX-512 (VNNI, BF16), no dependency.
+add_library(sepal_cpu STATIC
+  src/cpu/isa.cpp
+  src/cpu/thread_pool.cpp
+  src/cpu/gemm.cpp
+  src/cpu/gemm_kernels_avx2.cpp
+  src/cpu/gemm_kernels_avx512.cpp
+  src/cpu/provider.cpp
+)
+target_include_directories(sepal_cpu PUBLIC include)
+target_link_libraries(sepal_cpu PUBLIC sepal_core PRIVATE sepal_build_flags)
+
+add_executable(sepal-cpu-gemm-bench tools/sepal_cpu_gemm_bench.cpp)
+target_link_libraries(sepal-cpu-gemm-bench PRIVATE sepal_cpu sepal_build_flags)
+
 add_executable(sepal-info tools/sepal_info.cpp)
 target_link_libraries(sepal-info PRIVATE sepal_core sepal_build_flags)
 
@@ -72,8 +87,9 @@ if(SEPAL_BUILD_TESTS)
     tests/test_safetensors.cpp
     tests/test_loader.cpp
     tests/test_real_model.cpp
+    tests/test_cpu_gemm.cpp
   )
-  target_link_libraries(sepal_tests PRIVATE sepal_core sepal_build_flags)
+  target_link_libraries(sepal_tests PRIVATE sepal_cpu sepal_core sepal_build_flags)
   # The golden vectors written by tools/export_golden.py from the NumPy reference engine.
   target_compile_definitions(sepal_tests PRIVATE SEPAL_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden")
 
@@ -81,7 +97,7 @@ if(SEPAL_BUILD_TESTS)
   target_compile_definitions(sepal_tests PRIVATE SEPAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
   # One CTest entry per suite; `sepal_tests <suite>` fails if the name matches no test case.
-  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader)
+  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader cpu_gemm)
     add_test(NAME ${suite} COMMAND sepal_tests ${suite})
   endforeach()
 
