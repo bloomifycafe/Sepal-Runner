@@ -55,6 +55,8 @@ add_library(sepal_cpu STATIC
   src/cpu/deltanet.cpp
   src/cpu/attention.cpp
   src/cpu/trunk.cpp
+  src/cpu/clef_head.cpp
+  src/cpu/engine.cpp
   src/cpu/gemm_kernels_avx2.cpp
   src/cpu/gemm_kernels_avx512.cpp
   src/cpu/provider.cpp
@@ -64,6 +66,10 @@ target_link_libraries(sepal_cpu PUBLIC sepal_core PRIVATE sepal_build_flags)
 
 add_executable(sepal-cpu-gemm-bench tools/sepal_cpu_gemm_bench.cpp)
 target_link_libraries(sepal-cpu-gemm-bench PRIVATE sepal_cpu sepal_build_flags)
+
+add_executable(sepal-cpu-eval tools/sepal_cpu_eval.cpp)
+target_include_directories(sepal-cpu-eval PRIVATE tests)
+target_link_libraries(sepal-cpu-eval PRIVATE sepal_cpu sepal_build_flags)
 
 add_executable(sepal-info tools/sepal_info.cpp)
 target_link_libraries(sepal-info PRIVATE sepal_core sepal_build_flags)
