@@ -49,9 +49,9 @@ bool same_bits(const RequestLogits& a, const RequestLogits& b) {
 SEPAL_TEST(ref_engine, profiles_register_once) {
     // Other suites do not register; this is the only place register_ref_profiles runs in the test binary.
     register_ref_profiles();
-    CHECK(find_profile("cpu-ref") != nullptr);
-    CHECK(find_profile("cpu-ref64") != nullptr);
-    CHECK(find_profile("nope") == nullptr);
+    CHECK(find_engine_profile("cpu-ref") != nullptr);
+    CHECK(find_engine_profile("cpu-ref64") != nullptr);
+    CHECK(find_engine_profile("nope") == nullptr);
     CHECK_EQ(registered_profiles().size(), std::size_t{2});
     CHECK_THROWS(register_ref_profiles(), std::invalid_argument);
     CHECK_THROWS(register_profile({"", "x", {}, [](const EngineOptions&) { return std::unique_ptr<DecisionEngine>(); }}), std::invalid_argument);
@@ -134,6 +134,13 @@ SEPAL_TEST(ref_engine_golden, shortest_cases) {
     std::size_t count = 3;
     if (const auto n = env_value("SEPAL_REF_CASES")) count = std::stoull(*n);
     cases.resize(std::min(count, cases.size()));
+    // SEPAL_REF_ONLY=<case file name>: just that case (lets a driver run one process per case in parallel)
+    if (const auto only = env_value("SEPAL_REF_ONLY")) {
+        cases.clear();
+        for (const json::Value& entry : manifest.at("cases").items()) {
+            if (entry.at("file").as_string() == *only) cases.emplace_back(entry.at("tokens").as_uint(), *only);
+        }
+    }
     const bool fp64 = env_value("SEPAL_REF_FP64").has_value();
 
     EngineOptions options;
