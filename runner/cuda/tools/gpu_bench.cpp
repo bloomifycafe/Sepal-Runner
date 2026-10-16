@@ -61,6 +61,7 @@ double pct(std::vector<double> v, double q) {
 
 int main(int argc, char** argv) {
     std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on", dump_path, compare_path;
+    bool profile_phases = false;
     std::size_t batch = 1, reps = 3, warmup = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -75,6 +76,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefix-cache") prefix = v;
         else if (a == "--out") out_path = v;
         else if (a == "--dump") dump_path = v;
+        else if (a == "--phases") profile_phases = v == "on";
         else if (a == "--compare") compare_path = v;
         else if (a == "--label") label = v;
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
@@ -91,6 +93,8 @@ int main(int argc, char** argv) {
         else if (multiply == "invariant") options.multiply_path = cuda::MultiplyPath::Invariant;
         options.prefix_cache = prefix == "on";
         cuda::GpuDecisionEngine engine(model, options);
+        if (profile_phases) engine.trunk().set_profiling(true);
+        cuda::PhaseTimes ph;
         const std::vector<EncodedRequest> reqs = load(workload);
         std::uint64_t tokens = 0, questions = 0, option_count = 0;
         for (const EncodedRequest& r : reqs) {
@@ -114,6 +118,11 @@ int main(int argc, char** argv) {
                 const auto c0 = Clock::now();
                 const auto got = engine.score(std::span<const EncodedRequest>(reqs.data() + at, n));
                 lat.push_back(std::chrono::duration<double, std::milli>(Clock::now() - c0).count());
+                if (profile_phases) {
+                    const cuda::PhaseTimes q = engine.trunk().last_profile();
+                    ph.multiplies_ms += q.multiplies_ms; ph.deltanet_ms += q.deltanet_ms; ph.attention_ms += q.attention_ms;
+                    ph.elementwise_ms += q.elementwise_ms; ph.wall_ms += q.wall_ms; ph.tokens += q.tokens;
+                }
                 const ScoreTimes t = engine.last_times();
                 trunk_ms += t.trunk_ms;
                 head_ms += t.head_ms;
@@ -146,6 +155,9 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i < flat.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(flat[i] - ref[i])));
             std::cout << "  compare: " << flat.size() << " logits, max |dlogit| vs " << compare_path << " = " << std::scientific << worst << std::fixed << "\n";
         }
+        if (profile_phases)
+            std::cout << "  phases (all reps, summed over trunk calls; synchronised): multiplies " << ph.multiplies_ms << " ms, deltanet " << ph.deltanet_ms
+                      << " ms, attention " << ph.attention_ms << " ms, elementwise " << ph.elementwise_ms << " ms, host " << ph.host_ms() << " ms, wall " << ph.wall_ms << " ms\n";
         const cuda::EngineMemory mem = engine.trunk_memory();
         std::size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
