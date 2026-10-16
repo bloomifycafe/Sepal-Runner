@@ -310,3 +310,7 @@ add_library(sepal_runner_cuda SHARED $<TARGET_OBJECTS:sepal_capi> src/gpu_profil
 target_include_directories(sepal_runner_cuda SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_runner_cuda PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
 set_target_properties(sepal_runner_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
+
+add_executable(sepal-gpu-bench tools/gpu_bench.cpp)
+target_include_directories(sepal-gpu-bench SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-gpu-bench PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)

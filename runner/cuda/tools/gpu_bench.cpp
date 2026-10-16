@@ -14,6 +14,8 @@
 #include <sstream>
 #include <string>
 
+#include <cuda_runtime.h>
+
 #include "sepal/cuda/gpu_decision_engine.hpp"
 #include "sepal/json.hpp"
 
