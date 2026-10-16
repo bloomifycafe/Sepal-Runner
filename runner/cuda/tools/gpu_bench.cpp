@@ -62,6 +62,7 @@ double pct(std::vector<double> v, double q) {
 int main(int argc, char** argv) {
     std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on", dump_path, compare_path;
     bool profile_phases = false;
+    std::size_t call_tokens = 0;
     std::size_t batch = 1, reps = 3, warmup = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -76,6 +77,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefix-cache") prefix = v;
         else if (a == "--out") out_path = v;
         else if (a == "--dump") dump_path = v;
+        else if (a == "--call-tokens") call_tokens = std::stoull(v);
         else if (a == "--phases") profile_phases = v == "on";
         else if (a == "--compare") compare_path = v;
         else if (a == "--label") label = v;
@@ -92,6 +94,7 @@ int main(int argc, char** argv) {
         if (multiply == "cublas") options.multiply_path = cuda::MultiplyPath::Cublas;
         else if (multiply == "invariant") options.multiply_path = cuda::MultiplyPath::Invariant;
         options.prefix_cache = prefix == "on";
+        if (call_tokens != 0) options.max_call_tokens = call_tokens;
         cuda::GpuDecisionEngine engine(model, options);
         if (profile_phases) engine.trunk().set_profiling(true);
         cuda::PhaseTimes ph;

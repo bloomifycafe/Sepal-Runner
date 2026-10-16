@@ -26,7 +26,9 @@ struct GpuDecisionOptions {
     int device = 0;
     /// The longest request. The trunk's call buffers are sized for max_call_tokens, not for this: a longer request is cut.
     std::uint64_t max_tokens = 32768;
-    std::size_t max_call_tokens = 16384;
+    /// Tokens of one trunk call. 0: chosen from the free device memory (65536 from 20 GiB, 32768 from 10 GiB, else 16384). Several long rows
+    /// in one call fill the card's SMs (a Gated DeltaNet scan is one block per row and head), so larger is faster for long states.
+    std::size_t max_call_tokens = 0;
     std::size_t max_call_rows = 1024;
     ClefHeadCapacity head;
     /// Device memory the trunk may take (weights, call buffers, pools); 0: what is free, less the head and a margin.
