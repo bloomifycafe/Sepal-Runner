@@ -122,11 +122,15 @@ def cmd_compare(args) -> int:
     groups: dict[str, list[dict]] = {}
     # (a) golden
     golden = []
+    golden_missing: list[str] = []
     gdir = Path(args.golden)
     if gdir.is_dir() and (gdir / "manifest.json").exists():
         from safetensors import safe_open
         manifest = json.loads((gdir / "manifest.json").read_text(encoding="utf-8"))
         for entry in manifest["cases"]:
+            if not (gdir / entry["file"]).exists():
+                golden_missing.append(entry["name"])
+                continue
             with safe_open(str(gdir / entry["file"]), "pt") as f:
                 meta = f.metadata()
                 ids = f.get_tensor("input_ids").tolist()
@@ -184,6 +188,7 @@ def cmd_compare(args) -> int:
             gmis += 1
             result["mismatches"].append({"group": "golden-file", "case": case["name"]})
     result["golden_file_mismatches"] = gmis
+    result["golden_cases_listed_but_missing"] = golden_missing
     result["time_s"] = {"oracle_total": round(t_oracle, 3), "ours_total": round(t_ours, 3)}
 
     # speed at about 16k tokens: the longest panel/adversarial case, repeated

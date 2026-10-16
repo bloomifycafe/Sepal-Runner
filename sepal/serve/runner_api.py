@@ -330,7 +330,15 @@ def load_service(final: str, base: str, lib: str | None, profile: str, name: str
     from sepal.runner.engine import open_runner_api
     from sepal.train.unsloth_arm import fitted_temperatures
 
-    api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
+    if lib == "mock":                    # the Python front end alone (tokeniser, batching, HTTP) over a fake engine: for load tests
+        from sepal.runner.engine import CEngine, EngineBackend, RunnerApi
+        from sepal.runner.encode import Encoder
+        from sepal.runner.mock import FakeLib, MockEngine
+
+        engine = CEngine({"profile": profile, "max_tokens": MAX_SCORE_LEN}, lib=FakeLib(MockEngine()))
+        api = RunnerApi(Encoder.from_file(Path(final) / "tokenizer.json"), EngineBackend(engine), engine.hidden_size)
+    else:
+        api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
     temperatures = fitted_temperatures(str(Path(final).parent)) if calibrated else None
     return build_service(api, temperatures, name, **options), engine
 
@@ -338,7 +346,7 @@ def load_service(final: str, base: str, lib: str | None, profile: str, name: str
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--final", required=True, help="the checkpoint's final/ directory (tokenizer.json, sepal.json, adapter, head)")
     parser.add_argument("--base", required=True, help="the base model directory")
-    parser.add_argument("--lib", default=None, help="sepal_runner_*.dll/.so (default: $SEPAL_RUNNER_LIB)")
+    parser.add_argument("--lib", default=None, help="sepal_runner_*.dll/.so (default: $SEPAL_RUNNER_LIB); 'mock': a fake engine, to measure the Python front end alone")
     parser.add_argument("--profile", required=True, help="precision profile, e.g. gpu-f16, gpu-f32, cpu-f32, cpu-bf16")
     parser.add_argument("--name", default="sepal")
     parser.add_argument("--workers", type=int, default=4, help="tokenising threads")

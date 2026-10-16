@@ -265,6 +265,24 @@ def test_bind_rules(tiny_tokenizer):
     service.close()
 
 
+def test_decision_index_http_engine_talks_to_it(http):
+    """`socdecide.adapters.systemone_http.SystemOneHTTP` (what the Decision Index uses) against the runner server: answers parse, and a
+    request over the window is `Unsupported`, as against decision_api."""
+    from socdecide.adapters.base import Unsupported
+    from socdecide.adapters.systemone_http import SystemOneHTTP
+
+    base, _, _ = http
+    record = {"state": "user=admin host=srv ok", "questions": {
+        "q": {"type": "choice", "instructions": "pick", "criteria": {"A": "first", "B": "second"}, "label": "A"},
+        "r": {"type": "noul", "instructions": "yes or no?", "label": "yes"}}, "_meta": {"id": "x"}}
+    engine = SystemOneHTTP(base, model="sepal")
+    out = engine(record)
+    assert set(out["probabilities"]["q"]) == {"A", "B"} and set(out["probabilities"]["r"]) == {"yes", "no"}
+    assert abs(sum(out["probabilities"]["q"].values()) - 1) < 1e-9 and out["input_tokens"] > 0 and engine.served_model == "sepal-test"
+    with pytest.raises(Unsupported):
+        engine({**record, "state": "s" * 20000})
+
+
 def test_scheduler_closes_pending(tiny_tokenizer):
     service, _, _ = make(tiny_tokenizer)
     service.close()
