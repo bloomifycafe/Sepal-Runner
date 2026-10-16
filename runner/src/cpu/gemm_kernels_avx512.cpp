@@ -10,7 +10,9 @@ namespace {
 
 // ---- F32_Z: mr 12, nr 32, group 1 ---------------------------------------------------------------------------
 
-#define Z_DECL_F(r) __m512 c##r##0 = _mm512_setzero_ps(); __m512 c##r##1 = _mm512_setzero_ps();
+#define Z_DECL_F(r)                                                                            \
+    __m512 c##r##0 = args.accumulate ? _mm512_load_ps(tile + (r) * 32) : _mm512_setzero_ps(); \
+    __m512 c##r##1 = args.accumulate ? _mm512_load_ps(tile + (r) * 32 + 16) : _mm512_setzero_ps();
 #define Z_STEP_F(r)                                       \
     {                                                     \
         const __m512 ar = _mm512_set1_ps(pa[r]);          \

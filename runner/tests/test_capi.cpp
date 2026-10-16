@@ -236,6 +236,34 @@ void test_score(const sepal::test::GoldenCase& c) {
 
 } // namespace
 
+// The fast CPU profiles through the C ABI against cpu-ref (the tiny fixture's dimensions may not suit the packed
+// kernels: then the open fails with a message, which is itself checked).
+void test_fast_profiles(const sepal::test::GoldenCase& c) {
+    sepal_engine* ref = nullptr;
+    CHECK(sepal_open(options().c_str(), &ref) == 0);
+    Flat flat;
+    flat.add(c.request);
+    std::vector<float> want;
+    CHECK(flat.score(ref, want) == 0);
+    sepal_close(ref);
+    for (const char* profile : {"cpu-f32", "cpu-bf16", "cpu-q8"}) {
+        sepal_engine* e = nullptr;
+        if (sepal_open(options(", \"threads\": 2", profile).c_str(), &e) != 0) {
+            std::printf("%s: not openable on the tiny fixture: %s\n", profile, sepal_last_error());
+            CHECK(std::strlen(sepal_last_error()) > 0);
+            continue;
+        }
+        std::vector<float> got;
+        CHECK(flat.score(e, got) == 0);
+        CHECK(got.size() == want.size());
+        double worst = 0;
+        for (std::size_t i = 0; i < got.size() && i < want.size(); ++i) worst = std::max(worst, std::fabs(double(got[i]) - want[i]));
+        std::printf("%s: max |dlogit| vs cpu-ref %.3e\n", profile, worst);
+        CHECK(worst < (std::strcmp(profile, "cpu-f32") == 0 ? 1e-3 : 1.0));
+        sepal_close(e);
+    }
+}
+
 int main() {
     CHECK(sepal_api_version() == SEPAL_C_API_VERSION);
     CHECK(std::strlen(sepal_last_error()) == 0);
@@ -243,6 +271,7 @@ int main() {
     test_open_errors();
     test_info();
     test_score(c);
+    test_fast_profiles(c);
     std::printf("%d check(s), %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -28,7 +28,7 @@ VariantInfo info(Variant v) {
     case Variant::F32_Z: return {WeightKind::F32, Isa::Avx512, 12, 32, 1, 4, 4};
     case Variant::F32_Y: return {WeightKind::F32, Isa::Avx2, 6, 16, 1, 4, 4};
     case Variant::BF16_Z: return {WeightKind::BF16, Isa::Avx512, 12, 32, 2, 2, 2};
-    case Variant::BF16_Y: return {WeightKind::BF16, Isa::Avx2, 4, 16, 2, 2, 2};
+    case Variant::BF16_Y: return {WeightKind::BF16, Isa::Avx2, 6, 16, 1, 2, 4}; // bf16 weights widened to a float panel, float activations
     case Variant::I8_Z: return {WeightKind::I8, Isa::Avx512, 12, 32, 4, 1, 1};
     case Variant::I8_Y: return {WeightKind::I8, Isa::Avx2, 4, 16, 2, 2, 2};
     }
@@ -223,13 +223,13 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
             const float* src = x + row * ldx;
             switch (variant) {
             case Variant::F32_Z:
+            case Variant::BF16_Y: // AVX2 bf16 keeps float activations (the weights are widened exactly)
             case Variant::F32_Y: {
                 float* d = reinterpret_cast<float*>(dst);
                 for (std::size_t kk = 0; kk < k; ++kk) d[kk * mr + r] = src[kk];
                 break;
             }
-            case Variant::BF16_Z:
-            case Variant::BF16_Y: {
+            case Variant::BF16_Z: {
                 std::uint16_t* d = reinterpret_cast<std::uint16_t*>(dst);
                 for (std::size_t kk = 0; kk < k; ++kk) d[((kk / g) * mr + r) * g + kk % g] = float_to_bf16(src[kk]);
                 break;
@@ -300,16 +300,74 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
     if (w.swiglu() && accumulate) throw std::invalid_argument("gemm_packed: SwiGLU weights cannot accumulate");
     if (x.rows == 0) return;
     const VariantInfo vi = info(w.variant());
-    const KernelFn kernel = vi.isa == Isa::Avx512 ? kernel_avx512(w.variant()) : kernel_avx2(w.variant());
+    const bool widen = w.variant() == Variant::BF16_Y; // bf16 weight slices are widened to floats, then the F32 kernel runs
+    const KernelFn kernel = vi.isa == Isa::Avx512 ? kernel_avx512(w.variant()) : kernel_avx2(widen ? Variant::F32_Y : w.variant());
     if (kernel == nullptr) throw std::logic_error("gemm_packed: no kernel for the variant");
 
     const std::size_t mr = static_cast<std::size_t>(vi.mr);
     const std::size_t nr = static_cast<std::size_t>(vi.nr);
     const std::size_t out_per_panel = w.swiglu() ? nr / 2 : nr;
+    const bool i8 = is_i8(w.variant());
+    const std::size_t group = static_cast<std::size_t>(vi.group);
+
+    if (!i8) {
+        // k-blocked schedule (BLIS style): a task owns a block of ~96 rows and ~64 output columns, sweeps k in slices of
+        // `kc` values, and keeps every micro tile of the block in `tiles` between slices, so the A slice (rows x kc)
+        // and the B slices (columns x kc) stay in the L2 cache and every B panel slice is reused over all row blocks.
+        // The accumulation order of one element is still increasing k in one fp32 chain: the result does not change.
+        constexpr std::size_t kc_values = 256, rows_per_task = 96, cols_per_task = 64;
+        const std::size_t kcg = std::max<std::size_t>(1, kc_values / group);
+        const std::size_t mbn = std::max<std::size_t>(1, rows_per_task / mr);
+        const std::size_t pn = std::max<std::size_t>(1, cols_per_task / nr);
+        const std::size_t m_tasks = ceil_div(x.blocks, mbn);
+        const std::size_t n_tasks = ceil_div(w.panels(), pn);
+        const std::size_t tile_floats = mr * nr;
+        const std::size_t a_block_stride = x.block_bytes;
+        pool.parallel_for(m_tasks * n_tasks, [&](std::size_t task, unsigned) {
+            const std::size_t mt = task / n_tasks, nt = task % n_tasks;
+            const std::size_t mb0 = mt * mbn, mb1 = std::min(x.blocks, mb0 + mbn);
+            const std::size_t p0 = nt * pn, p1 = std::min(w.panels(), p0 + pn);
+            thread_local AlignedBuffer<float> tiles, widened;
+            tiles.resize((mbn * pn) * tile_floats);
+            if (widen) widened.resize(kcg * nr);
+            KernelArgs ka;
+            for (std::size_t kg0 = 0; kg0 < x.kgroups; kg0 += kcg) {
+                ka.kgroups = std::min(kcg, x.kgroups - kg0);
+                ka.accumulate = kg0 != 0;
+                for (std::size_t p = p0; p < p1; ++p) {
+                    ka.b = w.panel(p) + kg0 * nr * group * vi.weight_bytes;
+                    if (widen) {
+                        const std::uint16_t* src = reinterpret_cast<const std::uint16_t*>(ka.b);
+                        float* dst = widened.data();
+                        for (std::size_t e = 0; e < ka.kgroups * nr; e += 8) {
+                            const __m256i v = _mm256_cvtepu16_epi32(_mm_load_si128(reinterpret_cast<const __m128i*>(src + e)));
+                            _mm256_store_ps(dst + e, _mm256_castsi256_ps(_mm256_slli_epi32(v, 16)));
+                        }
+                        ka.b = widened.data();
+                    }
+                    for (std::size_t mb = mb0; mb < mb1; ++mb) {
+                        ka.a = x.data.data() + mb * a_block_stride + kg0 * mr * group * vi.act_bytes;
+                        ka.tile = tiles.data() + ((p - p0) * mbn + (mb - mb0)) * tile_floats;
+                        kernel(ka);
+                    }
+                }
+            }
+            for (std::size_t p = p0; p < p1; ++p) {
+                const std::size_t col0 = p * out_per_panel;
+                const std::size_t cols_valid = std::min(out_per_panel, w.n() - col0);
+                for (std::size_t mb = mb0; mb < mb1; ++mb) {
+                    const float* tile = tiles.data() + ((p - p0) * mbn + (mb - mb0)) * tile_floats;
+                    const std::size_t rows_valid = std::min(mr, x.rows - mb * mr);
+                    finish_tile(tile, vi.nr, rows_valid, cols_valid, w.swiglu(), accumulate, y + mb * mr * ldy + col0, ldy);
+                }
+            }
+        });
+        return;
+    }
+
     const std::size_t mb_per_task = 8;
     const std::size_t m_tasks = ceil_div(x.blocks, mb_per_task);
     const std::size_t tasks = w.panels() * m_tasks;
-    const bool i8 = is_i8(w.variant());
 
     pool.parallel_for(tasks, [&](std::size_t task, unsigned) {
         const std::size_t p = task / m_tasks;
@@ -319,16 +377,14 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
         ka.b = w.panel(p);
         ka.kgroups = x.kgroups;
         ka.tile = tile;
-        if (i8) {
-            ka.wscale = w.scale(p);
-            ka.corr = w.corr(p);
-        }
+        ka.wscale = w.scale(p);
+        ka.corr = w.corr(p);
         const std::size_t col0 = p * out_per_panel;
         const std::size_t cols_valid = std::min(out_per_panel, w.n() - col0);
         const std::size_t mb_end = std::min(x.blocks, (mt + 1) * mb_per_task);
         for (std::size_t mb = mt * mb_per_task; mb < mb_end; ++mb) {
             ka.a = x.data.data() + mb * x.block_bytes;
-            if (i8) ka.xscale = x.row_scale.data() + mb * mr;
+            ka.xscale = x.row_scale.data() + mb * mr;
             kernel(ka);
             const std::size_t rows_valid = std::min(mr, x.rows - mb * mr);
             finish_tile(tile, vi.nr, rows_valid, cols_valid, w.swiglu(), accumulate, y + mb * mr * ldy + col0, ldy);
