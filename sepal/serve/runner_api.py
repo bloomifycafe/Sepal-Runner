@@ -10,7 +10,8 @@ cache keyed by the canonical request, and in-flight coalescing of identical requ
 
 Endpoints: `POST /v1/systemone`; `POST /v1/systemone/batch` with `{"requests": [body, ...]}` answering
 `{"results": [{"status": 200, "body": answer} | {"status": 422, "body": {"detail": ...}}, ...]}`; `GET /health`; `GET /stats`.
-Binds to 127.0.0.1; a non-loopback host is refused unless `--allow-nonloopback` is given (there is no authentication).
+Binds to 127.0.0.1; a non-loopback host is refused unless an API key is set (`--api-key` / $SEPAL_API_KEY; Bearer or X-API-Key header).
+A full server (`--max-pending` requests in flight) answers 429, a request waiting longer than `--request-timeout` 504; `/stats` (JSON) and `/metrics` (Prometheus text) report counters and latency percentiles.
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ import argparse
 import collections
 import concurrent.futures
 import hashlib
+import hmac
+import os
 import ipaddress
 import json
 import queue
@@ -34,6 +37,8 @@ TOKEN_BUDGET = 65536        # tokens of one engine call at most (a single longer
 MAX_BATCH_REQUESTS = 64
 MAX_WAIT_S = 0.002          # how long a batch waits for company once the engine is idle
 MAX_BATCH_BODIES = 4096     # bodies of one /v1/systemone/batch call
+MAX_PENDING = 512           # requests in flight (queued, tokenising or scoring) before new ones get 429
+REQUEST_TIMEOUT_S = 600.0   # a request waits at most this long for its answer (504)
 
 
 class BatchScheduler:
@@ -152,8 +157,11 @@ class RunnerService:
     whose result is the answer dict, or whose exception is `Refused` (400/422) or the failure that makes a 500. Answers are shared
     between callers of an identical request: treat them as read-only."""
 
-    def __init__(self, scorer: UnslothScorer, scheduler: BatchScheduler, name: str, workers: int = 4, cache_size: int = 4096):
+    def __init__(self, scorer: UnslothScorer, scheduler: BatchScheduler, name: str, workers: int = 4, cache_size: int = 4096,
+                 max_pending: int = MAX_PENDING, request_timeout_s: float = REQUEST_TIMEOUT_S):
         self.scorer, self.scheduler, self.name = scorer, scheduler, name
+        self.max_pending, self.request_timeout_s = max(1, int(max_pending)), float(request_timeout_s)
+        self._latencies: collections.deque = collections.deque(maxlen=2000)
         self.pool = concurrent.futures.ThreadPoolExecutor(max(1, workers), thread_name_prefix="sepal-tokenise")
         self.cache_size = max(0, int(cache_size))
         self._cache: collections.OrderedDict[str, dict] = collections.OrderedDict()
@@ -175,6 +183,11 @@ class RunnerService:
             if key in self._inflight:
                 self.stats["coalesced"] += 1
                 return self._inflight[key]
+            if len(self._inflight) >= self.max_pending:
+                self.stats["rejected_429"] += 1
+                rejected: concurrent.futures.Future = concurrent.futures.Future()
+                rejected.set_exception(Refused(429, f"server busy: {self.max_pending} requests in flight, retry later"))
+                return rejected
             future: concurrent.futures.Future = concurrent.futures.Future()
             self._inflight[key] = future
         self.pool.submit(self._start, body, key, future)
@@ -218,40 +231,56 @@ class RunnerService:
     def answer(self, body: Any) -> dict:
         return self.submit(body).result()
 
-    def outcome(self, body: Any) -> tuple[int, dict]:
-        """(HTTP status, JSON body) exactly as `decision_api`'s handler answers."""
+    def _wait(self, future: concurrent.futures.Future, started: float) -> tuple[int, dict]:
         try:
-            return 200, self.answer(body)
+            result = 200, future.result(timeout=max(0.0, self.request_timeout_s - (time.monotonic() - started)))
         except Refused as refusal:
-            return refusal.status, {"detail": refusal.message}
+            result = refusal.status, {"detail": refusal.message}
+        except concurrent.futures.TimeoutError:
+            self.stats["timeouts"] += 1
+            result = 504, {"detail": f"no answer within {self.request_timeout_s:g} s"}
         except Exception as error:                     # noqa: BLE001  (a real failure: the client records an error and may retry)
-            return 500, {"detail": f"{type(error).__name__}: {error}"}
+            result = 500, {"detail": f"{type(error).__name__}: {error}"}
+        with self._lock:
+            self._latencies.append(time.monotonic() - started)
+            self.stats[f"status_{result[0]}"] += 1
+        return result
+
+    def outcome(self, body: Any) -> tuple[int, dict]:
+        """(HTTP status, JSON body) exactly as `decision_api`'s handler answers; 429 when the server is full, 504 on timeout."""
+        started = time.monotonic()
+        return self._wait(self.submit(body), started)
 
     def outcomes(self, bodies: list) -> list[tuple[int, dict]]:
+        started = time.monotonic()
         futures = [self.submit(b) for b in bodies]
-        out = []
-        for future in futures:
-            try:
-                out.append((200, future.result()))
-            except Refused as refusal:
-                out.append((refusal.status, {"detail": refusal.message}))
-            except Exception as error:                 # noqa: BLE001
-                out.append((500, {"detail": f"{type(error).__name__}: {error}"}))
-        return out
+        return [self._wait(f, started) for f in futures]
 
     def snapshot(self) -> dict:
         s = self.scheduler
-        return {"model": self.name, "uptime_s": round(time.time() - self.started, 1), **self.stats,
+        with self._lock:
+            lat = sorted(self._latencies)
+        pct = (lambda q: round(lat[min(len(lat) - 1, int(q * len(lat)))] * 1000, 1)) if lat else (lambda q: None)
+        return {"pending": len(self._inflight), "max_pending": self.max_pending, "queue_depth": s._queue.qsize(),
+                "latency_ms_p50": pct(0.5), "latency_ms_p95": pct(0.95), "latency_ms_p99": pct(0.99), "model": self.name, "uptime_s": round(time.time() - self.started, 1), **self.stats,
                 "cache_entries": len(self._cache), "batches": s.batches, "batched_requests": s.requests, "batched_tokens": s.tokens,
                 "mean_batch_requests": round(s.requests / s.batches, 2) if s.batches else 0, "engine_seconds": round(s.engine_seconds, 3),
                 "batch_sizes": dict(sorted(s.sizes.items()))}
+
+    def metrics_text(self) -> str:
+        """Prometheus text exposition of `snapshot()`'s numbers."""
+        lines = []
+        for key, value in self.snapshot().items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                lines.append(f"sepal_runner_{key} {value}")
+        return "\n".join(lines) + "\n"
 
     def close(self) -> None:
         self.pool.shutdown(wait=True, cancel_futures=True)
         self.scheduler.close()
 
 
-def make_handler(service: RunnerService, name: str):
+def make_handler(service: RunnerService, name: str, api_key: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -263,13 +292,35 @@ def make_handler(service: RunnerService, name: str):
             self.end_headers()
             self.wfile.write(data)
 
+        def _authorised(self) -> bool:
+            if not api_key:
+                return True
+            given = self.headers.get("X-API-Key") or ""
+            bearer = self.headers.get("Authorization") or ""
+            if bearer.startswith("Bearer "):
+                given = bearer[7:]
+            return hmac.compare_digest(given.encode("utf-8"), api_key.encode("utf-8"))
+
         def do_GET(self):
+            if self.path == "/health":
+                return self._send(200, {"status": "ok", "model": name})
+            if not self._authorised():
+                return self._send(401, {"detail": "missing or wrong API key"})
             if self.path == "/stats":
                 return self._send(200, service.snapshot())
-            self._send(200 if self.path == "/health" else 404, {"status": "ok", "model": name})
+            if self.path == "/metrics":
+                data = service.metrics_text().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
+            self._send(404, {"detail": "not found"})
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if not self._authorised():
+                return self._send(401, {"detail": "missing or wrong API key"})
             if self.path not in ("/v1/systemone", "/v1/systemone/batch"):
                 return self._send(404, {"detail": "not found"})
             try:
@@ -307,21 +358,21 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def serve(service: RunnerService, name: str, host: str, port: int, allow_nonloopback: bool = False) -> Server:
-    """Binds and returns the server (the caller runs `serve_forever`); refuses a non-loopback host without the explicit flag."""
-    if not is_loopback(host) and not allow_nonloopback:
-        raise SystemExit(f"refusing to bind {host}: the server has no authentication; pass --allow-nonloopback to expose it")
-    return Server((host, port), make_handler(service, name))
+def serve(service: RunnerService, name: str, host: str, port: int, api_key: str | None = None) -> Server:
+    """Binds and returns the server (the caller runs `serve_forever`); refuses a non-loopback host without an API key."""
+    if not is_loopback(host) and not api_key:
+        raise SystemExit(f"refusing to bind {host}: a non-loopback address needs an API key (--api-key or $SEPAL_API_KEY)")
+    return Server((host, port), make_handler(service, name, api_key))
 
 
 def build_service(api: Any, temperatures: Any, name: str, *, backend: Any = None, workers: int = 4, cache_size: int = 4096,
                   token_budget: int = TOKEN_BUDGET, max_requests: int = MAX_BATCH_REQUESTS, max_wait_s: float = MAX_WAIT_S,
-                  limit: int = MAX_SCORE_LEN) -> RunnerService:
+                  limit: int = MAX_SCORE_LEN, max_pending: int = MAX_PENDING, request_timeout_s: float = REQUEST_TIMEOUT_S) -> RunnerService:
     """A service over a `RunnerApi` (its `backend` is replaced by a scheduler over it). `temperatures` as `UnslothScorer` takes them."""
     scheduler = BatchScheduler(backend if backend is not None else api.backend, token_budget, max_requests, max_wait_s)
     scored = type(api)(api.encoder, scheduler, api.hidden_size)      # a RunnerApi whose logits go through the scheduler
     scorer = UnslothScorer(NoTruncateApi(scored, limit), limit, name=name, temperatures=temperatures, workers=0)
-    return RunnerService(scorer, scheduler, name, workers=workers, cache_size=cache_size)
+    return RunnerService(scorer, scheduler, name, workers=workers, cache_size=cache_size, max_pending=max_pending, request_timeout_s=request_timeout_s)
 
 
 def load_service(final: str, base: str, lib: str | None, profile: str, name: str, *, calibrated: bool = True, **options) -> tuple[RunnerService, Any]:
@@ -343,6 +394,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name", default="sepal")
     parser.add_argument("--workers", type=int, default=4, help="tokenising threads")
     parser.add_argument("--cache-size", type=int, default=4096, help="result cache entries (0: off)")
+    parser.add_argument("--max-pending", type=int, default=MAX_PENDING, help="requests in flight before new ones get 429")
+    parser.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_S, help="seconds before a request is answered 504")
     parser.add_argument("--token-budget", type=int, default=TOKEN_BUDGET)
     parser.add_argument("--max-batch-requests", type=int, default=MAX_BATCH_REQUESTS)
     parser.add_argument("--max-wait-ms", type=float, default=MAX_WAIT_S * 1000)
@@ -350,7 +403,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def service_options(args) -> dict:
-    return {"workers": args.workers, "cache_size": args.cache_size, "token_budget": args.token_budget,
+    return {"workers": args.workers, "cache_size": args.cache_size, "max_pending": args.max_pending, "request_timeout_s": args.request_timeout, "token_budget": args.token_budget,
             "max_requests": args.max_batch_requests, "max_wait_s": args.max_wait_ms / 1000, "calibrated": not args.temperature_1}
 
 
@@ -359,12 +412,12 @@ def main(argv: list[str] | None = None) -> int:
     add_arguments(parser)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--allow-nonloopback", action="store_true")
+    parser.add_argument("--api-key", default=os.environ.get("SEPAL_API_KEY"), help="required for a non-loopback --host; sent as 'Authorization: Bearer KEY' or 'X-API-Key: KEY' (/health is open)")
     args = parser.parse_args(argv)
-    if not is_loopback(args.host) and not args.allow_nonloopback:
-        raise SystemExit(f"refusing to bind {args.host}: the server has no authentication; pass --allow-nonloopback to expose it")
+    if not is_loopback(args.host) and not args.api_key:
+        raise SystemExit(f"refusing to bind {args.host}: a non-loopback address needs an API key (--api-key or $SEPAL_API_KEY)")
     service, engine = load_service(args.final, args.base, args.lib, args.profile, args.name, **service_options(args))
-    server = serve(service, args.name, args.host, args.port, args.allow_nonloopback)
+    server = serve(service, args.name, args.host, args.port, args.api_key)
     print(f"serving {args.name} ({args.profile}) on http://{args.host}:{args.port}/v1/systemone", flush=True)
     try:
         server.serve_forever()
