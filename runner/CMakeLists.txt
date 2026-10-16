@@ -37,6 +37,8 @@ add_library(sepal_core STATIC
   src/io/mapped_file.cpp
   src/io/safetensors.cpp
   src/model/loader.cpp
+  src/model/clef_head.cpp
+  src/model/trained_model.cpp
   src/provider/gemm_ref.cpp
   src/model/ops.cpp
   src/plan/planner.cpp
@@ -72,6 +74,7 @@ if(SEPAL_BUILD_TESTS)
     tests/test_safetensors.cpp
     tests/test_loader.cpp
     tests/test_real_model.cpp
+    tests/test_trained.cpp
   )
   target_link_libraries(sepal_tests PRIVATE sepal_core sepal_build_flags)
   # The golden vectors written by tools/export_golden.py from the NumPy reference engine.
@@ -81,7 +84,7 @@ if(SEPAL_BUILD_TESTS)
   target_compile_definitions(sepal_tests PRIVATE SEPAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
   # One CTest entry per suite; `sepal_tests <suite>` fails if the name matches no test case.
-  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader)
+  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader trained clef)
     add_test(NAME ${suite} COMMAND sepal_tests ${suite})
   endforeach()
 
@@ -89,6 +92,13 @@ if(SEPAL_BUILD_TESTS)
   # SEPAL_REAL_MODEL and SEPAL_REAL_GOLDEN (see tests/test_real_model.cpp) and reports itself as skipped without them.
   add_test(NAME real COMMAND sepal_tests real)
   set_tests_properties(real PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model" TIMEOUT 3600)
+
+  # Real-model suites for the trained model: need SEPAL_TRAINED_FINAL and SEPAL_TRAINED_BASE (and SEPAL_GOLDEN_DIR for the
+  # head golden check, optionally SEPAL_GOLDEN_MAX_TOKENS); they report themselves as skipped without them.
+  foreach(suite trained_real clef_golden)
+    add_test(NAME ${suite} COMMAND sepal_tests ${suite})
+    set_tests_properties(${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model" TIMEOUT 3600)
+  endforeach()
 
   # The benchmark tool on the test geometry with a short request: it runs, and its hidden states are finite.
   add_test(NAME sepal_bench_tiny COMMAND sepal-bench --preset tiny --state 24 --branches 3 --branch-tokens 5)
