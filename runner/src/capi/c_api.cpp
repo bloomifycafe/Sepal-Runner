@@ -86,7 +86,7 @@ sepal::EngineOptions parse_options(const char* options_json, const sepal::Profil
     if (root.kind() != sepal::json::Kind::Object) throw std::invalid_argument("options_json must be a JSON object");
     sepal::EngineOptions o;
     o.profile = need_string(root, "profile");
-    const sepal::ProfileInfo* profile = sepal::find_profile(o.profile);
+    const sepal::ProfileInfo* profile = sepal::find_engine_profile(o.profile);
     if (profile == nullptr) {
         std::string known;
         for (const std::string& n : sepal::registered_profiles()) known += (known.empty() ? "" : ", ") + n;

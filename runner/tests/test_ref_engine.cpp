@@ -49,9 +49,9 @@ bool same_bits(const RequestLogits& a, const RequestLogits& b) {
 SEPAL_TEST(ref_engine, profiles_register_once) {
     // Other suites do not register; this is the only place register_ref_profiles runs in the test binary.
     register_ref_profiles();
-    CHECK(find_profile("cpu-ref") != nullptr);
-    CHECK(find_profile("cpu-ref64") != nullptr);
-    CHECK(find_profile("nope") == nullptr);
+    CHECK(find_engine_profile("cpu-ref") != nullptr);
+    CHECK(find_engine_profile("cpu-ref64") != nullptr);
+    CHECK(find_engine_profile("nope") == nullptr);
     CHECK_EQ(registered_profiles().size(), std::size_t{2});
     CHECK_THROWS(register_ref_profiles(), std::invalid_argument);
     CHECK_THROWS(register_profile({"", "x", {}, [](const EngineOptions&) { return std::unique_ptr<DecisionEngine>(); }}), std::invalid_argument);

@@ -51,7 +51,7 @@ struct ProfileInfo {
 /// Adds a profile. Thread-safe. Throws std::invalid_argument for an empty name, a missing factory or a name taken.
 void register_profile(ProfileInfo info);
 /// The registered profile, or nullptr. The pointer stays valid for the life of the process.
-const ProfileInfo* find_profile(std::string_view name);
+const ProfileInfo* find_engine_profile(std::string_view name);
 /// All registered names, sorted.
 std::vector<std::string> registered_profiles();
 

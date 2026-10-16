@@ -32,7 +32,7 @@ void register_profile(ProfileInfo info) {
     }
 }
 
-const ProfileInfo* find_profile(std::string_view name) {
+const ProfileInfo* find_engine_profile(std::string_view name) {
     Registry& r = registry();
     const std::lock_guard<std::mutex> lock(r.mutex);
     const auto it = r.profiles.find(name);
