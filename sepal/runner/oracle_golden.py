@@ -31,8 +31,8 @@ import numpy as np
 
 from sepal.runner import oracle
 
-GOLDEN_DIR = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\runner-golden\full08b")
-SUITE_DEV = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\suites\socdecide-0.7.0\development.jsonl")
+GOLDEN_DIR = oracle.RUNS / "runner-golden" / "full08b"
+SUITE_DEV = oracle.RUNS / "suites" / "socdecide-0.7.0" / "development.jsonl"
 SEC_MEMBERS = ["DET-1", "DET-1b", "POL-1", "ABS-1", "MAP-1", "MAP-2", "VUL-1", "PRI-1", "ACT-2", "ENT-2"]     # experiments/rounds/full08b.yaml SEC-dev
 LAYER_TASKS = {"DET-1": 450, "VUL-1": 450, "ENT-2": 450}          # cases that also carry layer_hidden_fp32 (token cap keeps the file small)
 MAX_CASE_TOKENS = 1500
@@ -253,7 +253,7 @@ def environment(device: str, extra: dict | None = None) -> dict:
     import importlib.metadata as md
     import torch
 
-    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": "AMD Ryzen 5 7600X (6C/12T), RTX 3060 12 GB, Windows 11", "python": platform.python_version(),
+    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": os.environ.get("SEPAL_MACHINE", "AMD Ryzen 5 7600X (6C/12T), RTX 3060 12 GB, Windows 11"), "python": platform.python_version(),
            "torch": torch.__version__, "device": device, "torch_threads": torch.get_num_threads()}
     for name in ("transformers", "peft", "unsloth", "unsloth_zoo", "safetensors", "numpy"):
         try:
@@ -335,12 +335,12 @@ def stage_cpu(threads: int) -> None:
     print("manifest written", flush=True)
 
 
-WORKLOADS = Path("E:/MYCOMPANY/BlumSOC/Sepal/runs/runner-bench/workloads")
-LONG_SHAPES = [f"t{t}_q{q}" for t in ("1k", "4k", "16k") for q in (1, 8, 32)]
+WORKLOADS = oracle.RUNS / "runner-bench" / "workloads"
+LONG_SHAPES = [f"t{t}_q{q}" for t in ("1k", "4k", "16k") for q in (1, 8, 32)] + ["t32k_q8"]
 
 
 def long_cases() -> list[Case]:
-    """The first request of every workload shape (the 1k/4k/16k x 1/8/32 grid) as a golden case `wl_<shape>`."""
+    """The first request of every workload shape (the 1k/4k/16k x 1/8/32 grid and t32k_q8) as a golden case `wl_<shape>`."""
     cases = []
     for shape in LONG_SHAPES:
         with open(WORKLOADS / f"{shape}.jsonl", encoding="utf-8") as f:
@@ -351,13 +351,14 @@ def long_cases() -> list[Case]:
     return cases
 
 
-def stage_long_cpu(threads: int, only: list[str] | None) -> None:
-    """fp32 oracle on the CPU for the long cases (the reference: fp32 weights, no autocast; needs no GPU)."""
-    oracle.hide_gpu()
+def stage_long(device: str, threads: int, only: list[str] | None) -> None:
+    """fp32 oracle for the long cases (fp32 weights, no autocast), on the CPU or on a GPU (fp32 at 32k tokens needs the 24 GB card)."""
+    if device == "cpu":
+        oracle.hide_gpu()
     import torch
 
     torch.set_num_threads(threads)
-    o = oracle.Fp32Oracle(device="cpu")
+    o = oracle.Fp32Oracle(device=device)
     from sepal.train.unsloth_arm import fitted_temperatures
 
     temps = fitted_temperatures(str(oracle.STAGE))
@@ -368,7 +369,7 @@ def stage_long_cpu(threads: int, only: list[str] | None) -> None:
         if path.is_file():
             continue
         state_text, questions = prepare(case)
-        enc = o.encode(state_text, questions)
+        enc = o.encode(state_text, questions, max_length=65536)
         assert hashlib.sha256(np.asarray(enc.input_ids, dtype=np.int32).tobytes()).hexdigest() == json.loads(case.note)["input_ids_sha256"], "workload ids differ"
         t = time.time()
         out = o.forward(enc)
@@ -378,7 +379,8 @@ def stage_long_cpu(threads: int, only: list[str] | None) -> None:
         meta = case_meta(case, state_text, questions, enc, o.tokenizer)
         meta["probabilities_calibrated_fp32"] = json.dumps(calibrated_probabilities(temps, questions, enc, out["logits"]))
         write_case(path, tensors, meta)
-        print(f"{case.name}: {len(enc.input_ids)} tokens, {len(out['logits'])} logits, {time.time() - t:.1f} s", flush=True)
+        print(f"{case.name}: {len(enc.input_ids)} tokens, {len(out['logits'])} logits, {time.time() - t:.1f} s ({device})", flush=True)
+        (GOLDEN_DIR / f"_env_long_fp32_{device}.json").write_text(json.dumps(environment(device, {"oracle": "Fp32Oracle (vendored Clef head), fp32, no autocast", "platform": platform.platform()}), indent=1), encoding="utf-8")
     write_manifest()
 
 
@@ -433,7 +435,7 @@ def stage_crosscheck() -> None:
     for path in _case_files():
         tensors, meta = read_case(path)
         record = json.loads(meta["record"])
-        enc = oracle.load_vendored_clef().encode_record(model.tokenizer, oracle.record_for(record["state"], record["questions"]), max_length=oracle.MAX_SCORE_LEN)
+        enc = oracle.load_vendored_clef().encode_record(model.tokenizer, oracle.record_for(record["state"], record["questions"]), max_length=65536)
         if list(enc.input_ids) != tensors["input_ids"].tolist():
             raise RuntimeError(f"{path.name}: ids differ")
         torch.cuda.reset_peak_memory_stats()
@@ -458,7 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("cpu")
     c.add_argument("--threads", type=int, default=12)
-    lc = sub.add_parser("long-cpu")
+    lc = sub.add_parser("long")
+    lc.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     lc.add_argument("--threads", type=int, default=12)
     lc.add_argument("--only", nargs="*")
     sv = sub.add_parser("served")
@@ -468,8 +471,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "cpu":
         stage_cpu(args.threads)
-    elif args.command == "long-cpu":
-        stage_long_cpu(args.threads, args.only)
+    elif args.command == "long":
+        stage_long(args.device, args.threads, args.only)
     elif args.command == "served":
         stage_served(args.force)
     elif args.command == "crosscheck":

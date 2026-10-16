@@ -20,9 +20,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-FINAL = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\box-results\full08b\U2-s0\final")
-BASE = Path(r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68")
-STAGE = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\runner-golden\_stage")     # tools/runner_oracle/stage_model.py: final/ with the local base path
+RUNS = Path(os.environ.get("SEPAL_RUNS", r"E:\MYCOMPANY\BlumSOC\Sepal\runs"))      # on a rented box: a private runs dir (SEPAL_RUNS)
+FINAL = RUNS / "box-results" / "full08b" / "U2-s0" / "final"
+BASE = Path(os.environ.get("SEPAL_BASE", r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"))
+STAGE = RUNS / "runner-golden" / "_stage"   # tools/runner_oracle/stage_model.py: final/ with the local base path
 MAX_SCORE_LEN = 16384
 
 

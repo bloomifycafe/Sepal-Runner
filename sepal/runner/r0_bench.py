@@ -22,8 +22,9 @@ import sys
 import time
 from pathlib import Path
 
-WORKLOADS = Path("E:/MYCOMPANY/BlumSOC/Sepal/runs/runner-bench/workloads")
-OUT = Path("E:/MYCOMPANY/BlumSOC/Sepal/runs/runner-bench/r0")
+RUNS = Path(os.environ.get("SEPAL_RUNS", "E:/MYCOMPANY/BlumSOC/Sepal/runs"))
+WORKLOADS = RUNS / "runner-bench" / "workloads"
+OUT = RUNS / "runner-bench" / "r0"
 LLAMA = Path("E:/MYCOMPANY/BlumSOC/bench/llama.cpp-b11514/bin/llama-bench.exe")
 GGUF = Path("E:/MYCOMPANY/BlumSOC/bench/models/qwen35-0.8b-base-f16.gguf")
 GRID = [f"t{t}_q{q}" for t in ("1k", "4k", "16k") for q in (1, 8, 32)]
