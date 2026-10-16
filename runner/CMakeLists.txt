@@ -58,15 +58,38 @@ add_library(sepal_cpu STATIC
   src/cpu/deltanet.cpp
   src/cpu/attention.cpp
   src/cpu/trunk.cpp
+  src/cpu/clef_head.cpp
+  src/cpu/engine.cpp
   src/cpu/gemm_kernels_avx2.cpp
   src/cpu/gemm_kernels_avx512.cpp
   src/cpu/provider.cpp
 )
 target_include_directories(sepal_cpu PUBLIC include)
 target_link_libraries(sepal_cpu PUBLIC sepal_core PRIVATE sepal_build_flags)
+set_target_properties(sepal_cpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+  # GCC/Clang need the ISA flags per translation unit (MSVC compiles every intrinsic without them). The AVX2+FMA
+  # baseline is the CPU backend's minimum; the AVX-512 kernels are built only in their own file and chosen at run time.
+  target_compile_options(sepal_cpu PRIVATE -mavx2 -mfma)
+  set_source_files_properties(src/cpu/gemm_kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS
+    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512bf16")
+endif()
 
 add_executable(sepal-cpu-gemm-bench tools/sepal_cpu_gemm_bench.cpp)
 target_link_libraries(sepal-cpu-gemm-bench PRIVATE sepal_cpu sepal_build_flags)
+if(NOT MSVC)
+  target_compile_options(sepal-cpu-gemm-bench PRIVATE -mavx2 -mfma)
+endif()
+
+add_executable(sepal-cpu-bench tools/sepal_cpu_bench.cpp)
+target_link_libraries(sepal-cpu-bench PRIVATE sepal_cpu sepal_build_flags)
+if(WIN32)
+  target_link_libraries(sepal-cpu-bench PRIVATE psapi)
+endif()
+
+add_executable(sepal-cpu-eval tools/sepal_cpu_eval.cpp)
+target_include_directories(sepal-cpu-eval PRIVATE tests)
+target_link_libraries(sepal-cpu-eval PRIVATE sepal_cpu sepal_build_flags)
 
 # ---- The C ABI --------------------------------------------------------------------------------------------------
 # c_api.cpp is compiled once, as an object library, and every backend library is that object code plus its own
@@ -89,7 +112,7 @@ function(sepal_add_runner_library name)
   set_target_properties(${name} PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
-sepal_add_runner_library(sepal_runner_cpu SOURCES src/capi/cpu_profiles.cpp)
+sepal_add_runner_library(sepal_runner_cpu SOURCES src/capi/cpu_profiles.cpp LIBRARIES sepal_cpu)
 
 # Raw logits for a JSONL workload through any backend library's C ABI.
 add_executable(sepal-score tools/sepal_score.cpp)

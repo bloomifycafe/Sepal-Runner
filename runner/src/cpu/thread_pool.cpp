@@ -1,6 +1,6 @@
 #include "sepal/cpu/thread_pool.hpp"
 
-#include <intrin.h>
+#include <immintrin.h>
 
 #include <atomic>
 #include <condition_variable>
