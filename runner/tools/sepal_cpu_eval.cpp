@@ -181,6 +181,7 @@ int main(int argc, char** argv) {
         if (oracle) report("clef_head_reference (fp64), T = 1", ora1);
     }
 
+    std::map<std::string, std::vector<float>> twin_logits;  // cpu-bf16 raw logits per case, the float twin of cpu-q8
     std::stringstream ss(profiles);
     std::string profile;
     while (std::getline(ss, profile, ',')) {
@@ -194,7 +195,7 @@ int main(int argc, char** argv) {
         std::printf("%s: isa %s, %u threads, weights %.2f GB, delta chunk %zu%s\n", profile.c_str(), cpu::name_of(trunk.isa()), trunk.threads(),
                     static_cast<double>(trunk.weight_bytes()) / 1e9, delta_chunk,
                     opt.profile == cpu::Profile::Q8 ? (" q8 groups: " + q8).c_str() : "");
-        Accumulator t1, tc;
+        Accumulator t1, tc, tw1, twc;
         double worst_rel = 0, worst_abs = 0, total_s = 0;
         std::size_t tokens = 0;
         for (const auto& [name, c] : cases) {
@@ -218,12 +219,23 @@ int main(int argc, char** argv) {
             one.add(got, c.logits, c.request, nullptr);
             t1.add(got, c.logits, c.request, nullptr);
             tc.add(got, c.logits, c.request, &temps);
+            std::vector<float> flat;
+            for (const auto& q : got.logits) flat.insert(flat.end(), q.begin(), q.end());
+            if (opt.profile == cpu::Profile::BF16) twin_logits[name] = flat;
+            if (opt.profile == cpu::Profile::Q8 && twin_logits.count(name) != 0) {
+                tw1.add(got, twin_logits[name], c.request, nullptr);
+                twc.add(got, twin_logits[name], c.request, &temps);
+            }
             std::printf("  %-22s L=%-5zu hidden rel err %.2e  max |dp| %.2e  flips %zu\n", name.c_str(), req.size(), rel, one.max_dp(), one.flips);
         }
         std::printf("  trunk hidden vs hidden_fp32: worst relative RMS error %.3e, worst abs %.3e; %zu tokens in %.2f s (%.0f tok/s)\n", worst_rel,
                     worst_abs, tokens, total_s, static_cast<double>(tokens) / total_s);
         report("T = 1", t1);
         report("calibrated temperatures", tc);
+        if (tw1.questions != 0) {
+            report("vs cpu-bf16 twin, T = 1", tw1);
+            report("vs cpu-bf16 twin, calibrated", twc);
+        }
     }
     return 0;
 }
