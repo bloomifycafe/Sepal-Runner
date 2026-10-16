@@ -330,6 +330,34 @@ Two things to know when reading planner output:
 - The working-buffer figure is an estimate built from the geometry (the formula is documented at `working_bytes`
   in `include/sepal/planner.hpp`). Stage R3 replaces it with the executor's real allocations.
 
+## The CPU engine (rt-cpu)
+
+`src/cpu/` is the fast CPU backend: own thread pool, runtime ISA dispatch (AVX-512 VNNI/BF16 or AVX2+FMA), packed
+GEMM (k-blocked, 96 x 64 tasks, fp32 chain per output so the result does not depend on threads or batch), chunked
+Gated DeltaNet, flash-style GQA attention, chunked-prefill trunk, and the Clef head. `sepal_runner_cpu` registers
+`cpu-f32`, `cpu-bf16` and `cpu-q8` next to the reference engines; extra open options: `chunk_tokens`, `step_tokens`,
+`delta_chunk`, `group_tokens`, and `q8` (a string with any of `mlp`, `attn`, `dn_in`). On AVX2, `cpu-bf16` keeps bf16
+weights (half the memory) and widens them to fp32 per cache block, so it runs the fp32 kernel with float activations.
+`cpu-q8` is opt-in only: it fails its gate (below).
+
+Tools: `sepal-cpu-eval` (parity against the golden set, per profile, T = 1 and calibrated, q8 against its bf16 twin),
+`sepal-cpu-bench` (tokens/s, requests/s, per-call latency, peak RSS on an encoded workload; `--phases` splits the trunk
+time), `tools/runner_cpu_encode_workloads.py` (encodes `runs/runner-bench/workloads` for it).
+
+Parity, all 30 golden cases up to 31.9k tokens, 165 questions, AVX2 (Xeon E5-2683 v4, measured 2026-10-16):
+cpu-f32 max |dp| 5.7e-6 (gate 1e-4), 0 flips; cpu-bf16 max |dp| 6.8e-3 at T = 1, 4.5e-3 calibrated, p99 3.4e-3
+(gate 0.03 / 0.01), 0 flips. AVX-512 (Ryzen 7600X, 20 short cases): f32 2.4e-6; bf16 (bf16 activations too) 1.3e-2.
+cpu-q8 (int8 x int8, MLP + attention + DeltaNet input) vs its bf16 twin: max |dp| 0.25, 1 flip in 43 questions: fails
+(gate 0.05 / 1%); each weight group alone is still above 0.03. On AVX2 it is also slower than fp32 and stores 16-bit
+pairs, so there is no gain. Keep it off.
+
+Speed, Ryzen 5 5600X (AVX2, 12 threads, batch 1, the vast.ai box was shared with a neighbour that kept 2-3 threads
+busy; best of 2 runs differ by 0.3%): cpu-f32 166 tok/s on 913-token requests with 1 question (0.18 requests/s),
+165 tok/s at 1.3k tokens with 8 questions, 161 tok/s at 3.5k tokens with 32 questions, 160 tok/s at 4k, 131 tok/s at
+16k, 105 tok/s at 32k (attention grows quadratically); cpu-bf16 179 tok/s at 1.3k, 172 tok/s at 4k. Peak RSS 6.5 GB
+(f32) / 5.6 GB (bf16), mostly the transient fp32 merge at load. llama.cpp b11514 on the same box, base f16/bf16/f32 GGUF
+prefill pp512: 36.5 / 36.4 / 36.7 tok/s, q8_0 48.9 tok/s (4.5x slower than cpu-f32).
+
 ## Provenance
 
 The refusing-planner pattern follows Strata's `include/strata/plan/plan.hpp` (MIT). No code was copied or
