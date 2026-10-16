@@ -301,3 +301,9 @@ endforeach()
 foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
   set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 endforeach()
+
+# ---- the C ABI library of the GPU engine (same c_api.cpp object code as sepal_runner_cpu, plus the CUDA profiles) ----
+add_library(sepal_runner_cuda SHARED $<TARGET_OBJECTS:sepal_capi> src/gpu_profiles.cpp)
+target_include_directories(sepal_runner_cuda SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_runner_cuda PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
+set_target_properties(sepal_runner_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
