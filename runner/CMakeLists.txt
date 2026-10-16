@@ -49,6 +49,10 @@ add_library(sepal_cpu STATIC
   src/cpu/isa.cpp
   src/cpu/thread_pool.cpp
   src/cpu/gemm.cpp
+  src/cpu/elementwise.cpp
+  src/cpu/deltanet.cpp
+  src/cpu/attention.cpp
+  src/cpu/trunk.cpp
   src/cpu/gemm_kernels_avx2.cpp
   src/cpu/gemm_kernels_avx512.cpp
   src/cpu/provider.cpp
@@ -88,6 +92,7 @@ if(SEPAL_BUILD_TESTS)
     tests/test_loader.cpp
     tests/test_real_model.cpp
     tests/test_cpu_gemm.cpp
+    tests/test_cpu_trunk.cpp
   )
   target_link_libraries(sepal_tests PRIVATE sepal_cpu sepal_core sepal_build_flags)
   # The golden vectors written by tools/export_golden.py from the NumPy reference engine.
@@ -97,7 +102,7 @@ if(SEPAL_BUILD_TESTS)
   target_compile_definitions(sepal_tests PRIVATE SEPAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
   # One CTest entry per suite; `sepal_tests <suite>` fails if the name matches no test case.
-  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader cpu_gemm)
+  foreach(suite config dtype tensor gemm ops planner golden deltanet attention executor readout float32 safetensors loader cpu_gemm cpu_deltanet cpu_attention cpu_trunk)
     add_test(NAME ${suite} COMMAND sepal_tests ${suite})
   endforeach()
 
