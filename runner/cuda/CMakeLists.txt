@@ -206,6 +206,12 @@ foreach(suite convert_oracle contract embed rms_norm add_rms_norm add swiglu rea
   set_tests_properties(cuda_elem_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
 
+# ---- the Clef head on the GPU (float32; cuBLAS multiplies and its own kernels) ----
+add_library(sepal_cuda_clef_head STATIC src/clef_head.cpp src/clef_head_kernels.cu)
+target_include_directories(sepal_cuda_clef_head PUBLIC include PRIVATE src)
+target_include_directories(sepal_cuda_clef_head SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_clef_head PUBLIC sepal_cuda sepal_core PRIVATE sepal_cublas sepal_cuda_flags)
+
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
 add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
