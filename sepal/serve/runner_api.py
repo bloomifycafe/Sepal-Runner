@@ -330,15 +330,7 @@ def load_service(final: str, base: str, lib: str | None, profile: str, name: str
     from sepal.runner.engine import open_runner_api
     from sepal.train.unsloth_arm import fitted_temperatures
 
-    if lib == "mock":                    # the Python front end alone (tokeniser, batching, HTTP) over a fake engine: for load tests
-        from sepal.runner.engine import CEngine, EngineBackend, RunnerApi
-        from sepal.runner.encode import Encoder
-        from sepal.runner.mock import FakeLib, MockEngine
-
-        engine = CEngine({"profile": profile, "max_tokens": MAX_SCORE_LEN}, lib=FakeLib(MockEngine()))
-        api = RunnerApi(Encoder.from_file(Path(final) / "tokenizer.json"), EngineBackend(engine), engine.hidden_size)
-    else:
-        api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
+    api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
     temperatures = fitted_temperatures(str(Path(final).parent)) if calibrated else None
     return build_service(api, temperatures, name, **options), engine
 
