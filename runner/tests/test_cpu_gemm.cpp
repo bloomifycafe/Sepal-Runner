@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "sepal/cpu/gemm.hpp"
@@ -109,6 +110,14 @@ SEPAL_TEST(cpu_gemm, features_and_pool) {
         pool.parallel_for(10, [&](std::size_t, unsigned) { after.fetch_add(1); });
         CHECK_EQ(after.load(), 10);
     }
+}
+
+SEPAL_TEST(cpu_gemm, default_thread_count_is_the_physical_cores) {
+    const unsigned n = default_thread_count();
+    CHECK(n >= 1);
+    CHECK(n <= std::max(1u, std::thread::hardware_concurrency()));
+    ThreadPool pool(0);
+    CHECK_EQ(pool.size(), n);
 }
 
 SEPAL_TEST(cpu_gemm, f32_matches_reference) {

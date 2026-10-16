@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     const auto load_start = Clock::now();
     const auto engine = cpu::make_cpu_engine(final_dir, base_dir, opt);
     const double load_s = std::chrono::duration<double>(Clock::now() - load_start).count();
-    const unsigned used = threads != 0 ? threads : std::thread::hardware_concurrency();
+    const unsigned used = threads != 0 ? threads : cpu::default_thread_count();
 
     if (warmup) engine->score({requests.data(), std::min<std::size_t>(batch, requests.size())});
     for (std::size_t rep = 0; rep < repeats; ++rep) {
