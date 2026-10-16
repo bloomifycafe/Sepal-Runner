@@ -86,7 +86,8 @@ struct Accum {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string final_dir, base_dir, golden_dir, profile = "gpu-f16", multiply = "auto", only;
+    std::string final_dir, base_dir, golden_dir, profile = "gpu-f16", multiply = "auto", only, int8_groups;
+    bool int8_act = true;
     std::uint64_t max_tokens = 40000;
     std::size_t batch = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-tokens") max_tokens = std::stoull(v);
         else if (a == "--batch") batch = std::stoull(v);
         else if (a == "--multiply") multiply = v;
+        else if (a == "--int8") int8_groups = v;
+        else if (a == "--int8-act") int8_act = v == "on";
         else if (a == "--cases") only = "," + v + ",";
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
     }
@@ -113,6 +116,11 @@ int main(int argc, char** argv) {
         if (multiply == "cublas") options.multiply_path = cuda::MultiplyPath::Cublas;
         else if (multiply == "invariant") options.multiply_path = cuda::MultiplyPath::Invariant;
         options.head.memory_tokens = 98304;
+        options.int8.gate_up = int8_groups.find("gate_up") != std::string::npos;
+        options.int8.down = int8_groups.find("down") != std::string::npos;
+        options.int8.mixer_in = int8_groups.find("mixer_in") != std::string::npos;
+        options.int8.mixer_out = int8_groups.find("mixer_out") != std::string::npos;
+        options.int8.int8_activations = int8_act;
         cuda::GpuDecisionEngine engine(model, options);
         const json::Value manifest = json::parse(read_text(fs::path(golden_dir) / "manifest.json"));
         std::vector<std::string> names;

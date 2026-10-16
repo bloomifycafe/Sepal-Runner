@@ -90,7 +90,8 @@ struct GpuDecisionEngine::Impl {
             const std::size_t gib = std::size_t{1} << 30;
             options.max_call_tokens = free_bytes >= 20 * gib ? 65536 : free_bytes >= 10 * gib ? 32768 : 16384;
         }
-        options.head.call_tokens = std::max(options.head.call_tokens, options.max_call_tokens); // one trunk call goes into the head whole
+        options.head.call_tokens = std::max(options.head.call_tokens, options.max_call_tokens);
+        options.head.memory_tokens = std::max(options.head.memory_tokens, options.max_call_tokens); // one trunk call goes into the head whole
         vocab = model.config().vocab_size;
         check(cudaSetDevice(o.device), "cudaSetDevice");
         EngineOptions eo;
@@ -103,6 +104,7 @@ struct GpuDecisionEngine::Impl {
         eo.fp16_accumulate = o.fp16_accumulate;
         eo.half_state = o.half_state;
         eo.gemm_rows = o.gemm_rows;
+        eo.int8_multiply = o.int8;
         const std::size_t head_bytes = clef_head_device_bytes(model.head_config(), options.head);
         if (o.trunk_budget_bytes != 0) {
             eo.memory_budget_bytes = o.trunk_budget_bytes;

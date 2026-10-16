@@ -151,7 +151,7 @@ set_tests_properties(cuda_parity_real PROPERTIES TIMEOUT 900)
 set_source_files_properties(src/kernels_deltanet.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
 # A library of its own, so that the kernels build and test without the cuBLAS provider.
-add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu)
+add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu src/kernels_deltanet_chunked.cu)
 target_include_directories(sepal_cuda_deltanet_kernels PUBLIC src)
 target_include_directories(sepal_cuda_deltanet_kernels SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_deltanet_kernels PRIVATE sepal_cuda_flags)
@@ -314,3 +314,6 @@ set_target_properties(sepal_runner_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden 
 add_executable(sepal-gpu-bench tools/gpu_bench.cpp)
 target_include_directories(sepal-gpu-bench SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal-gpu-bench PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
+
+add_executable(sepal-cuda-chunk-check tools/chunk_check.cpp)
+target_link_libraries(sepal-cuda-chunk-check PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)

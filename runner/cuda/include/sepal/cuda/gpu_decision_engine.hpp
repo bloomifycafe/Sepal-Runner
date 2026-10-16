@@ -38,6 +38,8 @@ struct GpuDecisionOptions {
     Fp16Accumulate fp16_accumulate;
     bool half_state = false;
     std::size_t gemm_rows = 0;
+    /// int8 weights for chosen multiply groups of the gpu-f16 trunk (off by default; see the int8 section of README.md).
+    Int8Multiply int8;
     /// Prefix reuse (RUNNER.md section 7): a snapshot of the trunk plus the head's memory rows at a cut before the first question
     /// span. The cut is the last occurrence of `schema_marker` (token ids; empty: the longest common prefix with a recent request).
     bool prefix_cache = false;
