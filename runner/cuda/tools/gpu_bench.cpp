@@ -60,7 +60,7 @@ double pct(std::vector<double> v, double q) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on";
+    std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on", dump_path, compare_path;
     std::size_t batch = 1, reps = 3, warmup = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -74,6 +74,8 @@ int main(int argc, char** argv) {
         else if (a == "--multiply") multiply = v;
         else if (a == "--prefix-cache") prefix = v;
         else if (a == "--out") out_path = v;
+        else if (a == "--dump") dump_path = v;
+        else if (a == "--compare") compare_path = v;
         else if (a == "--label") label = v;
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
     }
@@ -100,8 +102,10 @@ int main(int argc, char** argv) {
         double best_wall = 1e300, best_trunk = 0, best_head = 0;
         std::uint64_t reused = 0;
         std::vector<double> latencies;
+        std::vector<float> flat;
         for (std::size_t rep = 0; rep < warmup + reps; ++rep) {
             std::vector<double> lat;
+            flat.clear();
             const auto t0 = Clock::now();
             double trunk_ms = 0, head_ms = 0;
             std::uint64_t reused_now = 0;
@@ -115,6 +119,8 @@ int main(int argc, char** argv) {
                 head_ms += t.head_ms;
                 reused_now += t.tokens_reused;
                 if (got.size() != n) throw std::runtime_error("wrong number of answers");
+                for (const RequestLogits& g : got)
+                    for (const std::vector<float>& q : g.logits) flat.insert(flat.end(), q.begin(), q.end());
             }
             const double wall = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::cout << "  rep " << rep << (rep < warmup ? " (warmup)" : "") << ": " << std::fixed << std::setprecision(1) << wall << " ms, "
@@ -126,6 +132,19 @@ int main(int argc, char** argv) {
                 latencies = lat;
                 reused = reused_now;
             }
+        }
+        if (!dump_path.empty()) {
+            std::ofstream d(dump_path, std::ios::binary);
+            d.write(reinterpret_cast<const char*>(flat.data()), static_cast<std::streamsize>(flat.size() * sizeof(float)));
+        }
+        if (!compare_path.empty()) {
+            std::ifstream c(compare_path, std::ios::binary);
+            std::vector<float> ref(flat.size());
+            c.read(reinterpret_cast<char*>(ref.data()), static_cast<std::streamsize>(ref.size() * sizeof(float)));
+            if (!c || c.peek() != std::ifstream::traits_type::eof()) throw std::runtime_error("--compare file has a different size");
+            double worst = 0;
+            for (std::size_t i = 0; i < flat.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(flat[i] - ref[i])));
+            std::cout << "  compare: " << flat.size() << " logits, max |dlogit| vs " << compare_path << " = " << std::scientific << worst << std::fixed << "\n";
         }
         const cuda::EngineMemory mem = engine.trunk_memory();
         std::size_t free_b = 0, total_b = 0;
