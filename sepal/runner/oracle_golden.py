@@ -31,8 +31,8 @@ import numpy as np
 
 from sepal.runner import oracle
 
-GOLDEN_DIR = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\runner-golden\full08b")
-SUITE_DEV = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\suites\socdecide-0.7.0\development.jsonl")
+GOLDEN_DIR = oracle.RUNS / "runner-golden" / "full08b"
+SUITE_DEV = oracle.RUNS / "suites" / "socdecide-0.7.0" / "development.jsonl"
 SEC_MEMBERS = ["DET-1", "DET-1b", "POL-1", "ABS-1", "MAP-1", "MAP-2", "VUL-1", "PRI-1", "ACT-2", "ENT-2"]     # experiments/rounds/full08b.yaml SEC-dev
 LAYER_TASKS = {"DET-1": 450, "VUL-1": 450, "ENT-2": 450}          # cases that also carry layer_hidden_fp32 (token cap keeps the file small)
 MAX_CASE_TOKENS = 1500
@@ -253,7 +253,7 @@ def environment(device: str, extra: dict | None = None) -> dict:
     import importlib.metadata as md
     import torch
 
-    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": "AMD Ryzen 5 7600X (6C/12T), RTX 3060 12 GB, Windows 11", "python": platform.python_version(),
+    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": os.environ.get("SEPAL_MACHINE", "AMD Ryzen 5 7600X (6C/12T), RTX 3060 12 GB, Windows 11"), "python": platform.python_version(),
            "torch": torch.__version__, "device": device, "torch_threads": torch.get_num_threads()}
     for name in ("transformers", "peft", "unsloth", "unsloth_zoo", "safetensors", "numpy"):
         try:
@@ -335,15 +335,153 @@ def stage_cpu(threads: int) -> None:
     print("manifest written", flush=True)
 
 
+WORKLOADS = oracle.RUNS / "runner-bench" / "workloads"
+LONG_SHAPES = [f"t{t}_q{q}" for t in ("1k", "4k", "16k") for q in (1, 8, 32)] + ["t32k_q8"]
+
+
+def long_cases() -> list[Case]:
+    """The first request of every workload shape (the 1k/4k/16k x 1/8/32 grid and t32k_q8) as a golden case `wl_<shape>`."""
+    cases = []
+    for shape in LONG_SHAPES:
+        with open(WORKLOADS / f"{shape}.jsonl", encoding="utf-8") as f:
+            row = json.loads(f.readline())
+        case = Case(f"wl_{shape}", f"workload {shape} request 0 ({row['id']}, {row['family']} window)", body=row["body"])
+        case.note = json.dumps({"input_ids_sha256": hashlib.sha256(np.asarray(row["input_ids"], dtype=np.int32).tobytes()).hexdigest()})
+        cases.append(case)
+    return cases
+
+
+def stage_long(device: str, threads: int, only: list[str] | None) -> None:
+    """fp32 oracle for the long cases (fp32 weights, no autocast), on the CPU or on a GPU (fp32 at 32k tokens needs the 24 GB card)."""
+    if device == "cpu":
+        oracle.hide_gpu()
+    else:
+        sys.modules["fla"] = None            # Triton kernels dot in TF32 (~3e-3 logit noise, measured): use transformers' reference PyTorch gated delta rule
+    import torch
+
+    if device != "cpu":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    torch.set_num_threads(threads)
+    o = oracle.Fp32Oracle(device=device)
+    from sepal.train.unsloth_arm import fitted_temperatures
+
+    temps = fitted_temperatures(str(oracle.STAGE))
+    for case in long_cases():
+        if only and case.name not in only:
+            continue
+        path = GOLDEN_DIR / f"{case.name}.safetensors"
+        if path.is_file():
+            continue
+        state_text, questions = prepare(case)
+        enc = o.encode(state_text, questions, max_length=65536)
+        assert hashlib.sha256(np.asarray(enc.input_ids, dtype=np.int32).tobytes()).hexdigest() == json.loads(case.note)["input_ids_sha256"], "workload ids differ"
+        t = time.time()
+        out = o.forward(enc)
+        tensors = encoded_tensors(enc)
+        tensors["hidden_fp32"] = out["hidden"].astype(np.float32)
+        tensors["logits_fp32"] = out["logits"].astype(np.float32)
+        meta = case_meta(case, state_text, questions, enc, o.tokenizer)
+        meta["probabilities_calibrated_fp32"] = json.dumps(calibrated_probabilities(temps, questions, enc, out["logits"]))
+        write_case(path, tensors, meta)
+        print(f"{case.name}: {len(enc.input_ids)} tokens, {len(out['logits'])} logits, {time.time() - t:.1f} s ({device})", flush=True)
+        (GOLDEN_DIR / f"_env_long_fp32_{device}.json").write_text(json.dumps(environment(device, {"oracle": "Fp32Oracle (vendored Clef head), fp32, no autocast", "platform": platform.platform()}), indent=1), encoding="utf-8")
+    write_manifest()
+
+
+def _case_files() -> list[Path]:
+    return sorted(GOLDEN_DIR.glob("*.safetensors"))
+
+
+def stage_served(force: bool) -> None:
+    """GPU (hold the lock): add `logits_bf16` (the as-served path: load_scorer(calibrated=True), its autocast, one record at a time) and
+    the as-served calibrated probabilities to every case file; the ids the served encoder makes must equal the file's."""
+    import torch
+
+    from sepal.serve.decision_api import answer
+
+    started = time.time()
+    served = oracle.ServedOracle(max_len=65536)
+    load_seconds = time.time() - started
+    print(f"served oracle loaded in {load_seconds:.1f} s", flush=True)
+    for path in _case_files():
+        tensors, meta = read_case(path)
+        if "logits_bf16" in tensors and not force:
+            continue
+        record = json.loads(meta["record"])
+        enc = served.encode(record["state"], record["questions"])
+        if list(enc.input_ids) != tensors["input_ids"].tolist():
+            raise RuntimeError(f"{path.name}: the served encoder makes other ids than the golden file")
+        t = time.time()
+        flat = served.raw_logits(enc)
+        torch.cuda.synchronize()
+        tensors["logits_bf16"] = np.asarray(flat, dtype=np.float32)
+        probabilities, _, _ = served.scorer.score({"state": record["state"], "questions": record["questions"]})
+        meta["probabilities_calibrated_bf16"] = json.dumps(probabilities)
+        if "body" in meta:
+            meta["answers_bf16"] = json.dumps(answer(served.scorer, json.loads(meta["body"]), "sepal")["answers"])
+        write_case(path, tensors, meta)
+        print(f"{path.stem}: {len(enc.input_ids)} tokens, bf16 {time.time() - t:.2f} s, max|bf16-fp32| = "
+              f"{float(np.abs(tensors['logits_bf16'] - tensors['logits_fp32']).max()):.4f}", flush=True)
+    (GOLDEN_DIR / "_env_gpu_bf16.json").write_text(json.dumps(environment("cuda", {
+        "oracle": "ServedOracle: load_scorer(calibrated=True), bf16 autocast, as sepal.serve.decision_api serves", "model_load_seconds": round(load_seconds, 1),
+        "gpu": torch.cuda.get_device_name(0)}), indent=1), encoding="utf-8")
+    write_manifest()
+
+
+def stage_crosscheck() -> None:
+    """GPU (hold the lock): Unsloth's FastDecisionModel in fp32 without autocast against the CPU fp32 golden, per case that fits."""
+    import torch
+
+    started = time.time()
+    model = oracle.UnslothFp32()
+    print(f"unsloth fp32 loaded in {time.time() - started:.1f} s, parameter dtypes {model.dtypes}", flush=True)
+    rows = {}
+    for path in _case_files():
+        tensors, meta = read_case(path)
+        record = json.loads(meta["record"])
+        enc = oracle.load_vendored_clef().encode_record(model.tokenizer, oracle.record_for(record["state"], record["questions"]), max_length=65536)
+        if list(enc.input_ids) != tensors["input_ids"].tolist():
+            raise RuntimeError(f"{path.name}: ids differ")
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            out = model.forward(enc)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            rows[path.stem] = {"tokens": len(enc.input_ids), "status": "out of memory in fp32 on the GPU"}
+            print(f"{path.stem}: OOM", flush=True)
+            continue
+        d_logit = float(np.abs(out["logits"] - tensors["logits_fp32"]).max())
+        d_hidden = float(np.abs(out["hidden"] - tensors["hidden_fp32"]).max())
+        rows[path.stem] = {"tokens": len(enc.input_ids), "max_abs_dlogit_gpu_fp32_vs_cpu_fp32": d_logit, "max_abs_dhidden": d_hidden,
+                           "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+                           "max_abs_dlogit_bf16_vs_cpu_fp32": float(np.abs(tensors["logits_bf16"] - tensors["logits_fp32"]).max()) if "logits_bf16" in tensors else None}
+        print(f"{path.stem}: {len(enc.input_ids)} tokens, max|dlogit| {d_logit:.2e}, max|dhidden| {d_hidden:.2e}, peak {rows[path.stem]['peak_gib']} GiB", flush=True)
+    (GOLDEN_DIR / "_crosscheck_gpu_fp32.json").write_text(json.dumps({"parameter_dtypes": model.dtypes, "cases": rows}, indent=1), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("cpu")
     c.add_argument("--threads", type=int, default=12)
+    lc = sub.add_parser("long")
+    lc.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    lc.add_argument("--threads", type=int, default=12)
+    lc.add_argument("--only", nargs="*")
+    sv = sub.add_parser("served")
+    sv.add_argument("--force", action="store_true")
+    sub.add_parser("crosscheck")
     sub.add_parser("manifest")
     args = parser.parse_args(argv)
     if args.command == "cpu":
         stage_cpu(args.threads)
+    elif args.command == "long":
+        stage_long(args.device, args.threads, args.only)
+    elif args.command == "served":
+        stage_served(args.force)
+    elif args.command == "crosscheck":
+        stage_crosscheck()
     elif args.command == "manifest":
         write_manifest()
     return 0
