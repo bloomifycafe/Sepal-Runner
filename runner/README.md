@@ -351,12 +351,17 @@ cpu-q8 (int8 x int8, MLP + attention + DeltaNet input) vs its bf16 twin: max |dp
 (gate 0.05 / 1%); each weight group alone is still above 0.03. On AVX2 it is also slower than fp32 and stores 16-bit
 pairs, so there is no gain. Keep it off.
 
-Speed, Ryzen 5 5600X (AVX2, 12 threads, batch 1, the vast.ai box was shared with a neighbour that kept 2-3 threads
-busy; best of 2 runs differ by 0.3%): cpu-f32 166 tok/s on 913-token requests with 1 question (0.18 requests/s),
-165 tok/s at 1.3k tokens with 8 questions, 161 tok/s at 3.5k tokens with 32 questions, 160 tok/s at 4k, 131 tok/s at
-16k, 105 tok/s at 32k (attention grows quadratically); cpu-bf16 179 tok/s at 1.3k, 172 tok/s at 4k. Peak RSS 6.5 GB
-(f32) / 5.6 GB (bf16), mostly the transient fp32 merge at load. llama.cpp b11514 on the same box, base f16/bf16/f32 GGUF
-prefill pp512: 36.5 / 36.4 / 36.7 tok/s, q8_0 48.9 tok/s (4.5x slower than cpu-f32).
+The default thread count is the physical cores (`default_thread_count()`): on the 5600X 12 threads (SMT) ran 20-25%
+slower than 6 (bf16, t1k_q8: 3 / 6 / 9 / 12 threads = 143 / 233 / 181 / 181 tok/s).
+
+Speed, Ryzen 5 5600X (AVX2, vast.ai box shared with a neighbour that kept 2-3 threads busy, so these are lower
+bounds; batch 1; two runs of each differ by up to 10%): with the default 6 threads cpu-f32 195-203 tok/s on 913-token
+requests with 1 question (0.23 requests/s), 191-198 tok/s at 1.3k tokens with 8 questions (0.15 requests/s), 179-204
+tok/s at 3.5k tokens with 32 questions, 168 tok/s at 4k; cpu-bf16 192-195 / 229-236 / 215-223 tok/s for the same
+shapes (0.18 requests/s at 1.3k x 8 questions), 238 tok/s at 4k, 170 tok/s at 16k (93 s per request). With 12 threads:
+f32 166 tok/s (1k), 131 at 16k, 105 at 32k (attention is quadratic); bf16 179. Peak RSS 6.5 GB (f32) / 5.6 GB (bf16),
+mostly the transient fp32 merge at load. llama.cpp b11514 on the same box (12 threads), base f16/bf16/f32 GGUF prefill
+pp512: 36.5 / 36.4 / 36.7 tok/s, q8_0 48.9 tok/s: cpu-bf16 is about 5-6x faster. Raw lines: runs/runner-bench/cpu/.
 
 ## Provenance
 
