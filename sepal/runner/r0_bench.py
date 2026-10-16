@@ -89,7 +89,7 @@ def run_gpu(args) -> None:
     from sepal.serve.decision_api import answer, to_record
 
     t0 = time.perf_counter()
-    served = oracle.ServedOracle(batch_tokens=max(args.batch_tokens))
+    served = oracle.ServedOracle(max_len=int(os.environ.get("SEPAL_MAX_LEN", oracle.MAX_SCORE_LEN)), batch_tokens=max(args.batch_tokens))
     load_seconds = time.perf_counter() - t0
     scorer, api_raw = served.scorer, served.api_raw
     env = environment({"model_load_seconds": round(load_seconds, 2), "model_load_note": "load_scorer(calibrated=True) wall time after `import torch`, Unsloth already imported by sepal.train.unsloth_arm lazily inside it"})
