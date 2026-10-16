@@ -71,6 +71,12 @@ set_target_properties(sepal_cpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(sepal-cpu-gemm-bench tools/sepal_cpu_gemm_bench.cpp)
 target_link_libraries(sepal-cpu-gemm-bench PRIVATE sepal_cpu sepal_build_flags)
 
+add_executable(sepal-cpu-bench tools/sepal_cpu_bench.cpp)
+target_link_libraries(sepal-cpu-bench PRIVATE sepal_cpu sepal_build_flags)
+if(WIN32)
+  target_link_libraries(sepal-cpu-bench PRIVATE psapi)
+endif()
+
 add_executable(sepal-cpu-eval tools/sepal_cpu_eval.cpp)
 target_include_directories(sepal-cpu-eval PRIVATE tests)
 target_link_libraries(sepal-cpu-eval PRIVATE sepal_cpu sepal_build_flags)
