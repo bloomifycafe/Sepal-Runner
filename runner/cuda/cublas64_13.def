@@ -11,5 +11,6 @@ EXPORTS
     cublasSetMathMode
     cublasGetStatusString
     cublasSgemm_v2
+    cublasSgemmStridedBatched
     cublasGemmEx
     cublasGemmStridedBatchedEx
