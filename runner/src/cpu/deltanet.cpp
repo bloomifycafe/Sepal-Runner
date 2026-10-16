@@ -57,11 +57,11 @@ void axpy(std::size_t n, float a, const float* x, float* y) {
 template <int R, int NV, bool NEG>
 void micro_nn(float* c, std::size_t ldc, const float* a, std::size_t ars, std::size_t acs, const float* b, std::size_t ldb,
               std::size_t k) {
-    __m256 acc[R][NV];
+    __m256 acc[static_cast<std::size_t>(R)][static_cast<std::size_t>(NV)];
     for (int r = 0; r < R; ++r)
         for (int v = 0; v < NV; ++v) acc[r][v] = _mm256_loadu_ps(c + static_cast<std::size_t>(r) * ldc + 8 * static_cast<std::size_t>(v));
     for (std::size_t p = 0; p < k; ++p) {
-        __m256 bv[NV];
+        __m256 bv[static_cast<std::size_t>(NV)];
         for (int v = 0; v < NV; ++v) bv[v] = _mm256_loadu_ps(b + p * ldb + 8 * static_cast<std::size_t>(v));
         for (int r = 0; r < R; ++r) {
             const __m256 av = _mm256_broadcast_ss(a + static_cast<std::size_t>(r) * ars + p * acs);
@@ -108,7 +108,7 @@ void sequential_slice(const DeltaGeometry& geo, const DeltaSegment& s, std::size
         const float* vvec = s.v + t * ld_in + h * dv + j0;
         const __m256 decay = _mm256_set1_ps(static_cast<float>(std::exp(static_cast<double>(s.g[t * hv + h]))));
         const __m256 beta = _mm256_set1_ps(s.beta[t * hv + h]);
-        __m256 rec[NV];
+        __m256 rec[static_cast<std::size_t>(NV)];
         for (int v = 0; v < NV; ++v) rec[v] = _mm256_setzero_ps();
         for (std::size_t i = 0; i < dk; ++i) {
             float* row = state + i * dv;
@@ -119,7 +119,7 @@ void sequential_slice(const DeltaGeometry& geo, const DeltaSegment& s, std::size
                 rec[v] = _mm256_fmadd_ps(ki, x, rec[v]);
             }
         }
-        __m256 corr[NV], out[NV];
+        __m256 corr[static_cast<std::size_t>(NV)], out[static_cast<std::size_t>(NV)];
         for (int v = 0; v < NV; ++v) {
             corr[v] = _mm256_mul_ps(beta, _mm256_sub_ps(_mm256_loadu_ps(vvec + 8 * v), rec[v]));
             out[v] = _mm256_setzero_ps();

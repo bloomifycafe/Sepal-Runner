@@ -1,7 +1,11 @@
 // A 64-byte aligned, move-only buffer (cache line and zmm aligned). Contents are uninitialised after `resize`.
 #pragma once
 
+#ifdef _WIN32
 #include <malloc.h>
+#else
+#include <cstdlib>
+#endif
 
 #include <cstddef>
 #include <cstring>
@@ -10,6 +14,23 @@
 #include <utility>
 
 namespace sepal::cpu {
+
+namespace detail {
+inline void* aligned_alloc64(std::size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, 64);
+#else
+    return std::aligned_alloc(64, (bytes + 63) / 64 * 64);
+#endif
+}
+inline void aligned_free64(void* p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+} // namespace detail
 
 template <class T>
 class AlignedBuffer {
@@ -38,7 +59,7 @@ public:
             return;
         }
         release();
-        data_ = static_cast<T*>(_aligned_malloc((n == 0 ? 1 : n) * sizeof(T), 64));
+        data_ = static_cast<T*>(detail::aligned_alloc64((n == 0 ? 1 : n) * sizeof(T)));
         if (data_ == nullptr) throw std::bad_alloc();
         size_ = n;
         capacity_ = n;
@@ -54,7 +75,7 @@ public:
 
 private:
     void release() {
-        if (data_ != nullptr) _aligned_free(data_);
+        if (data_ != nullptr) detail::aligned_free64(data_);
         data_ = nullptr;
         size_ = 0;
         capacity_ = 0;

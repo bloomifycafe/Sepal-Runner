@@ -288,7 +288,7 @@ void CpuTrunk::Impl::delta_layer(const Layer& L, std::size_t index, std::vector<
                                  const std::vector<Segment>& segs, std::size_t rows) {
     const DeltaLayer& D = L.dn;
     std::size_t dn_index = 0;
-    for (std::size_t i = 0; i < index; ++i) dn_index += layers[i].attention ? 0 : 1;
+    for (std::size_t i = 0; i < index; ++i) dn_index += layers[i].attention ? 0u : 1u;
     const std::size_t ld_qz = qz_width;
     {
         Timer t(times.other_ms);
@@ -361,7 +361,7 @@ void CpuTrunk::Impl::attention_layer(const Layer& L, std::size_t index, std::vec
                                      const std::vector<Segment>& segs, std::size_t rows) {
     const AttentionLayer& A = L.at;
     std::size_t attn_index = 0;
-    for (std::size_t i = 0; i < index; ++i) attn_index += layers[i].attention ? 1 : 0;
+    for (std::size_t i = 0; i < index; ++i) attn_index += layers[i].attention ? 1u : 0u;
     const std::size_t ld_qz = qz_width;
     const std::size_t q_width = heads * hd;
     {
