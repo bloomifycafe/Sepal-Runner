@@ -16,7 +16,9 @@
 #include <vector>
 
 #include "sepal/cpu/engine.hpp"
+#include "sepal/cpu/trunk.hpp"
 #include "sepal/json.hpp"
+#include "sepal/trained_model.hpp"
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -70,7 +72,7 @@ int main(int argc, char** argv) {
     unsigned threads = 0;
     std::size_t batch = 1, limit = 0, repeats = 1;
     std::uint64_t max_tokens = 65536;
-    bool warmup = false;
+    bool warmup = false, phases = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto value = [&]() -> std::string {
@@ -89,6 +91,7 @@ int main(int argc, char** argv) {
         else if (a == "--label") label = value();
         else if (a == "--q8") q8 = value();
         else if (a == "--warmup") warmup = true;
+        else if (a == "--phases") phases = true;
         else throw std::invalid_argument("unknown argument " + a);
     }
     if (final_dir.empty() || base_dir.empty() || input.empty() || batch == 0) {
@@ -112,6 +115,30 @@ int main(int argc, char** argv) {
     opt.q8.mlp = q8.find("mlp") != std::string::npos;
     opt.q8.attention = q8.find("attn") != std::string::npos;
     opt.q8.deltanet_in = q8.find("dn_in") != std::string::npos;
+    if (phases) {
+        // Trunk only, with the time split by kind of work (gemm / DeltaNet / attention / other).
+        const TrainedModel model = TrainedModel::open(final_dir, base_dir);
+        const Weights<float> merged = model.merged_weights<float>();
+        cpu::TrunkOptions t;
+        t.profile = cpu::parse_profile(profile);
+        t.q8 = opt.q8;
+        t.threads = threads;
+        cpu::CpuTrunk trunk(model.config(), merged, [&model](std::uint32_t tok, float* out) { model.embedding_row(tok, out); }, t);
+        cpu::TrunkTimes sum;
+        for (const EncodedRequest& r : requests) {
+            std::vector<std::vector<float>> hidden;
+            const std::span<const std::uint32_t> req(r.token_ids);
+            trunk.forward({&req, 1}, hidden);
+            const cpu::TrunkTimes& x = trunk.last_times();
+            sum.gemm_ms += x.gemm_ms; sum.delta_ms += x.delta_ms; sum.attention_ms += x.attention_ms;
+            sum.other_ms += x.other_ms; sum.total_ms += x.total_ms; sum.tokens += x.tokens;
+        }
+        std::printf("{\"label\": \"%s\", \"profile\": \"%s\", \"threads\": %u, \"tokens\": %llu, \"gemm_ms\": %.1f, \"delta_ms\": %.1f, "
+                    "\"attention_ms\": %.1f, \"other_ms\": %.1f, \"total_ms\": %.1f, \"tokens_per_s\": %.1f}\n",
+                    label.c_str(), profile.c_str(), trunk.threads(), static_cast<unsigned long long>(sum.tokens), sum.gemm_ms, sum.delta_ms,
+                    sum.attention_ms, sum.other_ms, sum.total_ms, static_cast<double>(sum.tokens) * 1000.0 / sum.total_ms);
+        return 0;
+    }
     const auto load_start = Clock::now();
     const auto engine = cpu::make_cpu_engine(final_dir, base_dir, opt);
     const double load_s = std::chrono::duration<double>(Clock::now() - load_start).count();
