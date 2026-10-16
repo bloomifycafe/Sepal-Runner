@@ -25,8 +25,9 @@ from pathlib import Path
 RUNS = Path(os.environ.get("SEPAL_RUNS", "E:/MYCOMPANY/BlumSOC/Sepal/runs"))
 WORKLOADS = RUNS / "runner-bench" / "workloads"
 OUT = RUNS / "runner-bench" / "r0"
-LLAMA = Path("E:/MYCOMPANY/BlumSOC/bench/llama.cpp-b11514/bin/llama-bench.exe")
-GGUF = Path("E:/MYCOMPANY/BlumSOC/bench/models/qwen35-0.8b-base-f16.gguf")
+LLAMA = Path(os.environ.get("LLAMA_BENCH", "E:/MYCOMPANY/BlumSOC/bench/llama.cpp-b11514/bin/llama-bench.exe"))
+GGUF = Path(os.environ.get("SEPAL_GGUF", "E:/MYCOMPANY/BlumSOC/bench/models/qwen35-0.8b-base-f16.gguf"))
+MACHINE = os.environ.get("SEPAL_MACHINE", "AMD Ryzen 5 7600X (6C/12T, Zen 4), RTX 3060 12 GB, Windows 11")
 GRID = [f"t{t}_q{q}" for t in ("1k", "4k", "16k") for q in (1, 8, 32)]
 ALL_SHAPES = GRID + ["shared_t4k_q8"]
 
@@ -48,7 +49,7 @@ def percentile(values: list[float], p: float) -> float:
 def environment(extra: dict | None = None) -> dict:
     import importlib.metadata as md
 
-    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": "AMD Ryzen 5 7600X (6C/12T, Zen 4), RTX 3060 12 GB, Windows 11", "python": platform.python_version()}
+    env = {"date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": MACHINE, "python": platform.python_version()}
     for name in ("torch", "transformers", "unsloth", "peft", "triton", "triton-windows"):
         try:
             env[name] = md.version(name)
@@ -205,7 +206,7 @@ def run_llama(args) -> None:
     started = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
     rows = json.loads(proc.stdout) if proc.stdout.strip().startswith("[") else []
-    out = {"device": args.device, "command": cmd, "environment": environment({"llama_cpp": "b11514 CUDA 12.4 Windows build", "gguf": GGUF.name,
+    out = {"device": args.device, "command": cmd, "environment": environment({"llama_cpp": os.environ.get("LLAMA_NOTE", "b11514 CUDA 12.4 Windows build"), "gguf": GGUF.name,
            "note": "trunk only (Qwen3.5-0.8B-Base f16 GGUF): no LoRA, no Clef head, no per-position head read; prefill pp tokens, tg 0"}),
            "wall_seconds": round(time.time() - started, 1), "returncode": proc.returncode, "stderr_tail": proc.stderr[-400:],
            "rows": [{"n_prompt": r.get("n_prompt"), "n_gen": r.get("n_gen"), "best_tokens_per_s": max(r.get("samples_ts", [r.get("avg_ts", 0)])),

@@ -401,7 +401,7 @@ def stage_served(force: bool) -> None:
     from sepal.serve.decision_api import answer
 
     started = time.time()
-    served = oracle.ServedOracle()
+    served = oracle.ServedOracle(max_len=65536)
     load_seconds = time.time() - started
     print(f"served oracle loaded in {load_seconds:.1f} s", flush=True)
     for path in _case_files():
