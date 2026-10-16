@@ -132,7 +132,9 @@ SEPAL_TEST(cpu_gemm, bf16_matches_reference_on_rounded_inputs) {
             auto x = random_matrix(s.rows, s.k, 3);
             auto w = random_matrix(s.n, s.k, 4);
             const auto y = run_gemm(x, w, s.rows, s.n, s.k, WeightKind::BF16, isa, 2);
-            for (float& v : x) v = round_bf16(v);
+            // The AVX2 variant keeps float activations (only the weights are bf16); AVX-512 BF16 rounds both.
+            if (pick_variant(WeightKind::BF16, isa) != Variant::BF16_Y)
+                for (float& v : x) v = round_bf16(v);
             for (float& v : w) v = round_bf16(v);
             std::vector<double> ref, bound;
             reference(x, w, s.rows, s.n, s.k, ref, bound);
