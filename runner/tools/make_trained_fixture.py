@@ -179,6 +179,15 @@ def main() -> None:
         },
         str(OUT / "head_case.safetensors"),
     )
+    # a two-request JSONL workload (the sepal-score input format) over the same request
+    def line(ids, request_id):
+        return json.dumps({
+            "id": request_id, "input_ids": [int(t) for t in ids], "question_types": question_types.tolist(),
+            "instruction_spans": instruction_spans.tolist(), "option_offsets": option_offsets.tolist(),
+            "option_spans": option_spans.tolist(),
+        })
+    lines = [line(input_ids, "forward"), line(input_ids[::-1], "reversed")]
+    (OUT / "workload.jsonl").write_text("\n".join(lines) + "\n")
     print("wrote", OUT, "logits", logits)
 
 
