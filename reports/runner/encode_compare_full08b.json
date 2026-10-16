@@ -1,0 +1,39 @@
+{
+ "tokenizer": "runs\\box-results\\full08b\\U2-s0\\final\\tokenizer.json",
+ "groups": {
+  "golden": {
+   "cases": 20,
+   "identical": 20,
+   "identical_errors": 0
+  },
+  "panel": {
+   "cases": 2000,
+   "identical": 2000,
+   "identical_errors": 0
+  },
+  "adversarial": {
+   "cases": 54,
+   "identical": 54,
+   "identical_errors": 0
+  },
+  "window-edges": {
+   "cases": 132,
+   "identical": 132,
+   "identical_errors": 45
+  }
+ },
+ "mismatches": [],
+ "golden_file_mismatches": 0,
+ "golden_cases_listed_but_missing": [],
+ "time_s": {
+  "oracle_total": 3.429,
+  "ours_total": 2.352
+ },
+ "speed_16k": {
+  "tokens": 15750,
+  "ours_ms_best_of_5": 15.85,
+  "unsloth_transformers_ms_best_of_5": 17.73,
+  "speedup": 1.12
+ },
+ "ok": true
+}

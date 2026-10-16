@@ -68,7 +68,7 @@ cudaStream_t stream() {
     return s.handle;
 }
 
-void sync() { sepal::cuda::check(cudaStreamSynchronize(stream()), "cudaStreamSynchronize"); }
+void sync_stream() { sepal::cuda::check(cudaStreamSynchronize(stream()), "cudaStreamSynchronize"); }
 
 // ---- data ----
 
@@ -201,7 +201,7 @@ public:
 
     /// The rows as bit patterns. Checks that nothing outside the rows' columns changed.
     Bits download_bits(bool padding_must_be_intact = true) const {
-        sync();
+        sync_stream();
         const std::vector<T> after = buf_.download();
         Bits rows(n_, std::vector<std::uint32_t>(width_));
         std::vector<char> in_row(after.size(), 0);
@@ -456,7 +456,6 @@ bool same_bits(const Bits& a, const Bits& b) { return a == b; }
 /// Row `i` of `all`, as a one-row result.
 Bits pick(const Bits& all, std::size_t i) { return Bits{all[i]}; }
 
-Rows one_row(const Rows& rows, std::size_t i) { return Rows{rows[i]}; }
 
 } // namespace
 
@@ -472,7 +471,7 @@ SEPAL_TEST(convert_oracle, host_half_matches_device) {
         DeviceBuffer<std::uint16_t> src(all);
         DeviceBuffer<float> dst(all.size());
         sepal::cuda::detail::launch_convert(src.data(), Elem::F16, dst.data(), Elem::F32, all.size(), stream());
-        sync();
+        sync_stream();
         const std::vector<float> widened = dst.download();
         std::size_t bad = 0;
         for (std::size_t i = 0; i < all.size(); ++i) {
@@ -497,7 +496,7 @@ SEPAL_TEST(convert_oracle, host_half_matches_device) {
         DeviceBuffer<float> src(values);
         DeviceBuffer<std::uint16_t> dst(values.size());
         sepal::cuda::detail::launch_convert(src.data(), Elem::F32, dst.data(), Elem::F16, values.size(), stream());
-        sync();
+        sync_stream();
         const std::vector<std::uint16_t> narrowed = dst.download();
         std::size_t bad = 0;
         for (std::size_t i = 0; i < values.size(); ++i) {
@@ -538,7 +537,7 @@ SEPAL_TEST(contract, argument_checks_and_empty_launches) {
     sepal::cuda::launch_embed(nullptr, 0, nullptr, Elem::F32, 0, 16, nullptr, 0, stream());
     sepal::cuda::launch_readout_norm(a.data(), 16, nullptr, 0, w.data(), 16, kEps, out, 16, stream());
     sepal::cuda::launch_add(nullptr, 0, nullptr, 0, nullptr, 0, 0, 16, stream());
-    sync();
+    sync_stream();
 }
 
 // ---- suite: embed ----
@@ -623,7 +622,7 @@ SEPAL_TEST(embed, full_vocabulary_table) {
     std::uint64_t s = 0x12345;
     for (auto& v : table) {
         s = s * 6364136223846793005ull + 1442695040888963407ull;
-        v = static_cast<std::uint16_t>((s >> 40) & 0x7BFFu | ((s >> 33) & 1u) << 15); // finite
+        v = static_cast<std::uint16_t>(((s >> 40) & 0x7BFFu) | (((s >> 33) & 1u) << 15)); // finite
     }
     Rng rng(5);
     std::vector<std::uint32_t> ids(4096);

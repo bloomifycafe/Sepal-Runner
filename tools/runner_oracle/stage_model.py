@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-FINAL = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\box-results\full08b\U2-s0\final")
-BASE = Path(r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68")
-OUT = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\runner-golden\_stage")
+RUNS = Path(os.environ.get("SEPAL_RUNS", r"E:\MYCOMPANY\BlumSOC\Sepal\runs"))
+FINAL = RUNS / "box-results" / "full08b" / "U2-s0" / "final"
+BASE = Path(os.environ.get("SEPAL_BASE", r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"))
+OUT = RUNS / "runner-golden" / "_stage"
 
 
 def stage(final: Path = FINAL, base: Path = BASE, out: Path = OUT) -> Path:

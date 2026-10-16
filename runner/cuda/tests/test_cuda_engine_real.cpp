@@ -458,7 +458,7 @@ SEPAL_TEST(real_2b, second_geometry_against_the_cpu_reference_and_float16_agains
     // A 28-token state with two branches, and a separate 12-token row, in one call.
     std::vector<EngineRow> rows = {row_of({text.begin(), text.begin() + 28}, {27}), row_of({text.begin() + 28, text.end()}, {11, 0})};
     for (std::size_t b = 0; b < 2; ++b) {
-        EngineRow branch = row_of({text.begin() + 3 * (b + 1), text.begin() + 3 * (b + 1) + 5 + b}, {4 + b});
+        EngineRow branch = row_of({text.begin() + static_cast<std::ptrdiff_t>(3 * (b + 1)), text.begin() + static_cast<std::ptrdiff_t>(3 * (b + 1) + 5 + b)}, {4 + b});
         branch.parent = ParentRow{0};
         branch.start_position = 28;
         rows.push_back(branch);

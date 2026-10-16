@@ -685,18 +685,18 @@ SEPAL_TEST(engine_int8, statistics_files_round_trip_and_refuse_damage) {
     std::size_t refused = 0, tried = 0;
     for (std::size_t len = 0; len < bytes.size(); len += 1 + len / 20) { // truncations
         ++tried;
-        refused += refused_bytes(std::vector<char>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(len))) ? 1 : 0;
+        refused += refused_bytes(std::vector<char>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(len))) ? 1U : 0U;
     }
     for (std::size_t at = 0; at < bytes.size(); at += 1 + at / 25) { // flipped bytes
         std::vector<char> bad = bytes;
         bad[at] = static_cast<char>(bad[at] ^ 0x40);
         ++tried;
-        refused += refused_bytes(bad) ? 1 : 0;
+        refused += refused_bytes(bad) ? 1U : 0U;
     }
     std::vector<char> longer = bytes;
     longer.push_back('x');
     ++tried;
-    refused += refused_bytes(longer) ? 1 : 0;
+    refused += refused_bytes(longer) ? 1U : 0U;
     std::cout << "  " << refused << " of " << tried << " damaged statistics files refused\n";
     CHECK_EQ(refused, tried);
     CHECK_THROWS(sepal::cuda::load_activation_stats(dir / "missing.bin"), std::runtime_error);

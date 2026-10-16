@@ -35,18 +35,18 @@ std::vector<Variant> variants() {
     add("interval 2, 6 layers", [](ModelConfig& c) { c.num_layers = 6; c.full_attention_interval = 2; });
     add("interval 6, 6 layers", [](ModelConfig& c) { c.num_layers = 6; c.full_attention_interval = 6; });
     add("single layer (attention only)", [](ModelConfig& c) { c.num_layers = 1; c.full_attention_interval = 1; });
-    for (const std::uint64_t k : {1, 2, 3, 5, 8}) {
+    for (const std::uint64_t k : {1U, 2U, 3U, 5U, 8U}) {
         add("conv_kernel " + std::to_string(k), [k](ModelConfig& c) { c.conv_kernel = k; });
     }
     add("multi-head attention (kv heads = heads = 4)", [](ModelConfig& c) { c.attn_kv_heads = 4; });
     add("multi-query attention (1 kv head, 4 heads)", [](ModelConfig& c) { c.attn_kv_heads = 1; });
     add("8 heads / 2 kv heads", [](ModelConfig& c) { c.attn_heads = 8; c.attn_kv_heads = 2; });
-    for (const std::uint64_t d : {8, 32, 64, 128, 256}) {
+    for (const std::uint64_t d : {8U, 32U, 64U, 128U, 256U}) {
         add("attention head dim " + std::to_string(d), [d](ModelConfig& c) { c.attn_head_dim = d; c.attn_heads = 2; c.attn_kv_heads = 1; });
     }
     add("attention head dim 256, rotary factor 1", [](ModelConfig& c) { c.attn_head_dim = 256; c.attn_heads = 2; c.attn_kv_heads = 1; c.partial_rotary_factor = 1.0; });
     add("attention head dim 64, rotary factor 0.5", [](ModelConfig& c) { c.attn_head_dim = 64; c.partial_rotary_factor = 0.5; });
-    for (const std::uint64_t d : {4, 16, 32, 64, 128}) {
+    for (const std::uint64_t d : {4U, 16U, 32U, 64U, 128U}) {
         add("DeltaNet key dim " + std::to_string(d), [d](ModelConfig& c) { c.dn_key_head_dim = d; });
         add("DeltaNet value dim " + std::to_string(d), [d](ModelConfig& c) { c.dn_value_head_dim = d; });
     }
@@ -231,7 +231,7 @@ SEPAL_TEST(attack_geometry, last_layer_pruning_changes_no_bit_in_strict_mode_on_
                     const auto rp = run(pruned, rows_p), rf = run(full, rows_f);
                     for (std::size_t i = 0; i < rows.size(); ++i) {
                         ++total;
-                        same += same_bits(rp[i].hidden, rf[i].hidden) ? 1 : 0;
+                        same += same_bits(rp[i].hidden, rf[i].hidden) ? 1U : 0U;
                     }
                     sp = rp[1].snapshot;
                     sf = rf[1].snapshot;

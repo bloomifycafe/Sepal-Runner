@@ -20,9 +20,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-FINAL = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\box-results\full08b\U2-s0\final")
-BASE = Path(r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68")
-STAGE = Path(r"E:\MYCOMPANY\BlumSOC\Sepal\runs\runner-golden\_stage")     # tools/runner_oracle/stage_model.py: final/ with the local base path
+RUNS = Path(os.environ.get("SEPAL_RUNS", r"E:\MYCOMPANY\BlumSOC\Sepal\runs"))      # on a rented box: a private runs dir (SEPAL_RUNS)
+FINAL = RUNS / "box-results" / "full08b" / "U2-s0" / "final"
+BASE = Path(os.environ.get("SEPAL_BASE", r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"))
+STAGE = RUNS / "runner-golden" / "_stage"   # tools/runner_oracle/stage_model.py: final/ with the local base path
 MAX_SCORE_LEN = 16384
 
 
@@ -95,7 +96,9 @@ class Fp32Oracle:
             ids = torch.tensor([list(encoded.input_ids)], dtype=torch.long, device=self.device)
             mask = torch.ones_like(ids)
             with torch.no_grad():
-                hidden = self.text_model(input_ids=ids, attention_mask=mask, use_cache=False, return_dict=True).last_hidden_state
+                # One unpadded sequence: no attention mask, so SDPA takes its causal (flash-style) path instead of materialising an
+                # L x L mask (8.6 GB of scores at 16k tokens on the CPU). Same maths as an all-ones mask.
+                hidden = self.text_model(input_ids=ids, use_cache=False, return_dict=True).last_hidden_state
                 per_question = self.head(hidden, ids, mask, [encoded], self.embedding.detach())[0]
         finally:
             for h in hooks:
@@ -128,6 +131,47 @@ class ServedOracle:
         """Flat raw logits of one record, as the served path computes them (autocast bf16, one record at a time)."""
         rows = self.api_raw.logits(encoded)
         return [float(x) for row, q in zip(rows, encoded.questions) for x in row[:len(q.option_ids)]]
+
+
+class UnslothFp32:
+    """Unsloth's own `FastDecisionModel` on the GPU with fp32 weights and NO autocast (the cross-check of `Fp32Oracle`): Unsloth's fused
+    Clef head (`clef.batched_logits`) over fp32 hidden states. `forward` returns the same dict as `Fp32Oracle.forward` (no layers)."""
+
+    def __init__(self, run_dir: Path = STAGE, max_len: int = MAX_SCORE_LEN):
+        import torch
+        from unsloth import FastDecisionModel
+
+        from sepal.train.unsloth_arm import _scrub_env
+
+        _scrub_env()
+        self.torch = torch
+        self.model, self.tokenizer = FastDecisionModel.from_pretrained(str(Path(run_dir) / "final"), max_seq_length=max_len,
+                                                                      dtype=torch.float32, local_files_only=True)
+        FastDecisionModel.for_inference(self.model)
+        self.tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        self.device = next(self.model.parameters()).device
+        self.dtypes = sorted({str(p.dtype) for p in self.model.parameters()})
+
+    def forward(self, encoded) -> dict:
+        import numpy as np
+
+        torch = self.torch
+        backbone = self.model._backbone()
+        text_model = getattr(backbone, "model", None) or backbone.base_model
+        text_model = getattr(text_model, "language_model", text_model)
+        box: list = []
+        hook = text_model.register_forward_hook(lambda module, args, out: box.append(out.last_hidden_state.detach().float().cpu()))
+        try:
+            ids = torch.tensor([list(encoded.input_ids)], dtype=torch.long, device=self.device)
+            mask = torch.ones_like(ids)
+            with torch.no_grad():                       # no autocast: fp32 throughout
+                logits, _ = self.model(input_ids=ids, attention_mask=mask, records=[encoded])
+        finally:
+            hook.remove()
+        flat = []
+        for row, q in zip(logits.float().cpu().tolist(), encoded.questions):
+            flat.extend(row[:len(q.option_ids)])
+        return {"hidden": box[0][0].numpy(), "logits": np.asarray(flat, dtype=np.float32), "layers": None}
 
 
 def flatten_options(encoded) -> tuple[list[str], list[list[str]], list[int], list[tuple[int, int]]]:

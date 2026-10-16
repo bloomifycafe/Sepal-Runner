@@ -220,9 +220,9 @@ SEPAL_TEST(s8_gemm, the_int8_multiply_is_the_exact_integer_product_scaled_in_flo
         DeviceBuffer<__half> yh(c.t * c.n);
         sepal::cuda::launch_gemm_s8(p.xq.data(), c.k, p.sx.data(), p.wq.data(), c.k, p.sw.data(), yh.data(), c.n, true, c.t, c.n, c.k, -1, stream());
         sync();
-        const auto half = yh.download();
+        const auto half_out = yh.download();
         std::size_t half_differing = 0;
-        for (std::size_t i = 0; i < got.size(); ++i) half_differing += __half2float(half[i]) != __half2float(__float2half(got[i])) ? 1 : 0;
+        for (std::size_t i = 0; i < got.size(); ++i) half_differing += __half2float(half_out[i]) != __half2float(__float2half(got[i])) ? 1U : 0U;
         CHECK_EQ(half_differing, std::size_t{0});
     }
 }
