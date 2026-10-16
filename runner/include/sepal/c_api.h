@@ -35,11 +35,14 @@ SEPAL_API const char* sepal_last_error(void);
 
 /* options_json: {"final_dir": "...", "base_dir": "...", "profile": "gpu-f16" | "cpu-f32" | "cpu-bf16" | "cpu-q8" | ...,
  *                "threads": 0, "max_tokens": 16384, "device": 0, ...backend-specific keys}. Unknown keys are an error. */
+/* "final_dir", "base_dir" and "profile" are required; "threads", "max_tokens" and "device" are accepted by every profile;
+ * a profile's own keys are accepted for that profile only (register_profile in sepal/engine.hpp). On failure *out is NULL. */
 SEPAL_API int32_t sepal_open(const char* options_json, sepal_engine** out);
 SEPAL_API void sepal_close(sepal_engine* engine);
 
-/* Profile id and limits, as JSON: {"profile": ..., "max_tokens": ..., "hidden_size": ..., "backend": ...}.
- * Writes at most `capacity` bytes including the terminating NUL; returns the needed size in *needed. */
+/* Profile id and limits, as JSON: {"profile": ..., "max_tokens": ..., "hidden_size": ..., "backend": ..., "api_version": ...}.
+ * Writes at most `capacity` bytes including the terminating NUL and always returns the needed size in *needed.
+ * buffer == NULL with capacity == 0 only queries the size (returns 0); a buffer that is too small returns non-zero. */
 SEPAL_API int32_t sepal_info(sepal_engine* engine, char* buffer, uint64_t capacity, uint64_t* needed);
 
 /* Scores n_requests requests in one call (the engine batches them).
