@@ -67,6 +67,9 @@ public:
     /// The longest sequence one request may have.
     virtual std::uint64_t max_tokens() const = 0;
 
+    /// Hidden size of the trunk, for sepal_info (0: not reported).
+    virtual std::uint64_t hidden_size() const { return 0; }
+
     /// Times of the last `score` call.
     virtual ScoreTimes last_times() const { return {}; }
 };
