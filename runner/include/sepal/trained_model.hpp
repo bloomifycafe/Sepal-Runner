@@ -57,6 +57,9 @@ public:
     /// `sepal.json` (the run's metadata, temperatures included) as text, for the caller; the engine applies none.
     const std::string& sepal_json() const;
 
+    /// Wall-clock seconds `open` took (base mapping, head conversion, adapter validation; the merge is on demand).
+    double load_seconds() const;
+
 private:
     struct Impl;
     std::shared_ptr<const Impl> impl_;
