@@ -11,9 +11,13 @@
 
 namespace sepal::cpu {
 
+/// The default number of worker threads: the physical cores this process may use (hyper-threads share the FMA units, and
+/// a spinning pool oversubscribed with them is slower than one thread per core). Falls back to the hardware concurrency.
+unsigned default_thread_count();
+
 class ThreadPool {
 public:
-    /// `threads` is the number of participants including the calling thread; 0 means the hardware concurrency.
+    /// `threads` is the number of participants including the calling thread; 0 means default_thread_count().
     explicit ThreadPool(unsigned threads = 0);
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;

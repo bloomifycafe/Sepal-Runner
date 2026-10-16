@@ -42,7 +42,7 @@ struct ClefHeadCapacity {
     std::size_t options = 4096;          // options of one batch
     std::size_t option_tokens = 262144;  // tokens of all option spans of one batch
     std::size_t unique_tokens = 32768;   // distinct tokens among them
-    std::size_t score_floats = std::size_t{1} << 26; // scratch of the attention scores: 8 * queries * L per request (256 MiB)
+    std::size_t score_floats = std::size_t{1} << 25; // scratch of the attention scores (heads * queries * L per piece; 128 MiB)
 };
 
 /// A piece of hidden states: tokens [first_token, first_token + count) of request `request` are rows
@@ -53,6 +53,9 @@ struct HeadSegment {
     std::size_t count = 0;
     std::size_t row = 0;
 };
+
+/// Device memory the head takes for a capacity (weights, arenas, scratch), with a small margin, in bytes.
+std::size_t clef_head_device_bytes(const ClefHeadConfig& config, const ClefHeadCapacity& capacity);
 
 class CudaClefHead {
 public:

@@ -1,6 +1,11 @@
 #include "sepal/cpu/isa.hpp"
 
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -12,23 +17,45 @@ namespace sepal::cpu {
 
 namespace {
 
+#if !defined(_MSC_VER)
+void cpu_id(int regs[4], int leaf) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    __get_cpuid(static_cast<unsigned>(leaf), &a, &b, &c, &d);
+    regs[0] = static_cast<int>(a); regs[1] = static_cast<int>(b); regs[2] = static_cast<int>(c); regs[3] = static_cast<int>(d);
+}
+void cpu_idex(int regs[4], int leaf, int sub) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    __cpuid_count(static_cast<unsigned>(leaf), static_cast<unsigned>(sub), a, b, c, d);
+    regs[0] = static_cast<int>(a); regs[1] = static_cast<int>(b); regs[2] = static_cast<int>(c); regs[3] = static_cast<int>(d);
+}
+unsigned long long xgetbv0() {
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (static_cast<unsigned long long>(hi) << 32) | lo;
+}
+#else
+void cpu_id(int regs[4], int leaf) { __cpuid(regs, leaf); }
+void cpu_idex(int regs[4], int leaf, int sub) { __cpuidex(regs, leaf, sub); }
+unsigned long long xgetbv0() { return _xgetbv(0); }
+#endif
+
 CpuFeatures detect() {
     CpuFeatures f;
     int regs[4] = {0, 0, 0, 0};
-    __cpuid(regs, 0);
+    cpu_id(regs, 0);
     const int max_leaf = regs[0];
     if (max_leaf < 7) return f;
 
-    __cpuid(regs, 1);
+    cpu_id(regs, 1);
     const bool osxsave = (regs[2] & (1 << 27)) != 0;
     const bool fma = (regs[2] & (1 << 12)) != 0;
     const bool avx = (regs[2] & (1 << 28)) != 0;
     unsigned long long xcr0 = 0;
-    if (osxsave) xcr0 = _xgetbv(0);
+    if (osxsave) xcr0 = xgetbv0();
     const bool ymm_state = (xcr0 & 0x6) == 0x6;
     const bool zmm_state = (xcr0 & 0xE6) == 0xE6;
 
-    __cpuidex(regs, 7, 0);
+    cpu_idex(regs, 7, 0);
     const unsigned ebx = static_cast<unsigned>(regs[1]);
     const unsigned ecx = static_cast<unsigned>(regs[2]);
     f.fma = fma && avx && ymm_state;
@@ -37,14 +64,14 @@ CpuFeatures detect() {
     f.avx512bw = zmm_state && (ebx & (1u << 30)) != 0;
     f.avx512vl = zmm_state && (ebx & (1u << 31)) != 0;
     f.avx512vnni = f.avx512f && (ecx & (1u << 11)) != 0;
-    __cpuidex(regs, 7, 1);
+    cpu_idex(regs, 7, 1);
     f.avx512bf16 = f.avx512f && (static_cast<unsigned>(regs[0]) & (1u << 5)) != 0;
 
     char brand[49] = {};
-    __cpuid(regs, static_cast<int>(0x80000000));
+    cpu_id(regs, static_cast<int>(0x80000000));
     if (static_cast<unsigned>(regs[0]) >= 0x80000004u) {
         for (int i = 0; i < 3; ++i) {
-            __cpuid(regs, static_cast<int>(0x80000002u + static_cast<unsigned>(i)));
+            cpu_id(regs, static_cast<int>(0x80000002u + static_cast<unsigned>(i)));
             std::memcpy(brand + 16 * i, regs, 16);
         }
         f.brand = brand;
@@ -76,11 +103,16 @@ Isa best_isa() {
     if (override_slot()) return *override_slot();
     static const Isa chosen = [] {
         if (!isa_supported(Isa::Avx2)) throw std::runtime_error("the CPU backend needs AVX2 and FMA");
+#if defined(_MSC_VER)
         char* env = nullptr;
         std::size_t length = 0;
         if (_dupenv_s(&env, &length, "SEPAL_CPU_ISA") == 0 && env != nullptr) {
             const std::string value = env;
             std::free(env);
+#else
+        if (const char* env = std::getenv("SEPAL_CPU_ISA")) {
+            const std::string value = env;
+#endif
             if (value == "avx2") return Isa::Avx2;
             if (value == "avx512" && isa_supported(Isa::Avx512)) return Isa::Avx512;
         }

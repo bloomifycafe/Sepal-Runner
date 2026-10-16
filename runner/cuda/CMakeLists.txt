@@ -33,6 +33,9 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 
+# The libraries end up in a shared object (sepal_runner_cuda) on Linux.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # ---- the existing engine, unmodified ----
 # Its own tests and tools are not built here: they belong to the parent project.
 set(SEPAL_BUILD_TESTS OFF CACHE BOOL "Parent tests are built by the parent project" FORCE)
@@ -212,12 +215,34 @@ target_include_directories(sepal_cuda_clef_head PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_clef_head SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_clef_head PUBLIC sepal_cuda sepal_core PRIVATE sepal_cublas sepal_cuda_flags)
 
+add_executable(sepal_cuda_head_tests tests/test_clef_head_cuda.cpp ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_head_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_head_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_compile_definitions(sepal_cuda_head_tests PRIVATE SEPAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures")
+target_link_libraries(sepal_cuda_head_tests PRIVATE sepal_cuda_clef_head sepal_core sepal_cuda_flags)
+foreach(suite head_fixture head_golden)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_head_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 900
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
+set_tests_properties(cuda_head_golden PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
+
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
 add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
   PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cuda_flags)
+
+add_library(sepal_cuda_gpu_decision STATIC src/gpu_decision_engine.cpp)
+target_include_directories(sepal_cuda_gpu_decision PUBLIC include PRIVATE src)
+target_include_directories(sepal_cuda_gpu_decision SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_gpu_decision PUBLIC sepal_cuda_engine sepal_cuda_clef_head sepal_core PRIVATE sepal_cuda_flags)
+
+add_executable(sepal-gpu-parity tools/gpu_parity.cpp)
+target_include_directories(sepal-gpu-parity PRIVATE ../tests)
+target_include_directories(sepal-gpu-parity SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-gpu-parity PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
 
 add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
 target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
@@ -279,3 +304,13 @@ endforeach()
 foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
   set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 endforeach()
+
+# ---- the C ABI library of the GPU engine (same c_api.cpp object code as sepal_runner_cpu, plus the CUDA profiles) ----
+add_library(sepal_runner_cuda SHARED $<TARGET_OBJECTS:sepal_capi> src/gpu_profiles.cpp)
+target_include_directories(sepal_runner_cuda SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_runner_cuda PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
+set_target_properties(sepal_runner_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON POSITION_INDEPENDENT_CODE ON)
+
+add_executable(sepal-gpu-bench tools/gpu_bench.cpp)
+target_include_directories(sepal-gpu-bench SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-gpu-bench PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
