@@ -171,8 +171,8 @@ struct CudaClefHead::Impl {
         }
         scorer_w1 = P("residual_scorer.0.weight");
         scorer_b1 = P("residual_scorer.0.bias");
-        scorer_w2 = P("residual_scorer.2.weight");
-        scorer_b2 = weights.tensors.at("residual_scorer.2.bias").at(0);
+        scorer_w2 = P("residual_scorer.3.weight");
+        scorer_b2 = weights.tensors.at("residual_scorer.3.bias").at(0);
         const double limit = std::log(100.0);
         prior_scale = static_cast<float>(std::exp(std::min(static_cast<double>(weights.tensors.at("prior_logit_scale").at(0)), limit)));
         joint_scale = static_cast<float>(std::exp(std::min(static_cast<double>(weights.tensors.at("joint_logit_scale").at(0)), limit)));

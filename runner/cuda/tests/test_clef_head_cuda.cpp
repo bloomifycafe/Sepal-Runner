@@ -124,9 +124,10 @@ SEPAL_TEST(head_golden, golden_set) {
     ClefHeadCapacity cap;
     cap.memory_tokens = 65536;
     cap.call_tokens = 16384;
-    CudaClefHead head(m.head(), cap, stream);
     double worst_logit = 0, worst_p = 0;
     std::size_t flips = 0, run = 0;
+    {
+    CudaClefHead head(m.head(), cap, stream);
     for (const json::Value& entry : manifest.at("cases").items()) {
         if (entry.at("tokens").as_uint() > max_tokens) continue;
         const std::string file = (fs::path(*golden) / entry.at("file").as_string()).string();
@@ -142,6 +143,7 @@ SEPAL_TEST(head_golden, golden_set) {
         flips += parity.flips;
         ++run;
     }
+    } // the head goes before its stream
     std::cout << "  golden head (GPU, fp32): " << run << " case(s), max |dlogit| " << std::scientific << worst_logit << ", max |dp| " << worst_p << ", flips " << flips << "\n";
     CHECK(run > 0);
     CHECK(worst_logit <= 1e-4);

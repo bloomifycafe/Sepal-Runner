@@ -1212,7 +1212,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             check_attention_rows(spans_u, descs_u, segs_u);
             for (const std::uint32_t pos : readout_rows) {
-                readout_compact.push_back(u32(std::lower_bound(upos.begin(), upos.end(), pos) - upos.begin()));
+                readout_compact.push_back(u32(static_cast<std::size_t>(std::lower_bound(upos.begin(), upos.end(), pos) - upos.begin())));
             }
         }
     }

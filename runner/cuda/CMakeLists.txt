@@ -33,6 +33,9 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 
+# The libraries end up in a shared object (sepal_runner_cuda) on Linux.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # ---- the existing engine, unmodified ----
 # Its own tests and tools are not built here: they belong to the parent project.
 set(SEPAL_BUILD_TESTS OFF CACHE BOOL "Parent tests are built by the parent project" FORCE)
