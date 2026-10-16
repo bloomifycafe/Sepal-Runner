@@ -289,3 +289,49 @@ def test_scheduler_closes_pending(tiny_tokenizer):
     future = service.scheduler.submit(Encoder(tiny_tokenizer).encode({"state": "s", "questions": {"q": question()}}))
     with pytest.raises(RuntimeError, match="closed"):
         future.result(timeout=2)
+
+
+def test_full_server_answers_429_and_recovers(tiny_tokenizer):
+    import time
+    service, _, _ = make(tiny_tokenizer, delay=0.3, max_pending=2, cache_size=0)
+    bodies = [{"state": f"distinct {i}", "questions": {"q": question()}} for i in range(6)]
+    futures = [service.submit(b) for b in bodies]
+    results = [service._wait(f, time.monotonic()) for f in futures]
+    statuses = [s for s, _ in results]
+    assert statuses[:2] == [200, 200] and statuses[2:] == [429] * 4
+    assert "retry" in results[2][1]["detail"]
+    assert service.snapshot()["rejected_429"] == 4 and service.snapshot()["status_429"] == 4
+    assert service.outcome(bodies[0])[0] == 200      # free again
+    service.close()
+
+
+def test_request_timeout_is_a_504(tiny_tokenizer):
+    service, _, _ = make(tiny_tokenizer, delay=0.5, request_timeout_s=0.05)
+    status, payload = service.outcome({"state": "slow", "questions": {"q": question()}})
+    assert status == 504 and "no answer" in payload["detail"] and service.snapshot()["timeouts"] == 1
+    service.close()
+
+
+def test_api_key_and_metrics(tiny_tokenizer):
+    service, _, _ = make(tiny_tokenizer)
+    with pytest.raises(SystemExit, match="API key"):
+        srv.serve(service, "n", "0.0.0.0", 0)
+    server = srv.serve(service, "n", "0.0.0.0", 0, api_key="s3cret")      # bound to all interfaces, with a key: allowed
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    body = {"state": "x", "questions": {"q": question()}}
+    assert post(f"{base}/v1/systemone", body)[0] == 401
+    assert urllib.request.urlopen(f"{base}/health").status == 200      # open
+    for headers in ({"Authorization": "Bearer s3cret"}, {"X-API-Key": "s3cret"}):
+        request = urllib.request.Request(f"{base}/v1/systemone", data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **headers})
+        assert urllib.request.urlopen(request).status == 200
+    bad = urllib.request.Request(f"{base}/metrics", headers={"X-API-Key": "wrong"})
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(bad)
+    assert caught.value.code == 401
+    text = urllib.request.urlopen(urllib.request.Request(f"{base}/metrics", headers={"X-API-Key": "s3cret"})).read().decode()
+    assert "sepal_runner_status_200 2" in text and "sepal_runner_latency_ms_p95" in text
+    server.shutdown()
+    server.server_close()
+    service.close()
