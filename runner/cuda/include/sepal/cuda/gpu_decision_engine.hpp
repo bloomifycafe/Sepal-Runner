@@ -22,7 +22,11 @@
 namespace sepal::cuda {
 
 struct GpuDecisionOptions {
-    std::string profile = "gpu-f16"; // or "gpu-f32"
+    /// "gpu-f16", "gpu-f32" (fast mode: the default; a request's answer may differ in the last bits with the requests it shares a call with)
+    /// or "gpu-f16-strict", "gpu-f32-strict" (strict mode: the trunk's answer for a request is bit-identical alone, among other requests and in
+    /// any place of a batch; the scan kernel for DeltaNet, the engine's batch-invariant multiplies, gemm_rows 128). The profile id of every
+    /// answer is this string, so a result says which mode made it.
+    std::string profile = "gpu-f16";
     int device = 0;
     /// The longest request. The trunk's call buffers are sized for max_call_tokens, not for this: a longer request is cut.
     std::uint64_t max_tokens = 32768;

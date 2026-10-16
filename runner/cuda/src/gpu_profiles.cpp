@@ -34,6 +34,8 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
 void register_backend_profiles() {
     const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries", "deltanet"};
     register_profile({"gpu-f16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16"); }});
+    register_profile({"gpu-f16-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16-strict"); }});
+    register_profile({"gpu-f32-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32-strict"); }});
     register_profile({"gpu-f32", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32"); }});
 }
 

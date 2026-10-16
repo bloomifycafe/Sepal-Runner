@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
         std::cout << "  calibrated : max |dp| " << *std::max_element(all.dpc.begin(), all.dpc.end()) << "  p99 " << percentile(all.dpc, 0.99) << "  flips " << all.flipsc << " ("
                   << std::fixed << std::setprecision(2) << 100.0 * static_cast<double>(all.flipsc) / static_cast<double>(all.questions) << "%)\n";
         // The gates of docs/RUNNER.md 14: float32 profiles 1e-4 and no flips; gpu-f16 0.03, p99 0.01, flips at most 0.5%; at T=1 and calibrated.
-        const bool f32 = profile == "gpu-f32";
+        const bool f32 = profile.rfind("gpu-f32", 0) == 0;
         const double questions = static_cast<double>(all.questions);
         const double worst_dp = std::fmax(*std::max_element(all.dp1.begin(), all.dp1.end()), *std::max_element(all.dpc.begin(), all.dpc.end()));
         const double worst_p99 = std::fmax(percentile(all.dp1, 0.99), percentile(all.dpc, 0.99));

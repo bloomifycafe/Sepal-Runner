@@ -334,7 +334,9 @@ add_test(NAME cuda_golden_gpu_f32 COMMAND sepal-gpu-parity --profile gpu-f32 --m
 add_test(NAME cuda_golden_gpu_f16_scan COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet scan --skip-without-env on)
 add_test(NAME cuda_golden_gpu_f16_chunked COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet chunked --skip-without-env on)
 add_test(NAME cuda_golden_gpu_f16_batch20 COMMAND sepal-gpu-parity --profile gpu-f16 --batch 20 --skip-without-env on)
-foreach(t gpu_f32 gpu_f16_scan gpu_f16_chunked gpu_f16_batch20)
+add_test(NAME cuda_golden_gpu_f16_strict COMMAND sepal-gpu-parity --profile gpu-f16-strict --max-tokens 20000 --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f32_strict COMMAND sepal-gpu-parity --profile gpu-f32-strict --max-tokens 20000 --skip-without-env on)
+foreach(t gpu_f32 gpu_f16_scan gpu_f16_chunked gpu_f16_batch20 gpu_f16_strict gpu_f32_strict)
   set_tests_properties(cuda_golden_${t} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
