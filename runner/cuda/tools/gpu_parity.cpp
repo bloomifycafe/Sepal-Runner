@@ -88,6 +88,7 @@ struct Accum {
 int main(int argc, char** argv) {
     std::string final_dir, base_dir, golden_dir, profile = "gpu-f16", multiply = "auto", only, int8_groups;
     bool int8_act = true;
+    std::string deltanet = "auto";
     std::uint64_t max_tokens = 40000;
     std::size_t batch = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -100,6 +101,7 @@ int main(int argc, char** argv) {
         else if (a == "--batch") batch = std::stoull(v);
         else if (a == "--multiply") multiply = v;
         else if (a == "--int8") int8_groups = v;
+        else if (a == "--deltanet") deltanet = v;
         else if (a == "--int8-act") int8_act = v == "on";
         else if (a == "--cases") only = "," + v + ",";
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
@@ -121,6 +123,8 @@ int main(int argc, char** argv) {
         options.int8.mixer_in = int8_groups.find("mixer_in") != std::string::npos;
         options.int8.mixer_out = int8_groups.find("mixer_out") != std::string::npos;
         options.int8.int8_activations = int8_act;
+        if (deltanet == "scan") options.deltanet = cuda::DeltaNetMode::Scan;
+        else if (deltanet == "chunked") options.deltanet = cuda::DeltaNetMode::Chunked;
         cuda::GpuDecisionEngine engine(model, options);
         const json::Value manifest = json::parse(read_text(fs::path(golden_dir) / "manifest.json"));
         std::vector<std::string> names;

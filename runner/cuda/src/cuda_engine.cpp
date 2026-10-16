@@ -25,6 +25,7 @@
 #include "gemm_s8_kernels.hpp"
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
+#include "kernels_deltanet_chunked.hpp"
 #include "kernels_elementwise.hpp"
 #include "snapshot_file.hpp"
 
@@ -280,6 +281,11 @@ struct CudaEngine::Impl {
     std::size_t cap_rows = 0;  // rows the call buffers hold (a multiple of gemm_rows in strict mode)
     DeltaNetGeometry dn_geometry;
     AttentionShape attn_shape{};
+    bool use_chunked = false;  // the chunked DeltaNet kernels may be used (see DeltaNetMode)
+    int sm_count = 1;
+    std::size_t chunk_cap = 0; // chunks the workspace holds
+    char* dn_ws = nullptr;     // workspace of the chunked kernels (call buffers)
+    std::size_t dn_ws_bytes = 0;
 
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
@@ -565,6 +571,11 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
         if (place) member = reinterpret_cast<std::remove_reference_t<decltype(member)>>(call_memory.data() + used);
         used += align_up(bytes);
     };
+    if (use_chunked) {
+        chunk_cap = cap_rows / kDeltaNetChunk + 64;
+        dn_ws_bytes = deltanet_chunked_workspace_bytes(dn_geometry, chunk_cap, cap_rows);
+        take(dn_ws_bytes, dn_ws);
+    }
     take(cap_rows * H * 4, x);
     take(cap_rows * H * 4, m);
     take(cap_rows * H * elem_bytes, a1);
@@ -699,6 +710,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
                                    u32(dim(config.conv_kernel)), config.rms_norm_eps};
     attn_shape = AttentionShape{u32(dim(config.attn_heads)), u32(dim(config.attn_kv_heads)), u32(dim(config.attn_head_dim)),
                                 u32(dim(config.attn_rotary_dims())), config.rope_theta, config.rms_norm_eps};
+    use_chunked = options.deltanet != DeltaNetMode::Scan && half && options.gemm_rows == 0 && dn_layers != 0 && deltanet_chunked_supported(dn_geometry);
     state_conv_floats = dn_geometry.conv_tail_floats();
     state_recurrent_floats = dn_geometry.recurrent_floats();
     state_elem = options.half_state ? 2 : 4;
@@ -708,6 +720,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     cudaDeviceProp prop{};
     check_cuda(cudaGetDeviceProperties(&prop, options.device), "cudaGetDeviceProperties");
     info.device = options.device;
+    sm_count = std::max(1, prop.multiProcessorCount);
     info.name = prop.name;
     info.compute_major = prop.major;
     info.compute_minor = prop.minor;
@@ -1127,6 +1140,38 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
     }
     wave_start[waves] = wave_rows.size();
+    // The chunked DeltaNet kernels for the waves they pay off in: the scan runs one block per (row, head) and a block's time is its row's
+    // length, so a wave with few rows leaves most of the card idle; the chunked kernels' time is proportional to the tokens, spread over the
+    // whole card. Per layer, measured on an RTX 3090 (82 SMs): scan 0.93 us per token of the longest row per wave of blocks, chunked 0.285 us
+    // per token (scaled by the SM count).
+    std::vector<std::uint32_t> chunk_prefix_all;
+    std::vector<std::size_t> chunk_prefix_at(waves, 0);
+    std::vector<std::uint32_t> chunk_total(waves, 0);
+    std::vector<char> wave_chunked(waves, 0);
+    if (use_chunked) {
+        for (std::size_t w = 0; w < waves; ++w) {
+            const std::size_t count = wave_start[w + 1] - wave_start[w];
+            std::vector<std::uint32_t> lens(count);
+            std::uint64_t toks = 0;
+            std::uint32_t maxlen = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                lens[i] = u32(plan[wave_rows[wave_start[w] + i]].length);
+                toks += lens[i];
+                maxlen = std::max(maxlen, lens[i]);
+            }
+            std::vector<std::uint32_t> pref = deltanet_chunk_prefix(lens);
+            const double scan_waves = std::ceil(static_cast<double>(count * dn_geometry.value_heads) / static_cast<double>(sm_count));
+            const double t_scan = maxlen * 0.93 * scan_waves;
+            const double t_chunk = static_cast<double>(toks) * 0.285 * 82.0 / static_cast<double>(sm_count);
+            const bool fits = pref.back() <= chunk_cap && toks != 0;
+            if (fits && (options.deltanet == DeltaNetMode::Chunked || (toks >= 256 && t_chunk < 0.8 * t_scan))) {
+                wave_chunked[w] = 1;
+                chunk_prefix_at[w] = chunk_prefix_all.size();
+                chunk_total[w] = pref.back();
+                chunk_prefix_all.insert(chunk_prefix_all.end(), pref.begin(), pref.end());
+            }
+        }
+    }
     std::size_t segment_total = 0;
     if (attn_layers != 0) {
         char* const heap = pools->kv_memory.data();
@@ -1222,6 +1267,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     const std::size_t off_in = tw.put(in_slots);
     const std::size_t off_out = tw.put(out_slots);
     const std::size_t off_waves = tw.put(wave_rows);
+    const std::size_t off_chunks = tw.put(chunk_prefix_all);
     const std::size_t off_descs = tw.put(descs);
     const std::size_t off_readout = tw.put(readout_rows);
     std::vector<std::size_t> off_segments(attn_layers);
@@ -1242,6 +1288,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     const auto* d_in = reinterpret_cast<const std::uint32_t*>(tables + off_in);
     const auto* d_out = reinterpret_cast<const std::uint32_t*>(tables + off_out);
     const auto* d_waves = reinterpret_cast<const std::uint32_t*>(tables + off_waves);
+    const auto* d_chunks = reinterpret_cast<const std::uint32_t*>(tables + off_chunks);
     const auto* d_descs = reinterpret_cast<const AttentionRowDesc*>(tables + off_descs);
     const auto* d_readout = reinterpret_cast<const std::uint32_t*>(tables + off_readout);
     const auto* d_upos = reinterpret_cast<const std::uint32_t*>(tables + off_upos);
@@ -1402,7 +1449,16 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                 Phase phase(*this, &PhaseTimes::deltanet_ms);
                 for (std::size_t wv = 0; wv < waves; ++wv) {
                     const DeltaNetRows dn_rows{d_spans, d_in, d_out, d_waves + wave_start[wv], u32(wave_start[wv + 1] - wave_start[wv])};
-                    if (dn_in_half) {
+                    if (wave_chunked[wv]) {
+                        const DeltaNetChunkPlan chunk_plan{d_chunks + chunk_prefix_at[wv], chunk_total[wv]};
+                        if (dn_in_half) {
+                            launch_deltanet_chunked<__half>(dn_geometry, w.deltanet, dn_inputs_half, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws,
+                                                            dn_ws_bytes, cap_rows, reinterpret_cast<__half*>(a2), mix_width, stream);
+                        } else {
+                            launch_deltanet_chunked<float>(dn_geometry, w.deltanet, dn_inputs, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws,
+                                                           dn_ws_bytes, cap_rows, reinterpret_cast<__half*>(a2), mix_width, stream);
+                        }
+                    } else if (dn_in_half) {
                         launch_deltanet_wave<__half>(dn_geometry, w.deltanet, dn_inputs_half, dn_rows, dn_states[w.kind_index],
                                                      reinterpret_cast<__half*>(a2), mix_width, stream);
                     } else if (half) {

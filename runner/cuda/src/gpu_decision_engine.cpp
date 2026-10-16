@@ -105,6 +105,7 @@ struct GpuDecisionEngine::Impl {
         eo.half_state = o.half_state;
         eo.gemm_rows = o.gemm_rows;
         eo.int8_multiply = o.int8;
+        eo.deltanet = o.deltanet;
         const std::size_t head_bytes = clef_head_device_bytes(model.head_config(), options.head);
         if (o.trunk_budget_bytes != 0) {
             eo.memory_budget_bytes = o.trunk_budget_bytes;
