@@ -47,6 +47,7 @@ std::uint32_t u32(std::size_t v) { return static_cast<std::uint32_t>(v); }
 
 void check_cuda(cudaError_t status, const char* what, const std::string& context = {}) {
     if (status == cudaSuccess) return;
+    (void)cudaGetLastError(); // the error is reported by the exception: do not leave it for the next call's check
     throw CudaError(what, static_cast<long long>(status), cudaGetErrorString(status), context);
 }
 

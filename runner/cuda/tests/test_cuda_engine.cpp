@@ -23,6 +23,7 @@ using sepal::cuda::Precision;
 namespace {
 
 constexpr double kHiddenTolerance = 1e-4;
+constexpr double kFloat32Floor = 2.5e-4; // see fuzz_against_reference
 
 EngineOptions tiny_options(Precision precision, std::size_t gemm_rows = 0) {
     EngineOptions o;
@@ -150,14 +151,17 @@ SEPAL_TEST(engine_f32, fuzz_against_reference) {
                 // random weights amplify float32 rounding noise through the DeltaNet layers (the ladder shows the error
                 // growing in DeltaNet layers only, in the engine and in the reference alike), so in a few calls the
                 // float32 reference is itself far from the float64 answer. Such a call passes when the engine is no further
-                // from float64 than 1e-4 plus 3 times the reference's own distance; a fault in the engine would be orders
-                // of magnitude over that.
+                // from float64 than kFloat32Floor plus 3 times the reference's own distance. The floor is the float32 noise this
+                // chain can reach on these random weights: the float32 reference alone is 2.0e-4 from float64 in its worst call
+                // (CUDA 12.8 cuBLAS on sm_86 sums in another order than the CPU, so which calls are the bad ones differs from
+                // machine to machine), so a bar of 1e-4 was below what two correct float32 implementations can promise. A fault
+                // in the engine would be orders of magnitude over it.
                 ++over_bar;
                 worst_over_bar = std::max(worst_over_bar, diff);
                 std::cerr << "  call " << call << " of weight set " << w << " differs from the float32 reference by " << diff
                           << " (engine from float64: " << call_engine_exact << ", float32 reference from float64: " << call_ref32_exact << ")\n";
-                CHECK(call_engine_exact <= 3.0 * call_ref32_exact + 1e-4);
-                if (call_engine_exact > 3.0 * call_ref32_exact + 1e-4) locate_mismatch(engine, cfg, weights, request, want, seed);
+                CHECK(call_engine_exact <= 3.0 * call_ref32_exact + kFloat32Floor);
+                if (call_engine_exact > 3.0 * call_ref32_exact + kFloat32Floor) locate_mismatch(engine, cfg, weights, request, want, seed);
             }
             for (std::size_t r = 0; r < request.engine.size(); ++r) {
                 ++rows_total;
@@ -186,6 +190,7 @@ SEPAL_TEST(engine_f32, fuzz_against_reference) {
               << " and the float32 reference by " << ref32_vs_exact << " (largest hidden value " << std::fixed << std::setprecision(2)
               << peak << ")\n";
     CHECK(over_bar * 100 <= calls * 2); // at most 2% of the calls may need the float64 yardstick
+    CHECK(engine_vs_exact <= 2.0 * ref32_vs_exact + 1e-4); // over the whole run the engine is as close to float64 as the float32 reference
 }
 
 SEPAL_TEST(engine_f32, ladder_matches_reference_layer_by_layer) {

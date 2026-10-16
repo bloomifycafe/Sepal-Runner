@@ -50,6 +50,7 @@ inline constexpr std::uint32_t kNoSlot = 0xFFFFFFFFu;
 
 inline void check(cudaError_t status, const char* call) {
     if (status != cudaSuccess) {
+        (void)cudaGetLastError(); // the error is reported by the exception: do not leave it for the next call's check
         throw std::runtime_error(std::string(call) + " failed: " + cudaGetErrorString(status));
     }
 }

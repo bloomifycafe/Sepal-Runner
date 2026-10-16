@@ -87,7 +87,7 @@ struct Accum {
 
 int main(int argc, char** argv) {
     std::string final_dir, base_dir, golden_dir, profile = "gpu-f16", multiply = "auto", only, int8_groups;
-    bool int8_act = true;
+    bool int8_act = true, skip_without_env = false;
     std::string deltanet = "auto";
     std::uint64_t max_tokens = 40000;
     std::size_t batch = 1;
@@ -104,7 +104,16 @@ int main(int argc, char** argv) {
         else if (a == "--deltanet") deltanet = v;
         else if (a == "--int8-act") int8_act = v == "on";
         else if (a == "--cases") only = "," + v + ",";
+        else if (a == "--skip-without-env") skip_without_env = v == "on";
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
+    }
+    const auto from_env = [](const char* name) { const char* v = std::getenv(name); return v != nullptr ? std::string(v) : std::string(); };
+    if (final_dir.empty()) final_dir = from_env("SEPAL_TRAINED_FINAL");
+    if (base_dir.empty()) base_dir = from_env("SEPAL_TRAINED_BASE");
+    if (golden_dir.empty()) golden_dir = from_env("SEPAL_GOLDEN_DIR");
+    if (skip_without_env && (final_dir.empty() || base_dir.empty() || golden_dir.empty())) {
+        std::cout << "SKIPPED: real-model parity; set SEPAL_TRAINED_FINAL, SEPAL_TRAINED_BASE and SEPAL_GOLDEN_DIR\n";
+        return 77;
     }
     if (final_dir.empty() || base_dir.empty() || golden_dir.empty()) {
         std::cerr << "usage: sepal-gpu-parity --final D --base D --golden D [--profile P] [--max-tokens N] [--batch K] [--multiply cublas|invariant|auto] [--cases a,b]\n";
@@ -187,6 +196,16 @@ int main(int argc, char** argv) {
                   << std::fixed << std::setprecision(2) << 100.0 * static_cast<double>(all.flips1) / static_cast<double>(all.questions) << "%)\n" << std::scientific << std::setprecision(2);
         std::cout << "  calibrated : max |dp| " << *std::max_element(all.dpc.begin(), all.dpc.end()) << "  p99 " << percentile(all.dpc, 0.99) << "  flips " << all.flipsc << " ("
                   << std::fixed << std::setprecision(2) << 100.0 * static_cast<double>(all.flipsc) / static_cast<double>(all.questions) << "%)\n";
+        // The gates of docs/RUNNER.md 14: float32 profiles 1e-4 and no flips; gpu-f16 0.03, p99 0.01, flips at most 0.5%; at T=1 and calibrated.
+        const bool f32 = profile == "gpu-f32";
+        const double questions = static_cast<double>(all.questions);
+        const double worst_dp = std::fmax(*std::max_element(all.dp1.begin(), all.dp1.end()), *std::max_element(all.dpc.begin(), all.dpc.end()));
+        const double worst_p99 = std::fmax(percentile(all.dp1, 0.99), percentile(all.dpc, 0.99));
+        const std::size_t worst_flips = std::max(all.flips1, all.flipsc);
+        const bool pass = f32 ? (worst_dp <= 1e-4 && worst_flips == 0)
+                              : (worst_dp <= 0.03 && worst_p99 <= 0.01 && static_cast<double>(worst_flips) <= 0.005 * questions);
+        std::cout << "  gate (" << (f32 ? "max dp <= 1e-4, no flips" : "max dp <= 0.03, p99 <= 0.01, flips <= 0.5%") << "): " << (pass ? "PASS" : "FAIL") << "\n";
+        if (!pass) return 3;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
