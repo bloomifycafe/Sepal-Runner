@@ -54,6 +54,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -349,6 +350,16 @@ public:
     /// not part of the call or a cycle of parents, a snapshot of another engine, too many tokens or rows), and
     /// BudgetExceeded when the pools cannot hold the call. Either way nothing is left allocated by the call.
     std::vector<EngineRowResult> run(std::span<const EngineRow> rows);
+
+    /// Called inside `run`, on the engine's stream, after the final norm of the read-out rows has been computed: `hidden` is a
+    /// device pointer to [readouts, hidden size] float32 rows, in the order of the call (rows in order, each row's readout offsets in
+    /// order). The hook enqueues work on `stream` (a cudaStream_t) and must not wait for it; the buffer is reused by the next call,
+    /// which runs on the same stream, so work enqueued here is ordered before it.
+    using HiddenHook = std::function<void(const float* hidden, std::size_t readouts, void* stream)>;
+    /// `run` with the hook above. `copy_hidden` false leaves `EngineRowResult::hidden` empty: nothing is copied to the host.
+    std::vector<EngineRowResult> run(std::span<const EngineRow> rows, const HiddenHook& hook, bool copy_hidden = false);
+    /// The engine's stream (a cudaStream_t), for work that has to be ordered with its calls.
+    void* stream_handle() const;
 
     const ModelConfig& config() const;
     const EngineOptions& options() const;

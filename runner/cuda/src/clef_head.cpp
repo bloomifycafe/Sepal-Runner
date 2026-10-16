@@ -28,8 +28,6 @@ void check_blas(cublasStatus_t status, const char* what) {
 
 std::uint32_t u32(std::size_t v) { return static_cast<std::uint32_t>(v); }
 
-constexpr std::size_t kHeads = 8;
-
 /// One multi-head attention's parameters on the device.
 struct AttnPtrs {
     const float* in_w = nullptr;  // [3 * width, width]
@@ -75,7 +73,7 @@ struct CudaClefHead::Impl {
     ClefHeadCapacity cap;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
-    std::size_t W = 0, Hd = 0, FF = 0;
+    std::size_t W = 0, Hd = 0, FF = 0, nh = 0;
 
     DeviceBuffer<float> weights_mem;
     std::map<std::string, const float*, std::less<>> wp;
@@ -108,10 +106,8 @@ struct CudaClefHead::Impl {
         W = cfg.width;
         Hd = cfg.hidden_size;
         FF = cfg.feedforward;
-        if (cfg.heads != kHeads || W % kHeads != 0 || W != 512 || cfg.hidden_size != 1024) {
-            // The kernels are written for the shapes of this head family (8 heads); other widths are not exercised.
-            if (cfg.heads != kHeads || W % kHeads != 0) throw std::invalid_argument("clef head: only 8 heads are supported");
-        }
+        nh = cfg.heads;
+        if (nh == 0 || W % nh != 0) throw std::invalid_argument("clef head: width is not a multiple of the heads");
         upload_weights(weights);
         check_blas(cublasCreate(&blas), "cublasCreate");
         check_blas(cublasSetStream(blas, stream), "cublasSetStream");
@@ -199,8 +195,8 @@ struct CudaClefHead::Impl {
         ox = DeviceBuffer<float>(cap.options * W);
         oln = DeviceBuffer<float>(Q * W);
         qproj = DeviceBuffer<float>(Q * W);
-        qk = DeviceBuffer<float>(kHeads * Q * W);
-        ctx = DeviceBuffer<float>(kHeads * Q * W);
+        qk = DeviceBuffer<float>(nh * Q * W);
+        ctx = DeviceBuffer<float>(nh * Q * W);
         att = DeviceBuffer<float>(Q * W);
         ao = DeviceBuffer<float>(Q * W);
         ffh = DeviceBuffer<float>(Q * FF);
@@ -246,37 +242,45 @@ struct CudaClefHead::Impl {
                          const std::vector<QuerySeg>& segs, float* out) {
         const float one = 1.0f, zero = 0.0f;
         linear(qin, n, W, a.in_w, W, a.in_b, qproj.data());
-        clef_scale(qproj.data(), n * W, 0.125f, stream); // 1/sqrt(head_dim = 64)
-        const std::size_t hd = W / kHeads;
+        clef_scale(qproj.data(), n * W, 1.0f / std::sqrt(static_cast<float>(W / nh)), stream); // 1/sqrt(head_dim)
+        const std::size_t hd = W / nh;
         // qk_h = Q_h Wk_h : [n, W] per head, stored [head][n][W]
         check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(W), static_cast<int>(n), static_cast<int>(hd), &one,
                                              a.in_w + W * W, static_cast<int>(W), static_cast<long long>(hd * W), qproj.data(), static_cast<int>(W),
                                              static_cast<long long>(hd), &zero, qk.data(), static_cast<int>(W), static_cast<long long>(n * W),
-                                             static_cast<int>(kHeads)),
+                                             static_cast<int>(nh)),
                    "cublasSgemmStridedBatched");
-        if (gamma != nullptr) clef_scale_shift_cols(qk.data(), kHeads * n, W, gamma, nullptr, stream);
+        if (gamma != nullptr) clef_scale_shift_cols(qk.data(), nh * n, W, gamma, nullptr, stream);
         for (const QuerySeg& s : segs) {
             if (s.count == 0) continue;
             const float* m = mem_base + s.mem_tok * W;
-            const int L = static_cast<int>(s.length), c = static_cast<int>(s.count);
-            // scores[h] [count, L] = qk_h [count, W] M^T
-            check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_T, CUBLAS_OP_N, L, c, static_cast<int>(W), &one, m, static_cast<int>(W), 0,
-                                                 qk.data() + s.off * W, static_cast<int>(W), static_cast<long long>(n * W), &zero, scores.data(), L,
-                                                 static_cast<long long>(s.count * s.length), static_cast<int>(kHeads)),
-                       "cublasSgemmStridedBatched");
-            clef_softmax_rows(scores.data(), kHeads * s.count, s.length, 1.0f, stream);
-            // ctx_h [count, W] = P_h [count, L] M
-            check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(W), c, L, &one, m, static_cast<int>(W), 0,
-                                                 scores.data(), L, static_cast<long long>(s.count * s.length), &zero, ctx.data() + s.off * W,
-                                                 static_cast<int>(W), static_cast<long long>(n * W), static_cast<int>(kHeads)),
-                       "cublasSgemmStridedBatched");
+            const int L = static_cast<int>(s.length);
+            const std::size_t per_query = nh * s.length;
+            if (per_query > cap.score_floats) throw std::invalid_argument("clef head: attention scores of one query exceed the scratch");
+            const std::size_t step = std::min(s.count, cap.score_floats / per_query);
+            for (std::size_t start = 0; start < s.count; start += step) {
+                const std::size_t cnt = std::min(step, s.count - start);
+                const int c = static_cast<int>(cnt);
+                const std::size_t row0 = s.off + start;
+                // scores[h] [cnt, L] = qk_h [cnt, W] M^T
+                check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_T, CUBLAS_OP_N, L, c, static_cast<int>(W), &one, m, static_cast<int>(W), 0,
+                                                     qk.data() + row0 * W, static_cast<int>(W), static_cast<long long>(n * W), &zero, scores.data(), L,
+                                                     static_cast<long long>(cnt * s.length), static_cast<int>(nh)),
+                           "cublasSgemmStridedBatched");
+                clef_softmax_rows(scores.data(), nh * cnt, s.length, 1.0f, stream);
+                // ctx_h [cnt, W] = P_h [cnt, L] M
+                check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(W), c, L, &one, m, static_cast<int>(W), 0,
+                                                     scores.data(), L, static_cast<long long>(cnt * s.length), &zero, ctx.data() + row0 * W,
+                                                     static_cast<int>(W), static_cast<long long>(n * W), static_cast<int>(nh)),
+                           "cublasSgemmStridedBatched");
+            }
         }
-        if (gamma != nullptr || beta != nullptr) clef_scale_shift_cols(ctx.data(), kHeads * n, W, gamma, beta, stream);
+        if (gamma != nullptr || beta != nullptr) clef_scale_shift_cols(ctx.data(), nh * n, W, gamma, beta, stream);
         // o[:, h*hd ...] = ctx_h Wv_h^T
         check_blas(cublasSgemmStridedBatched(blas, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(hd), static_cast<int>(n), static_cast<int>(W), &one,
                                              a.in_w + 2 * W * W, static_cast<int>(W), static_cast<long long>(hd * W), ctx.data(), static_cast<int>(W),
                                              static_cast<long long>(n * W), &zero, att.data(), static_cast<int>(W), static_cast<long long>(hd),
-                                             static_cast<int>(kHeads)),
+                                             static_cast<int>(nh)),
                    "cublasSgemmStridedBatched");
         clef_add_bias(att.data(), W, n, W, a.in_b + 2 * W, stream);
         linear(att.data(), n, W, a.out_w, W, a.out_b, out);
@@ -330,13 +334,13 @@ void CudaClefHead::Impl::begin(std::span<const EncodedRequest* const> requests, 
         fields += p.fields;
         options += popt;
         max_fields = std::max(max_fields, p.fields);
-        score_need = std::max({score_need, kHeads * p.options * L, kHeads * p.fields * L});
+        score_need = std::max(score_need, nh * L);
     }
     if (mem_total > cap.memory_tokens) throw std::invalid_argument("clef head: " + std::to_string(mem_total) + " memory tokens (capacity " + std::to_string(cap.memory_tokens) + ")");
     if (fields > cap.fields) throw std::invalid_argument("clef head: " + std::to_string(fields) + " fields (capacity " + std::to_string(cap.fields) + ")");
     if (options > cap.options) throw std::invalid_argument("clef head: " + std::to_string(options) + " options (capacity " + std::to_string(cap.options) + ")");
     if (option_tokens > cap.option_tokens) throw std::invalid_argument("clef head: " + std::to_string(option_tokens) + " option tokens (capacity " + std::to_string(cap.option_tokens) + ")");
-    if (score_need > cap.score_floats) throw std::invalid_argument("clef head: attention scores need " + std::to_string(score_need) + " floats (capacity " + std::to_string(cap.score_floats) + ")");
+    if (score_need > cap.score_floats) throw std::invalid_argument("clef head: attention scores of one query need " + std::to_string(score_need) + " floats (capacity " + std::to_string(cap.score_floats) + ")");
 
     // Spans: [instruction of every field][every option][global of every request], and the tables.
     std::vector<ClefSpan> spans;
@@ -509,7 +513,7 @@ std::vector<RequestLogits> CudaClefHead::Impl::finish() {
     for (const DecoderLayer& l : decoder) {
         layer_norm(f.data(), fln.data(), Qn, W, l.norm1);
         linear(fln.data(), Qn, W, l.self_attn.in_w, 3 * W, l.self_attn.in_b, qkv.data());
-        clef_self_attention(qkv.data(), tab(t_q_request), tab(t_q_req_first), tab(t_q_req_count), Qn, W, kHeads, att.data(), stream, max_fields_per_req);
+        clef_self_attention(qkv.data(), tab(t_q_request), tab(t_q_req_first), tab(t_q_req_count), Qn, W, nh, att.data(), stream, max_fields_per_req);
         linear(att.data(), Qn, W, l.self_attn.out_w, W, l.self_attn.out_b, ao.data());
         clef_add(f.data(), ao.data(), Qn * W, stream);
 
@@ -546,6 +550,19 @@ std::vector<RequestLogits> CudaClefHead::Impl::finish() {
 }
 
 // ---- public surface ------------------------------------------------------------------------------------------
+
+std::size_t clef_head_device_bytes(const ClefHeadConfig& cfg, const ClefHeadCapacity& cap) {
+    const std::size_t W = cfg.width, Hd = cfg.hidden_size, FF = cfg.feedforward, nh = cfg.heads;
+    const std::size_t S = cap.fields + cap.options + cap.requests;
+    const std::size_t Q = std::max(cap.options, cap.fields);
+    std::size_t floats = 2 * cap.memory_tokens * W + cap.call_tokens * (Hd + W) + S * Hd + cap.options * Hd + cap.unique_tokens * Hd;
+    floats += cap.fields * W * 2 + cap.requests * W + cap.options * W + Q * W * 3 + 2 * nh * Q * W + Q * FF;
+    floats += cap.fields * W * 2 + cap.fields * 3 * W + cap.options * 4 * W + cap.options * W + 2 * cap.options + cap.score_floats;
+    floats += 8 * cap.fields + 6 * cap.requests + 2 * cap.options + cap.option_tokens + 16 + S * 2;
+    // weights: about 23 (hidden * width) + layers * (4 attention matrices + 2 feed-forward matrices) with a margin
+    const std::size_t weights = (6 * Hd * W + (cfg.routing_layers + cfg.layers) * (4 * W * W + 2 * W * FF) + cfg.layers * 4 * W * W + 4 * W * W) * 1;
+    return (floats + weights) * 4 + (std::size_t{64} << 20);
+}
 
 CudaClefHead::CudaClefHead(const ClefHeadWeights& weights, const ClefHeadCapacity& capacity, void* stream)
     : impl_(std::make_unique<Impl>(weights, capacity, stream)) {}

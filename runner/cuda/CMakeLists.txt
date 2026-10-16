@@ -212,12 +212,34 @@ target_include_directories(sepal_cuda_clef_head PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_clef_head SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_clef_head PUBLIC sepal_cuda sepal_core PRIVATE sepal_cublas sepal_cuda_flags)
 
+add_executable(sepal_cuda_head_tests tests/test_clef_head_cuda.cpp ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_head_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_head_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_compile_definitions(sepal_cuda_head_tests PRIVATE SEPAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures")
+target_link_libraries(sepal_cuda_head_tests PRIVATE sepal_cuda_clef_head sepal_core sepal_cuda_flags)
+foreach(suite head_fixture head_golden)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_head_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 900
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
+set_tests_properties(cuda_head_golden PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
+
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
 add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
   PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cuda_flags)
+
+add_library(sepal_cuda_gpu_decision STATIC src/gpu_decision_engine.cpp)
+target_include_directories(sepal_cuda_gpu_decision PUBLIC include PRIVATE src)
+target_include_directories(sepal_cuda_gpu_decision SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_gpu_decision PUBLIC sepal_cuda_engine sepal_cuda_clef_head sepal_core PRIVATE sepal_cuda_flags)
+
+add_executable(sepal-gpu-parity tools/gpu_parity.cpp)
+target_include_directories(sepal-gpu-parity PRIVATE ../tests)
+target_include_directories(sepal-gpu-parity SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-gpu-parity PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
 
 add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
 target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
