@@ -164,9 +164,9 @@ SEPAL_TEST(gemmk_accuracy, both_accumulation_modes_against_float64) {
         CHECK(err <= c.bound);
         for (const float v : got) CHECK(std::isfinite(v));
         // The binary16 output is the float32 output rounded to binary16.
-        const std::vector<__half> half = p.run_half(c.mode, c.flush);
+        const std::vector<__half> half_out = p.run_half(c.mode, c.flush);
         std::size_t differing = 0;
-        for (std::size_t i = 0; i < got.size(); ++i) differing += __half2float(half[i]) != __half2float(__float2half(got[i])) ? 1 : 0;
+        for (std::size_t i = 0; i < got.size(); ++i) differing += __half2float(half_out[i]) != __half2float(__float2half(got[i])) ? 1U : 0U;
         CHECK_EQ(differing, std::size_t{0});
     }
 }

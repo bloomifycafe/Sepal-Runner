@@ -99,9 +99,9 @@ struct Buffers {
 };
 
 void alloc_buffers(Buffers& b, int t, int n, int k, bool want32) {
-    b.w_count = static_cast<std::size_t>(n) * k;
-    b.x_count = static_cast<std::size_t>(t) * k;
-    b.y_count = static_cast<std::size_t>(t) * n;
+    b.w_count = static_cast<std::size_t>(n) * static_cast<std::size_t>(k);
+    b.x_count = static_cast<std::size_t>(t) * static_cast<std::size_t>(k);
+    b.y_count = static_cast<std::size_t>(t) * static_cast<std::size_t>(n);
     std::mt19937 rng(12345);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     const float wscale = 1.0f / std::sqrt(static_cast<float>(k));
@@ -114,7 +114,7 @@ void alloc_buffers(Buffers& b, int t, int n, int k, bool want32) {
         b.hw[i] = __half2float(h);
     }
     for (int r = 0; r < n; ++r)
-        for (int c = 0; c < k; ++c) w16t[static_cast<std::size_t>(c) * n + r] = w16[static_cast<std::size_t>(r) * k + c];
+        for (int c = 0; c < k; ++c) w16t[static_cast<std::size_t>(c) * static_cast<std::size_t>(n) + static_cast<std::size_t>(r)] = w16[static_cast<std::size_t>(r) * static_cast<std::size_t>(k) + static_cast<std::size_t>(c)];
     for (std::size_t i = 0; i < b.x_count; ++i) {
         const __half h = __float2half(nd(rng));
         x16[i] = h;
@@ -165,13 +165,13 @@ Err measure(const Buffers& b, int t, int n, int k, bool out_half) {
     }
     double sum_sq_err = 0, sum_sq_ref = 0, max_abs = 0;
     for (int r = 0; r < rows; ++r) {
-        const float* x = &b.hx[static_cast<std::size_t>(r) * k];
+        const float* x = &b.hx[static_cast<std::size_t>(r) * static_cast<std::size_t>(k)];
         for (int c = 0; c < n; ++c) {
-            const float* w = &b.hw[static_cast<std::size_t>(c) * k];
+            const float* w = &b.hw[static_cast<std::size_t>(c) * static_cast<std::size_t>(k)];
             double acc = 0;
             for (int i = 0; i < k; ++i) acc += static_cast<double>(x[i]) * w[i];
-            const double got = out_half ? static_cast<double>(__half2float(y16[static_cast<std::size_t>(r) * n + c]))
-                                        : static_cast<double>(y32[static_cast<std::size_t>(r) * n + c]);
+            const double got = out_half ? static_cast<double>(__half2float(y16[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)]))
+                                        : static_cast<double>(y32[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)]);
             const double d = got - acc;
             max_abs = std::max(max_abs, std::fabs(d));
             sum_sq_err += d * d;
@@ -450,7 +450,7 @@ void rows_check(const char* label, int t, int n, int k, const std::vector<std::s
         // (a) rotate the rows by 37 places
         std::vector<float> xa(b.x_count);
         const int shift = 37 % t;
-        for (int r = 0; r < t; ++r) std::copy_n(&x0[static_cast<std::size_t>(r) * k], k, &xa[static_cast<std::size_t>((r + shift) % t) * k]);
+        for (int r = 0; r < t; ++r) std::copy_n(&x0[static_cast<std::size_t>(r) * static_cast<std::size_t>(k)], k, &xa[static_cast<std::size_t>((r + shift) % t) * static_cast<std::size_t>(k)]);
         upload_x(xa);
         v.run();
         const auto ya = fetch(v.out_half);
@@ -464,8 +464,8 @@ void rows_check(const char* label, int t, int n, int k, const std::vector<std::s
         for (int r = 0; r < t; ++r) {
             bool d = false, d2 = false;
             for (int c = 0; c < n; ++c) {
-                d = d || y0[static_cast<std::size_t>(r) * n + c] != ya[static_cast<std::size_t>((r + shift) % t) * n + c];
-                d2 = d2 || y0[static_cast<std::size_t>(r) * n + c] != y0b[static_cast<std::size_t>(r) * n + c];
+                d = d || y0[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)] != ya[static_cast<std::size_t>((r + shift) % t) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)];
+                d2 = d2 || y0[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)] != y0b[static_cast<std::size_t>(r) * static_cast<std::size_t>(n) + static_cast<std::size_t>(c)];
             }
             rot_diff += d;
             same_run_diff += d2;

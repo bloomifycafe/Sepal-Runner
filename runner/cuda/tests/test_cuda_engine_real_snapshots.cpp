@@ -255,7 +255,7 @@ Outputs measure_all(bool half_state, const std::vector<Alert>& alerts, Range* ra
     CudaEngine engine(real().model, options(half_state));
     const ModelConfig& cfg = real().model.config();
     const std::size_t H = hidden_size();
-    std::cout << "  engine float16, state " << (half_state ? "binary16" : "float32") << ": slot " << engine.memory().slot_bytes / 1024.0 / 1024.0 << " MiB\n";
+    std::cout << "  engine float16, state " << (half_state ? "binary16" : "float32") << ": slot " << static_cast<double>(engine.memory().slot_bytes) / 1024.0 / 1024.0 << " MiB\n";
     const auto note_range = [&](const DeviceSnapshot& s) {
         if (range != nullptr) range->add(engine.to_host(s), cfg);
     };
@@ -467,8 +467,8 @@ void tiers_for(const char* label, const std::string& model_dir, const std::vecto
         const double total_mib = slot_mib + kv_mib;
         const double fixed_mib = static_cast<double>(m.weights_bytes + m.call_buffer_bytes) / 1048576.0;
         std::cout << "  [measure] " << label << " state " << (half_state ? "binary16" : "float32") << ": " << state.size() << "-token alert: slot " << std::fixed << std::setprecision(2) << slot_mib
-                  << " MiB + keys/values " << kv_mib << " MiB = " << total_mib << " MiB per snapshot; weights " << m.weights_bytes / 1048576.0 << " MiB, call buffers (4096 tokens) "
-                  << m.call_buffer_bytes / 1048576.0 << " MiB\n";
+                  << " MiB + keys/values " << kv_mib << " MiB = " << total_mib << " MiB per snapshot; weights " << static_cast<double>(m.weights_bytes) / 1048576.0 << " MiB, call buffers (4096 tokens) "
+                  << static_cast<double>(m.call_buffer_bytes) / 1048576.0 << " MiB\n";
         const double card_mib = 12288.0, reserve_mib = 600.0; // 12 GB card, driver and display take about 600 MiB
         const double fit = std::floor((card_mib - reserve_mib - fixed_mib) / total_mib);
         std::cout << "  [measure] " << label << " " << (half_state ? "binary16" : "float32") << ": alerts of this size resident on a 12 GB card next to the weights: " << fit << "\n";
@@ -538,7 +538,7 @@ void tiers_for(const char* label, const std::string& model_dir, const std::vecto
         line("save (device -> file)", save);
         line("load_host (file -> host)", load_host);
         line("load (file -> device)", load);
-        std::cout << "  [measure] file size " << fs::file_size(file) / 1048576.0 << " MiB (host snapshot " << engine.to_host(snap).bytes() / 1048576.0 << " MiB)\n";
+        std::cout << "  [measure] file size " << static_cast<double>(fs::file_size(file)) / 1048576.0 << " MiB (host snapshot " << static_cast<double>(engine.to_host(snap).bytes()) / 1048576.0 << " MiB)\n";
         fs::remove(file);
     }
 }

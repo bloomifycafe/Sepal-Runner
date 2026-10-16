@@ -372,7 +372,7 @@ struct CudaEngine::Impl {
 
     // ---- a call ----
     struct Phase;
-    std::vector<EngineRowResult> run(std::span<const EngineRow> rows);
+    std::vector<EngineRowResult> run(std::span<const EngineRow> rows, const HiddenHook* hook = nullptr, bool copy_hidden = true);
     // Snapshot tiers; the caller holds run_mutex.
     SnapshotIdentity identity();
     HostSnapshot to_host(const DeviceSnapshot& snapshot, HostMemory memory);
@@ -959,7 +959,7 @@ private:
 
 } // namespace
 
-std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> rows) {
+std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> rows, const HiddenHook* hook, bool copy_hidden) {
     std::lock_guard<std::mutex> lock(run_mutex);
     // The calling thread may not be the one that made the engine; the CUDA device is a per-thread setting.
     check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
@@ -1212,7 +1212,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             check_attention_rows(spans_u, descs_u, segs_u);
             for (const std::uint32_t pos : readout_rows) {
-                readout_compact.push_back(u32(std::lower_bound(upos.begin(), upos.end(), pos) - upos.begin()));
+                readout_compact.push_back(u32(static_cast<std::size_t>(std::lower_bound(upos.begin(), upos.end(), pos) - upos.begin())));
             }
         }
     }
@@ -1491,7 +1491,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
     }
 
-    std::vector<float> hidden(readouts * H);
+    std::vector<float> hidden(copy_hidden ? readouts * H : 0);
     {
         Phase phase(*this, &PhaseTimes::elementwise_ms);
         if (readouts != 0) {
@@ -1502,7 +1502,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
         }
     }
-    if (readouts != 0) {
+    if (readouts != 0 && hook != nullptr) (*hook)(m, readouts, stream);
+    if (readouts != 0 && copy_hidden) {
         check_cuda(cudaMemcpyAsync(hidden.data(), m, hidden.size() * 4, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync", "readout");
     }
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "end of call");
@@ -1517,7 +1518,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     std::size_t taken = 0;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const std::size_t count = rows[r].readout_offsets.size() * H;
-        results[r].hidden.assign(hidden.begin() + static_cast<std::ptrdiff_t>(taken), hidden.begin() + static_cast<std::ptrdiff_t>(taken + count));
+        if (copy_hidden) results[r].hidden.assign(hidden.begin() + static_cast<std::ptrdiff_t>(taken), hidden.begin() + static_cast<std::ptrdiff_t>(taken + count));
         taken += count;
         if (rows[r].keep_snapshot) {
             auto data = std::make_shared<DeviceSnapshot::Data>();
@@ -1564,6 +1565,10 @@ CudaEngine::CudaEngine(const ModelConfig& config, const Weights<float>& weights,
 CudaEngine::~CudaEngine() = default;
 
 std::vector<EngineRowResult> CudaEngine::run(std::span<const EngineRow> rows) { return impl_->run(rows); }
+std::vector<EngineRowResult> CudaEngine::run(std::span<const EngineRow> rows, const HiddenHook& hook, bool copy_hidden) {
+    return impl_->run(rows, &hook, copy_hidden);
+}
+void* CudaEngine::stream_handle() const { return impl_->stream; }
 const ModelConfig& CudaEngine::config() const { return impl_->config; }
 const EngineOptions& CudaEngine::options() const { return impl_->options; }
 Precision CudaEngine::precision() const { return impl_->options.precision; }

@@ -1,0 +1,25 @@
+{
+ "url": "http://127.0.0.1:8000",
+ "concurrency": 8,
+ "requests_sent": 16,
+ "answered": 16,
+ "statuses": {
+  "200": 16
+ },
+ "client_errors": 0,
+ "first_errors": [],
+ "wall_s": 160.621,
+ "requests_per_s": 0.1,
+ "input_tokens": 20745,
+ "input_tokens_per_s": 129.2,
+ "bust_cache": true,
+ "latency_ms": {
+  "mean": 73102.2,
+  "p50": 82489.7,
+  "p95": 84976.6,
+  "p99": 84977.7,
+  "max": 84977.7
+ },
+ "bodies": 16,
+ "bodies_file": "t1k_q8.jsonl"
+}

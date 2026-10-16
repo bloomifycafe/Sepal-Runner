@@ -583,9 +583,9 @@ SEPAL_TEST(stages, chain_against_reference) {
         check_parity(vs_f, 1e-4);
         check_parity(vs_d, 1e-4);
         // The half output is the float output rounded to binary16.
-        RunOptions half;
-        half.half = true;
-        const SingleRun run_h = run_single(p, row, half);
+        RunOptions half_opts;
+        half_opts.half = true;
+        const SingleRun run_h = run_single(p, row, half_opts);
         bool rounded = run_h.result.out.size() == run.result.out.size();
         for (std::size_t i = 0; rounded && i < run.result.out.size(); ++i) {
             rounded = std::bit_cast<std::uint16_t>(__float2half_rn(run.result.out[i])) ==
@@ -873,7 +873,7 @@ void invariance_for(const Problem& p, std::size_t row_len, std::uint64_t seed) {
         // Random other rows of random lengths, the target at a random place.
         const std::size_t others = 5 + rng.below(10);
         std::vector<RowData> rows;
-        for (std::size_t i = 0; i < others; ++i) rows.push_back(make_row(p, 1 + rng.below(90), seed * 31 + trial * 100 + i));
+        for (std::size_t i = 0; i < others; ++i) rows.push_back(make_row(p, 1 + rng.below(90), seed * 31 + static_cast<std::size_t>(trial) * 100 + i));
         const std::size_t at = trial == 0 ? 0 : trial == 1 ? others : rng.below(static_cast<std::uint32_t>(others + 1));
         rows.insert(rows.begin() + static_cast<std::ptrdiff_t>(at), target);
 
