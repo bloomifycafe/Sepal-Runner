@@ -1143,7 +1143,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     wave_start[waves] = wave_rows.size();
     // The chunked DeltaNet kernels for the waves they pay off in: the scan runs one block per (row, head) and a block's time is its row's
     // length, so a wave with few rows leaves most of the card idle; the chunked kernels' time is proportional to the tokens, spread over the
-    // whole card. Per layer, measured on an RTX 3090 (82 SMs): scan 0.93 us per token of the longest row per wave of blocks, chunked 0.285 us
+    // whole card. Per layer, measured on an RTX 3090 (82 SMs): scan 0.93 us per token of the longest row per wave of blocks, chunked 0.235 us
     // per token (scaled by the SM count).
     std::vector<std::uint32_t> chunk_prefix_all;
     std::vector<std::size_t> chunk_prefix_at(waves, 0);
@@ -1163,7 +1163,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             std::vector<std::uint32_t> pref = deltanet_chunk_prefix(lens);
             const double scan_waves = std::ceil(static_cast<double>(count * dn_geometry.value_heads) / static_cast<double>(sm_count));
             const double t_scan = maxlen * 0.93 * scan_waves;
-            const double t_chunk = static_cast<double>(toks) * 0.285 * 82.0 / static_cast<double>(sm_count);
+            const double t_chunk = static_cast<double>(toks) * 0.235 * 82.0 / static_cast<double>(sm_count);
             const bool fits = pref.back() <= chunk_cap && toks != 0;
             if (fits && (options.deltanet == DeltaNetMode::Chunked || (toks >= 256 && t_chunk < 0.8 * t_scan))) {
                 wave_chunked[w] = 1;

@@ -23,6 +23,10 @@ constexpr int kD = 128;         // key and value head dimension
 constexpr int kSplit = 4;       // slices of the value columns (32 each) run by separate blocks of the state kernel
 constexpr int kSliceCols = kD / kSplit;
 constexpr int kMaxTaps = 8;
+// Leading dimensions in shared memory, padded so that the 8 or 16 rows of a tensor-core fragment fall in different banks.
+constexpr int kPadD = 136; // [64][128] binary16 operands
+constexpr int kPadC = 72;  // [64][64] binary16
+constexpr int kPadA = 68;  // [64][64] float32
 constexpr std::size_t kTileBytesBig = static_cast<std::size_t>(kC) * kD * sizeof(__half); // W, U, Q, K of one (chunk, head)
 constexpr std::size_t kTileBytesM = static_cast<std::size_t>(kC) * kC * sizeof(__half);
 
@@ -105,18 +109,18 @@ struct Args {
 // ---- kernel 1: prepare ----
 
 constexpr int kPrepThreads = 512;
-constexpr int kPrepSmem = 16384 + 16384 + 16384 + 16384 + 8192 + 1536;
+constexpr int kPrepSmem = 16384 + 17408 + 17408 + 17408 + 9216 + 1536;
 
 template <class InT, bool HS>
 __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     constexpr std::integral_constant<bool, HS> kHalfState{};
     float* F = reinterpret_cast<float*>(smem_raw);                        // [64][64]: T
-    __half* ks = reinterpret_cast<__half*>(smem_raw + 16384);              // [64][128]
-    __half* qx = reinterpret_cast<__half*>(smem_raw + 32768);              // [64][128]: X for W, then Q, then X for U
-    float* AT = reinterpret_cast<float*>(smem_raw + 49152);                // [64][64]: A / products staging
-    __half* Th = reinterpret_cast<__half*>(smem_raw + 65536);              // [64][64]
-    float* sg = reinterpret_cast<float*>(smem_raw + 73728);                // g[64]
+    __half* ks = reinterpret_cast<__half*>(smem_raw + 16384);              // [64][kPadD]
+    __half* qx = reinterpret_cast<__half*>(smem_raw + 33792);              // [64][kPadD]: X for W, then Q, then X for U
+    float* AT = reinterpret_cast<float*>(smem_raw + 51200);                // [64][kPadA]: A / products staging
+    __half* Th = reinterpret_cast<__half*>(smem_raw + 68608);              // [64][kPadC]
+    float* sg = reinterpret_cast<float*>(smem_raw + 77824);                // g[64]
     float* sbeta = sg + 64;
     float* scum = sbeta + 64;
     float* sex = scum + 64;                                                // exp(cum)
@@ -246,9 +250,9 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
     conv_tokens(args.key_heads * kD + key_head * kD, normalised([&](std::uint32_t tok, std::uint32_t i, float kh) {
                     const float kd = tok < n ? __fmul_rn(skd[tok], kh) : 0.0f;
                     const float xw = tok < n ? __fmul_rn(__fmul_rn(sbeta[tok], sex[tok]), kh) : 0.0f;
-                    ks[tok * kD + i] = __float2half_rn(kh);
+                    ks[tok * kPadD + i] = __float2half_rn(kh);
                     Kd_t[tok * kD + i] = __float2half_rn(kd);
-                    qx[tok * kD + i] = __float2half_rn(xw);
+                    qx[tok * kPadD + i] = __float2half_rn(xw);
                 }));
     __syncthreads();
 
@@ -260,16 +264,17 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
         const int rt = warp & 3, nt = warp >> 2;
         wmma::fill_fragment(acc, 0.0f);
         for (int kk = 0; kk < 8; ++kk) {
-            wmma::load_matrix_sync(fa, ks + (16 * rt) * kD + 16 * kk, kD);
-            wmma::load_matrix_sync(fb, ks + (16 * nt) * kD + 16 * kk, kD);
+            wmma::load_matrix_sync(fa, ks + (16 * rt) * kPadD + 16 * kk, kPadD);
+            wmma::load_matrix_sync(fb, ks + (16 * nt) * kPadD + 16 * kk, kPadD);
             wmma::mma_sync(acc, fa, fb, acc);
         }
-        wmma::store_matrix_sync(AT + (16 * rt) * kC + 16 * nt, acc, kC, wmma::mem_row_major);
+        wmma::store_matrix_sync(AT + (16 * rt) * kPadA + 16 * nt, acc, kPadA, wmma::mem_row_major);
     }
     __syncthreads();
     for (std::uint32_t e = tid; e < kC * kC; e += kPrepThreads) {
         const std::uint32_t i = e / kC, jj = e % kC;
-        AT[e] = (jj < i && i < n) ? __fmul_rn(__fmul_rn(sbeta[i], expf(__fsub_rn(scum[i], scum[jj]))), AT[e]) : 0.0f;
+        float& a = AT[i * kPadA + jj];
+        a = (jj < i && i < n) ? __fmul_rn(__fmul_rn(sbeta[i], expf(__fsub_rn(scum[i], scum[jj]))), a) : 0.0f;
     }
     for (std::uint32_t e = tid; e < kC * kC; e += kPrepThreads) F[e] = 0.0f;
     __syncthreads();
@@ -284,7 +289,7 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
             float s = 0.0f;
 #pragma unroll
             for (int m = 0; m < 15; ++m) {
-                if (m < i && static_cast<std::uint32_t>(m) >= jc) s = __fmaf_rn(AT[(b * 16 + i) * kC + b * 16 + m], tcol[m], s);
+                if (m < i && static_cast<std::uint32_t>(m) >= jc) s = __fmaf_rn(AT[(b * 16 + i) * kPadA + b * 16 + m], tcol[m], s);
             }
             tcol[i] = static_cast<std::uint32_t>(i) < jc ? 0.0f : (static_cast<std::uint32_t>(i) == jc ? 1.0f : -s);
             F[(b * 16 + i) * kC + b * 16 + jc] = tcol[i];
@@ -298,7 +303,7 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
             float s = 0.0f;
             for (std::uint32_t k = c; k < r; ++k) {
 #pragma unroll
-                for (int q = 0; q < 16; ++q) s = __fmaf_rn(AT[(r * 16 + i) * kC + k * 16 + q], F[(k * 16 + q) * kC + c * 16 + jc], s);
+                for (int q = 0; q < 16; ++q) s = __fmaf_rn(AT[(r * 16 + i) * kPadA + k * 16 + q], F[(k * 16 + q) * kC + c * 16 + jc], s);
             }
             Sbuf[e] = s;
         }
@@ -311,7 +316,7 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
         }
         __syncthreads();
     }
-    for (std::uint32_t e = tid; e < kC * kC; e += kPrepThreads) Th[e] = __float2half_rn(F[e]);
+    for (std::uint32_t e = tid; e < kC * kC; e += kPrepThreads) Th[(e / kC) * kPadC + e % kC] = __float2half_rn(F[e]);
     __syncthreads();
 
     // C[64][128] = Th[64][64] * X[64][128] (X in qx), written as binary16 to `dst` (a [64][128] tile). The staging area is AT.
@@ -325,8 +330,8 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
             const int col0 = ((warp >> 2) * 2 + np) * 16;
             wmma::fill_fragment(acc, 0.0f);
             for (int kk = 0; kk < 4; ++kk) {
-                wmma::load_matrix_sync(fa, Th + (16 * rt) * kC + 16 * kk, kC);
-                wmma::load_matrix_sync(fb, qx + (16 * kk) * kD + col0, kD);
+                wmma::load_matrix_sync(fa, Th + (16 * rt) * kPadC + 16 * kk, kPadC);
+                wmma::load_matrix_sync(fb, qx + (16 * kk) * kPadD + col0, kPadD);
                 wmma::mma_sync(acc, fa, fb, acc);
             }
             wmma::store_matrix_sync(stage, acc, 16, wmma::mem_row_major);
@@ -345,7 +350,7 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
     conv_tokens(key_head * kD, normalised([&](std::uint32_t tok, std::uint32_t i, float qh) {
                     const float qs = tok < n ? __fmul_rn(qh, args.read_scale) : 0.0f;
                     const float qg = tok < n ? __fmul_rn(sex[tok], qs) : 0.0f;
-                    qx[tok * kD + i] = __float2half_rn(qs);
+                    qx[tok * kPadD + i] = __float2half_rn(qs);
                     Qg_t[tok * kD + i] = __float2half_rn(qg);
                 }));
     __syncthreads();
@@ -357,16 +362,16 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
         const int rt = warp & 3, nt = warp >> 2;
         wmma::fill_fragment(acc, 0.0f);
         for (int kk = 0; kk < 8; ++kk) {
-            wmma::load_matrix_sync(fa, qx + (16 * rt) * kD + 16 * kk, kD);
-            wmma::load_matrix_sync(fb, ks + (16 * nt) * kD + 16 * kk, kD);
+            wmma::load_matrix_sync(fa, qx + (16 * rt) * kPadD + 16 * kk, kPadD);
+            wmma::load_matrix_sync(fb, ks + (16 * nt) * kPadD + 16 * kk, kPadD);
             wmma::mma_sync(acc, fa, fb, acc);
         }
-        wmma::store_matrix_sync(AT + (16 * rt) * kC + 16 * nt, acc, kC, wmma::mem_row_major);
+        wmma::store_matrix_sync(AT + (16 * rt) * kPadA + 16 * nt, acc, kPadA, wmma::mem_row_major);
     }
     __syncthreads();
     for (std::uint32_t e = tid; e < kC * kC; e += kPrepThreads) {
         const std::uint32_t i = e / kC, jj = e % kC;
-        const float m = (jj <= i && i < n) ? __fmul_rn(expf(__fsub_rn(scum[i], scum[jj])), AT[e]) : 0.0f;
+        const float m = (jj <= i && i < n) ? __fmul_rn(expf(__fsub_rn(scum[i], scum[jj])), AT[i * kPadA + jj]) : 0.0f;
         M_t[e] = __float2half_rn(m);
     }
     __syncthreads(); // qx and AT are free
@@ -374,7 +379,7 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
     // ---- v: convolution; X for U = diag(beta) V ----
     conv_tokens(2 * args.key_heads * kD + head * kD, [&](std::uint32_t tok, float (&v)[4]) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) qx[tok * kD + lane + 32 * q] = __float2half_rn(tok < n ? __fmul_rn(sbeta[tok], v[q]) : 0.0f);
+        for (int q = 0; q < 4; ++q) qx[tok * kPadD + lane + 32 * q] = __float2half_rn(tok < n ? __fmul_rn(sbeta[tok], v[q]) : 0.0f);
     });
     __syncthreads();
     product_to_global(U_t);
@@ -386,8 +391,9 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
 // accumulation, operands single binary16): P = W S, Y = U - P, out = Qg S + M Y, S = gend S + Kd^T Y. The four chunk operands of the next chunk
 // are fetched with cp.async as soon as the buffer they replace is free, so the loads hide behind the arithmetic of the current chunk.
 
-constexpr int kPadD = 136; // leading dimension of the [64][128] operands in shared memory (padded against bank conflicts)
-constexpr int kStateSmem = 97280;
+constexpr int kYld = 40; // leading dimension of Y [64][32] binary16 in shared memory
+constexpr int kOld = 36; // of the float32 staging [64][32]
+constexpr int kStateSmem = 100352;
 
 __device__ __forceinline__ void cp_async16(void* shared_dst, const void* global_src) {
     const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(shared_dst));
@@ -403,7 +409,7 @@ __device__ __forceinline__ void fetch_big(__half* shared, const __half* global, 
     }
 }
 __device__ __forceinline__ void fetch_mask(__half* shared, const __half* global, std::uint32_t tid) {
-    for (std::uint32_t e = tid; e < kTileBytesM / 16; e += 128) cp_async16(shared + static_cast<std::size_t>(e) * 8, global + static_cast<std::size_t>(e) * 8);
+    for (std::uint32_t e = tid; e < kTileBytesM / 16; e += 128) cp_async16(shared + (e / 8) * kPadC + (e % 8) * 8, global + static_cast<std::size_t>(e) * 8);
 }
 
 template <bool HS>
@@ -415,9 +421,9 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
     __half* Wb = reinterpret_cast<__half*>(smem_raw + 24576);       // [64][kPadD]
     __half* Qb = reinterpret_cast<__half*>(smem_raw + 41984);       // [64][kPadD]: Qg
     __half* Kb = reinterpret_cast<__half*>(smem_raw + 59392);       // [64][kPadD]: Kd
-    __half* Mb = reinterpret_cast<__half*>(smem_raw + 76800);       // [64][64]
-    float* Ost = reinterpret_cast<float*>(smem_raw + 84992);        // [64][32]
-    __half* Yh = reinterpret_cast<__half*>(smem_raw + 93184);       // [64][32]
+    __half* Mb = reinterpret_cast<__half*>(smem_raw + 76800);       // [64][kPadC]
+    float* Ost = reinterpret_cast<float*>(smem_raw + 86016);        // [64][kOld]
+    __half* Yh = reinterpret_cast<__half*>(smem_raw + 95232);       // [64][kYld]
 
     const std::uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const std::uint32_t pos = blockIdx.x, head = blockIdx.y, split = blockIdx.z;
@@ -482,14 +488,14 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
                 }
             }
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) wmma::store_matrix_sync(Ost + (16 * warp) * kSliceCols + 16 * nt, accP[nt], kSliceCols, wmma::mem_row_major);
+            for (int nt = 0; nt < 2; ++nt) wmma::store_matrix_sync(Ost + (16 * warp) * kOld + 16 * nt, accP[nt], kOld, wmma::mem_row_major);
         }
         __syncwarp();
         // Y = U - P for this warp's rows
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
             const int rowi = 16 * warp + i;
-            Yh[rowi * kSliceCols + lane] = __float2half_rn(__fsub_rn(u[i], Ost[rowi * kSliceCols + lane]));
+            Yh[rowi * kYld + lane] = __float2half_rn(__fsub_rn(u[i], Ost[rowi * kOld + lane]));
         }
         __syncthreads(); // Y complete; W and Qg are no longer needed
         if (j + 1 < nchunks) {
@@ -504,15 +510,15 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fm;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> bh;
             for (int kk = 0; kk <= static_cast<int>(warp); ++kk) {
-                wmma::load_matrix_sync(fm, Mb + (16 * warp) * kC + 16 * kk, kC);
+                wmma::load_matrix_sync(fm, Mb + (16 * warp) * kPadC + 16 * kk, kPadC);
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
-                    wmma::load_matrix_sync(bh, Yh + (16 * kk) * kSliceCols + 16 * nt, kSliceCols);
+                    wmma::load_matrix_sync(bh, Yh + (16 * kk) * kYld + 16 * nt, kYld);
                     wmma::mma_sync(accO[nt], fm, bh, accO[nt]);
                 }
             }
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) wmma::store_matrix_sync(Ost + (16 * warp) * kSliceCols + 16 * nt, accO[nt], kSliceCols, wmma::mem_row_major);
+            for (int nt = 0; nt < 2; ++nt) wmma::store_matrix_sync(Ost + (16 * warp) * kOld + 16 * nt, accO[nt], kOld, wmma::mem_row_major);
         }
         __syncwarp();
 #pragma unroll
@@ -520,7 +526,7 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
             const int rowi = 16 * warp + i;
             if (static_cast<std::uint32_t>(rowi) < n) {
                 args.reads[(static_cast<std::size_t>(span.offset) + j * kC + rowi) * value_dim + head * kD + split * kSliceCols + lane] =
-                    __float2half_rn(Ost[rowi * kSliceCols + lane]);
+                    __float2half_rn(Ost[rowi * kOld + lane]);
             }
         }
 
@@ -540,7 +546,7 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
                 if (static_cast<std::uint32_t>(16 * kk) >= n) break;
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
-                    wmma::load_matrix_sync(bh, Yh + (16 * kk) * kSliceCols + 16 * nt, kSliceCols);
+                    wmma::load_matrix_sync(bh, Yh + (16 * kk) * kYld + 16 * nt, kYld);
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         wmma::load_matrix_sync(fk, Kb + (16 * kk) * kPadD + 32 * warp + 16 * mt, kPadD);
