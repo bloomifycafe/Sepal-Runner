@@ -169,8 +169,8 @@ def run_cpu(args) -> None:
     load_seconds = time.perf_counter() - t0
     env = environment({"model_load_seconds": round(load_seconds, 2), "torch_threads": torch.get_num_threads(),
                        "note": "Fp32Oracle: fp32 weights, PEFT LoRA unmerged, no autocast, reference PyTorch gated delta rule (no fla/Triton on CPU)"})
-    from sepal.serve.decision_api import to_record
-    from sepal.train import unsloth_convert as conv
+    from sepal_runner.shared.decision import to_record
+    from sepal_runner.shared import convert as conv
 
     warm = load_requests("t1k_q1")[0]
     record = to_record(warm["body"])

@@ -264,8 +264,8 @@ class Builder:
 
     def encode(self, body: dict, limit: int):
         """What decision_api hands the encoder for this body, encoded (one token over the limit is allowed to detect an overflow)."""
-        from sepal.serve.decision_api import to_record
-        from sepal.train import unsloth_convert as conv
+        from sepal_runner.shared.decision import to_record
+        from sepal_runner.shared import convert as conv
 
         record = to_record(body)
         state, questions = conv.state_text(record["state"]), conv.request_questions(record)

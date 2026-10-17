@@ -145,7 +145,7 @@ def test_max_state_tokens(tiny_tokenizer):
 
 
 def real_tokenizer_path():
-    for candidate in (os.environ.get("SEPAL_TOKENIZER"), (Path(os.environ["SEPAL_TOKENIZER_DIR"]) / "tokenizer.json") if os.environ.get("SEPAL_TOKENIZER_DIR") else None, ROOT / "runs" / "box-results" / "full08b" / "U2-s0" / "final" / "tokenizer.json"):
+    for candidate in (os.environ.get("SEPAL_TOKENIZER"), (Path(os.environ["SEPAL_FINAL_DIR"]) / "tokenizer.json") if os.environ.get("SEPAL_FINAL_DIR") else None, (Path(os.environ["SEPAL_TOKENIZER_DIR"]) / "tokenizer.json") if os.environ.get("SEPAL_TOKENIZER_DIR") else None, ROOT / "runs" / "box-results" / "full08b" / "U2-s0" / "final" / "tokenizer.json"):
         if candidate and Path(candidate).is_file():
             return Path(candidate)
     return None

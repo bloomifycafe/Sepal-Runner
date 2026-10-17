@@ -52,8 +52,8 @@ class Case:
 
 def prepare(case: Case) -> tuple[str, dict]:
     """(state text, questions) exactly as the scorer hands them to the encoder."""
-    from sepal.serve.decision_api import to_record
-    from sepal.train import unsloth_convert as conv
+    from sepal_runner.shared.decision import to_record
+    from sepal_runner.shared import convert as conv
 
     if case.body is not None:
         record = to_record(case.body)
@@ -69,7 +69,7 @@ def sec_cases(tok, clef) -> list[Case]:
     seed among those short enough, converted as the panel scorer converts them (state_text, request_questions)."""
     import random
 
-    from sepal.train import unsloth_convert as conv
+    from sepal_runner.shared import convert as conv
 
     by: dict[str, list[dict]] = {t: [] for t in SEC_MEMBERS}
     with open(SUITE_DEV, encoding="utf-8") as f:
