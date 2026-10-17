@@ -1,19 +1,19 @@
 # Sepal runner
 
-> **Moved from Sepal (2026-10-17).** This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
+> Moved from Sepal (2026-10-17). This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
 
 Design document for the inference runner that serves the Sepal decision models. A future runner builder starts here.
 
 ## Status and what changed on 2026-10-13
 
-**Runner status.** Paused since 2026-10-11; nobody is building it. Two pieces of this design exist as code: the first
+Runner status. Paused since 2026-10-11; nobody is building it. Two pieces of this design exist as code: the first
 C++ slice of stage R1 in `runner/` (build, model geometry as data, a reference matrix-multiply provider, basic
 operations, a refusing memory planner; listed in `runner/README.md`), and a NumPy float64 reference implementation of
 the trunk and of the old request semantics in `sepal_runner/refengine/`. Neither has loaded a model file. The runner has no
 DeltaNet step, no attention, no weight loader, no executor and no server, and has been built with MSVC on Windows
 only. Stage R0 has not started. Nothing in the runner was measured on a model.
 
-**Model contract changed.** On 2026-10-13 the owner decided to train Sepal with Unsloth's decision trainer, after a
+Model contract changed. On 2026-10-13 the owner decided to train Sepal with Unsloth's decision trainer, after a
 local pilot ([../reports/pilot-unsloth/REPORT.md](../reports/pilot-unsloth/REPORT.md)). The runner therefore has to
 serve this model, and not the Kev-style pointer head or the label-row slots this document was written for:
 
@@ -21,40 +21,40 @@ serve this model, and not the Kev-style pointer head or the label-row slots this
   linear layer of the language model, the DeltaNet projections `in_proj_qkv / z / a / b` and `out_proj` included.
   The vision tower and the output embedding are not adapted.
 - **Readout:** Cloudflare's Clef `JointSchemaHead` (Apache-2.0), a small attention network that reads the final hidden
-  states of **every** position of the sequence. It is not a pointer head and not label rows.
+  states of every position of the sequence. It is not a pointer head and not label rows.
 - **One prompt per request:** a system line, `STATE:` and the state, then `SCHEMA FIELDS:` with one block per
   question, then `JOINT SCHEMA DECISIONS:`. All questions of a request share this one sequence and one forward pass.
   Section 3 gives the exact format.
 
-**What still holds, and what is superseded.**
+What still holds, and what is superseded.
 
 | Section | State |
 |---|---|
 | 1 Decisions | Substrate and stage decisions hold. The sentence on ragged question branches is superseded |
 | 2 Requirements | Edited: request shape, question packs, limits |
-| 3 What the model computes | **Rewritten**: 3.1-3.7 are the new contract (read from source); 3.8 is the trunk (DeltaNet, attention, geometry), **unaffected** |
+| 3 What the model computes | Rewritten: 3.1-3.7 are the new contract (read from source); 3.8 is the trunk (DeltaNet, attention, geometry), unaffected |
 | 4 Why the reference runtime is not enough | Edited: the reference is now the Unsloth / Transformers forward; Kev's numbers are kept as evidence about the class of cost |
 | 5 Substrate decision | Holds; settling items (b) and (e) redefined |
 | 6 Architecture | Edited: row DAG reduced to prefix row plus one tail row per request; readout is the Clef head; last-layer pruning is gone |
-| 7 Caches | **Rewritten** for the new prompt: what can and cannot be cached |
+| 7 Caches | Rewritten for the new prompt: what can and cannot be cached |
 | 8 Scheduler and planner | Holds; the planner's head size and the 64-question target are superseded |
-| 9, 10 Lifecycle, API | **Rewritten** |
+| 9, 10 Lifecycle, API | Rewritten |
 | 11 Precision profiles | Holds (trunk); head row and calibration edited; one new risk on fp16 |
-| 12 Throughput model | **Redone**: token counts and every rate |
-| 13 Scale-out | **Unaffected** |
+| 12 Throughput model | Redone: token counts and every rate |
+| 13 Scale-out | Unaffected |
 | 14 Verification | Edited: the oracle is the Unsloth / Transformers forward of the trained model |
 | 15 Language, build | Unaffected, plus a licence line |
-| 16, 17 Stages, first two weeks | **Rewritten** |
+| 16, 17 Stages, first two weeks | Rewritten |
 | 18 Risks | Edited |
-| 19 Open questions | **New** |
-| 20 Superseded design | **New**: the pointer-head / label-row design and the numbers built on it, kept for the record. Do not build from it |
+| 19 Open questions | New |
+| 20 Superseded design | New: the pointer-head / label-row design and the numbers built on it, kept for the record. Do not build from it |
 
-**Licence status is an open question** (section 19, item 1): the decision modules of Unsloth carry
+Licence status is an open question (section 19, item 1): the decision modules of Unsloth carry
 `AGPL-3.0-only` headers and Clef is Apache-2.0. A runner builder may read Unsloth's code to understand the contract
 but may not copy AGPL code into an Apache-2.0 runner. Implement the head from the Apache-2.0 Clef source or from the
 description in section 3.
 
-**Markers.** Every number carries one:
+Markers. Every number carries one:
 
 - **read from source**: a fact read in a file; the file and lines are cited as `repo@version:path:lines`.
 - **measured (pilot)**: read from an artefact of the 2026-10-13 pilot (`runs/pilot-unsloth/`, git-ignored, in the main
@@ -83,7 +83,7 @@ not a git commit. Other reference code is cited as `repo@commit:path:lines`; sho
 The engine exists for one operation that neither llama.cpp nor the reference server provides: the tails of many
 requests (the rest of the state, then the question schema), each continuing an immutable snapshot of a shared state
 prefix, in a single pass over the weights, with the final hidden states of every position handed to the Clef head.
-**Superseded (2026-10-13):** the first version of this sentence said "many ragged question branches ... continuing
+Superseded (2026-10-13): the first version of this sentence said "many ragged question branches ... continuing
 one immutable snapshot". With one prompt per request the questions are no longer separate branches (section 7). The
 row DAG, the snapshot trie and the token-budget scheduler still follow from making the new operation cheap and exact.
 ## 2. Requirements and workload
@@ -149,35 +149,35 @@ END FIELD\n
 allowed options." (`unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_model.py:24-27`). Rules, all read from
 `unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_model.py`:
 
-- **Rendering (`:35-43`).** A string is used as it is. Anything else is compact JSON with `ensure_ascii=False`,
-  separators `,` and `:` and **sorted keys**. The same function renders instructions and option semantics.
-- **Instruction (`:120-123`).** `None` or an empty string is replaced by the question id.
-- **Options (`:46-57`).** `choice`: `sorted((str(key), value))`, so options are in code-point order of the key, whatever
+- Rendering (`:35-43`). A string is used as it is. Anything else is compact JSON with `ensure_ascii=False`,
+  separators `,` and `:` and sorted keys. The same function renders instructions and option semantics.
+- Instruction (`:120-123`). `None` or an empty string is replaced by the question id.
+- Options (`:46-57`). `choice`: `sorted((str(key), value))`, so options are in code-point order of the key, whatever
   order the caller sent. `noul`: always `true` then `false`, with default descriptions "The proposition is true or the
   answer is yes." and "The proposition is false or the answer is no.", which `criteria` may override. `score`: option ids
   are the strings `"0" ... "n-1"` in list order, the description is the list entry.
-- **Option line (`:129-138`).** `OPTION k: ` then the compact JSON `{"description": d, "option_id": id}` (keys sorted, so
+- Option line (`:129-138`). `OPTION k: ` then the compact JSON `{"description": d, "option_id": id}` (keys sorted, so
   `description` first; `description` is left out when it is `None`), then a newline.
-- **Spans (`:119-139`).** The encoder records the token span of the instruction text alone (not the `INSTRUCTION:`
+- Spans (`:119-139`). The encoder records the token span of the instruction text alone (not the `INSTRUCTION:`
   label) and of each option's JSON alone (not `OPTION k:`).
-- **Tokenisation is piecewise (`:77-78`, `:110-188`).** Each fragment above is tokenised on its own with
+- Tokenisation is piecewise (`:77-78`, `:110-188`). Each fragment above is tokenised on its own with
   `add_special_tokens=False` and the id lists are concatenated: the prefix, the state, `\n\nSCHEMA FIELDS:\n`, then for every
   question the header fragment, the instruction, `\nALLOWED OPTIONS:\n`, and for every option `OPTION k: `, the JSON, `\n`,
   then `END FIELD\n`, and finally the suffix. The ids are therefore **not** the ids of tokenising the whole string, and a
   runner must reproduce the fragment boundaries exactly. Special tokens written in the text (`<|im_start|>` and so on)
   are matched as special tokens; text from the caller is **not** neutralised, so a state containing `<|im_end|>` is
   tokenised to the real special token (section 19, item 8).
-- **Truncation (`:162-170`).** Optional `max_state_tokens`, then the state is cut **at its end** to
+- Truncation (`:162-170`). Optional `max_state_tokens`, then the state is cut at its end to
   `max_length - (prefix + schema + suffix)` tokens. Questions and options are never cut. If prefix, schema and suffix
   alone exceed `max_length`, `encode_record` raises `ValueError` (`:166-169`). The cut is silent; Unsloth's serving call
   re-encodes with one more token to tell a cut state from one that fits exactly
   (`unsloth@2026.10.4:unsloth/models/decision.py:506-513`).
-- **Lengths.** `encode_record` defaults to 16,384 (`:106`). Unsloth's own defaults: 4,096 for training
+- Lengths. `encode_record` defaults to 16,384 (`:106`). Unsloth's own defaults: 4,096 for training
   (`CLEF_MAX_LEN`), 16,384 for `predict` and serving (`CLEF_SERVE_MAX_LEN`)
   (`unsloth@2026.10.4:unsloth/models/_decision_common.py:62-64`, `unsloth@2026.10.4:unsloth/models/decision.py:1704-1725`). The
   pilot trained at 6,144 with states over 4,096 tokens skipped (`sepal/train/unsloth_arm.py:33`, `:157-166`) and scored
   at 16,384 (`sepal/train/unsloth_arm.py:34`).
-- **Media.** Images and videos add vision placeholders after `STATE:` (`:28-29`, `:158-161`). Sepal sends none; the
+- Media. Images and videos add vision placeholders after `STATE:` (`:28-29`, `:158-161`). Sepal sends none; the
   runner needs no vision encoder.
 
 Measured (pilot): the saved tokenizer has `<|im_start|>` 248045, `<|vision_pad|>` 248055 and `<|endoftext|>` 248044
@@ -190,22 +190,22 @@ Unsloth names; any mapping back to ours belongs to the caller.
 
 ### 3.3 Which hidden states the head reads
 
-- **Layer.** The last one only. `ClefModel.forward` calls the text model with `use_cache=False` and takes
+- Layer. The last one only. `ClefModel.forward` calls the text model with `use_cache=False` and takes
   `last_hidden_state` (`unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_model.py:468-491`; Unsloth's trainer wrapper does the
   same, `unsloth@2026.10.4:unsloth/models/decision.py:292-342`). The Transformers Qwen3.5 text model applies its final
   RMSNorm before returning it (`transformers@5.17.0:src/transformers/models/qwen3_5/modeling_qwen3_5.py:1302`, the pilot's
   installed copy). No vocabulary projection is computed.
-- **Positions.** Every non-padding position. The head's first operation is a LayerNorm over the hidden size
+- Positions. Every non-padding position. The head's first operation is a LayerNorm over the hidden size
   (`:353`), then:
-  - **memory**: every position, projected from the hidden size to the head width (`:357`);
-  - **question vector**: mean of the normalised hidden states over the question's instruction span (`:359-364`);
-  - **option vector**: mean over the option's JSON span (`:373-378`);
-  - **lexical vector**: mean of the **output-embedding rows** of the option's token ids (`:379-383`, matrix passed at
+  - Memory: every position, projected from the hidden size to the head width (`:357`);
+  - Question vector: mean of the normalised hidden states over the question's instruction span (`:359-364`);
+  - Option vector: mean over the option's JSON span (`:373-378`);
+  - Lexical vector: mean of the **output-embedding rows** of the option's token ids (`:379-383`, matrix passed at
     `:490`). At 0.8B / 2B / 4B the output embedding is tied to the input embedding; at 9B it is a separate matrix
     (section 3.8). The rows are the frozen base rows: LoRA does not touch the embedding or the output head
     (`unsloth@2026.10.4:unsloth/models/decision.py:706-736`);
-  - **global vector**: the normalised hidden state of the **last** position, the `:` of `JOINT SCHEMA DECISIONS:` (`:358`).
-- **Consequence for a runner.** The final hidden state of every token is an input, so no layer can be skipped for any
+  - Global vector: the normalised hidden state of the last position, the `:` of `JOINT SCHEMA DECISIONS:` (`:358`).
+- Consequence for a runner. The final hidden state of every token is an input, so no layer can be skipped for any
   token, including the state tokens and the final layer's MLP. "Last-layer pruning" of the old design is gone
   (section 20).
 
@@ -228,7 +228,7 @@ is also kept there (`forward_per_record`). Structure, for one request with `Q` q
    with `prior = s_prior * cos(lexical_k, normalise(q_vec + global))`; `g`, `s_prior`, `s_joint` are learned scalars and both
    scales are `exp(clamp(., max=log 100))` (`:426-457`).
 
-**Sizes.** `default_head_config` picks width 1,024 if the backbone hidden size is at least 3,072 and 512 otherwise, `heads =
+Sizes. `default_head_config` picks width 1,024 if the backbone hidden size is at least 3,072 and 512 otherwise, `heads =
 width / 64`, `feedforward = 4 * width`, 2 routing and 4 decoder layers (`unsloth@2026.10.4:unsloth/models/decision_from_lm.py:29-42`).
 Parameter counts below are computed by a short script written for this document from the module definitions (not
 by Unsloth's code); the 0.8B count equals the pilot's file and the 9B count equals the figure REFERENCES.md derived for
@@ -244,7 +244,7 @@ Clef-flash, which uses the same head configuration.
 0.8B / 2B / 4B rows follow from the default rule and the hidden sizes; whether the owner trains 2B / 4B / 9B with the
 default is not decided in this repository (not verified). Always read the head config from the artefact.
 
-**Cost of the head.** Per token of the sequence, the memory projection and the key/value projections of the memory in the
+Cost of the head. Per token of the sequence, the memory projection and the key/value projections of the memory in the
 six cross-attention layers cost `2*h*w + 6*2*2*w*w` FLOPs: 7.3 MFLOP at 0.8B and 33.6 MFLOP at 9B (derived). That is 0.7%
 and 0.24% of the trunk's FLOPs per token (section 12). Attention scores and the option/field work are not counted.
 The head is a per-request cost on top of the trunk and does not batch with other requests' rows except by padding or by a
@@ -263,7 +263,7 @@ options only, in fp32 (`unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_mode
 
 The vendored function rounds to 4 decimals; a runner should return unrounded values and round only for display.
 
-**Where a temperature applies.** The vendored Cloudflare code holds none. Unsloth's serving path divides the logits by a
+Where a temperature applies. The vendored Cloudflare code holds none. Unsloth's serving path divides the logits by a
 temperature before the softmax (`unsloth@2026.10.4:unsloth/models/decision.py:453-503`, `:483-498`):
 `T = head_temperature * T_bucket`, where `T_bucket` is the entry of `temperature_by_options` for the key `<type>:<size>`
 (`size` one of `2`, `3-5`, `6-10`, `11+`) if present, else the per-type entry of `temperature`; per-type and bucket values are clamped to
@@ -285,7 +285,7 @@ Measured (pilot): `model.save_pretrained(dir)` on a LoRA model writes the adapte
 | File | Bytes | Format |
 |---|---|---|
 | `adapter_model.safetensors` | 43,346,432 | LoRA A/B, float32, 372 tensors, 10.82M parameters |
-| `adapter_config.json` | 1,900 | PEFT config; `base_model_name_or_path` is a **local snapshot path** in the pilot, and `target_modules` is a regex over language-layer linears |
+| `adapter_config.json` | 1,900 | PEFT config; `base_model_name_or_path` is a local snapshot path in the pilot, and `target_modules` is a regex over language-layer linears |
 | `joint_head.safetensors` | 54,661,902 | 122 tensors; weights bf16, the three scalars (`prior_logit_scale`, `joint_logit_scale`, `residual_gate`) fp32 |
 | `joint_head_config.json` | 123 | `{"hidden_size":1024,"width":512,"routing_layers":2,"layers":4,"heads":8,"feedforward":2048}` |
 | `unsloth_decision_config.json` | 298 | `layout: "clef"`, `max_len` (6144), `temperature` [1,1,1], `base_model` (local path), `load_in_4bit` false, `fine_tuned` true |
@@ -293,13 +293,13 @@ Measured (pilot): `model.save_pretrained(dir)` on a LoRA model writes the adapte
 
 Head and config file names are `unsloth@2026.10.4:unsloth/models/clef.py:36`. Writing is in `decision.py:838-851`.
 
-**Merged 16-bit model.** `save_pretrained_merged(dir, tokenizer, save_method="merged_16bit")` merges the LoRA into the
+Merged 16-bit model. `save_pretrained_merged(dir, tokenizer, save_method="merged_16bit")` merges the LoRA into the
 backbone and writes it as a Hugging Face folder (`config.json`, `model*.safetensors` and an index), the processor files, the head
 files, the decision config, and, for a `Qwen3_5ForConditionalGeneration` backbone, Cloudflare's `joint_schema_model.py` and
 `LICENSE` so that Cloudflare's own loader works on the folder
 (`unsloth@2026.10.4:unsloth/models/decision.py:854-903`, `:1319-1331`; Cloudflare's loader is `joint_schema_model.py:494-520`,
 which reads `joint_head_config.json` and `joint_head.safetensors`). `save_pretrained` on a full fine-tune does the same. A merged folder
-was **not** produced in the pilot and nothing here was run on one (not verified). How Unsloth rounds the merge is not
+was not produced in the pilot and nothing here was run on one (not verified). How Unsloth rounds the merge is not
 verified here; Kev's rule (merge the delta in fp32, round once) is the runner's own for float profiles.
 
 ### 3.7 Never loaded
@@ -368,7 +368,7 @@ the Kev call names `swish` (`kev@5e42a7a:kev/fused_qwen35.py:84`). The gate is a
 per-head RMSNorm of `q` and `k` with weight `1 + w`; RoPE on `q` and `k`; K (post-norm, post-RoPE) and V appended to
 the cache; causal grouped-query attention; output multiplied by `sigmoid(gate)`; `o_proj`.
 
-**Snapshot.** What a state leaves for the rows that continue it: per DeltaNet layer the recurrent state
+Snapshot. What a state leaves for the rows that continue it: per DeltaNet layer the recurrent state
 `S [Hv, dk, dv]` and the conv tail `[K-1, conv_dim]`; per attention layer K and V for every state token. Derived
 from the table: K/V at fp16 is 12,288 bytes per state token on 0.8B / 2B and 32,768 on 4B / 9B; the recurrent state
 of all layers at fp32 is 18 MiB on 0.8B / 2B and 48 MiB on 4B / 9B. Two properties keep snapshots simple:
@@ -377,8 +377,8 @@ of all layers at fp32 is 18 MiB on 0.8B / 2B and 48 MiB on 4B / 9B. Two properti
   branches never continue from each other, so snapshots can be immutable.
 - A zero input leaves the DeltaNet state unchanged, so left-padding is exact (`kev@5e42a7a:kev/shared_prefix.py:14-15`).
 
-**Request-level semantics that survive.** A row that continues a snapshot reads it and never advances it, so snapshots are
-immutable. What changed is who continues a snapshot: no longer one branch per question, but the tail of a request (section 7).
+Request-level semantics that survive. A row that continues a snapshot reads it and never advances it, so snapshots are
+immutable. What changed is who continues a snapshot: the tail of a request (section 7), where it used to be one branch per question.
 
 ## 4. Why the reference runtime is not enough
 
@@ -405,8 +405,8 @@ and schema together.
 
 ## 5. Substrate decision
 
-**The argument.** The defining operation is request tails from many requests continuing immutable snapshots, with the final hidden
-states of every position returned for the head (**revised 2026-10-13**; it was "ragged branches ... continuing one
+The argument. The defining operation is request tails from many requests continuing immutable snapshots, with the final hidden
+states of every position returned for the head (revised 2026-10-13; it was "ragged branches ... continuing one
 immutable snapshot"). llama.cpp is built around sequences that each own their memory and advance together. It would
 serve only the trunk: the Clef head is not part of it and would run outside. As reported upstream
 (unverified by this project; R0 pins a commit and checks each item):
@@ -419,7 +419,7 @@ serve only the trunk: the Clef head is not part of it and would run outside. As 
 The last two items are limits on exactly the operation we need. Lifting them inside llama.cpp means owning a fork of
 its batch and memory layers.
 
-**Settling experiment (R0).** 0.8B, a pinned llama.cpp build, a 1,000-token state, the laptop CPU and the RTX 3060.
+Settling experiment (R0): 0.8B, a pinned llama.cpp build, a 1,000-token state, the laptop CPU and the RTX 3060.
 
 | | Measurement | Flip threshold |
 |---|---|---|
@@ -430,8 +430,8 @@ its batch and memory layers.
 | (e) | Tokens/s for 8 states x 2 tails in one batch, divided by flat prefill | >= 0.7 on both machines |
 
 The weak-machine tiers flip onto a pinned llama.cpp fork only if (a), (b), (d) and (e) all hold. Otherwise the
-decision in section 1 stands. **Reverse check:** if our CPU path runs below 0.8x llama.cpp's flat prefill on the same
-machine, we replace the GEMM provider, not the engine.
+decision in section 1 stands. Reverse check: if our CPU path runs below 0.8x llama.cpp's flat prefill on the same
+machine, we replace the GEMM provider and keep the engine.
 
 | Source | Components |
 |---|---|
@@ -447,7 +447,7 @@ Strata's DeltaNet kernels must be re-parameterised: `Strata@fb58e0d:src/prefill/
 (`Strata@fb58e0d:src/prefill/kernels.cu:404-447`). We need geometry as arguments, a const parent state, a separate
 output state and a row dimension. (Unaffected by the 2026-10-13 decision.)
 
-**What Strata is not.** It has no CPU path for the trunk. Its attention kernel is sparse top-k, not dense causal
+What Strata is not. It has no CPU path for the trunk. Its attention kernel is sparse top-k, not dense causal
 attention. Its batch slots carry one token per row (`Strata@fb58e0d:docs/BATCHING.md:1-5`), with no shared-prefix
 batching. It has no backend abstraction layer. About 10% of it is relevant to a dense prefill engine (unverified).
 
@@ -463,15 +463,15 @@ HTTP | C ABI -> Encoder -> ResultCache -> Coalescer -> Scheduler <- Planner
 
 Three ideas carry the design (revised 2026-10-13):
 
-1. **Row DAG, layer-interleaved, now two levels deep.** A request becomes at most two rows: a **prefix row** (system
-   prefix plus a state prefix, shared by requests that start with the same tokens) and a **tail row** (the rest of the
+1. Row DAG, layer-interleaved, now two levels deep. A request becomes at most two rows: a prefix row (system
+   prefix plus a state prefix, shared by requests that start with the same tokens) and a tail row (the rest of the
    state, the schema, the suffix). The tail's parent is a cached snapshot or the prefix row in the same pass. Per layer,
    every GEMM runs once over the flat token list, so a cache miss reads the weights once. Only the delta-rule recurrence
    is sequential along the parent chain, and two waves per layer suffice: prefix rows, then tail rows. Convolution and
    attention need no waves. K/V is never replicated. There are no per-question branch rows (section 7).
-2. **Ragged rows packed with no per-row padding.** Tokens of all rows sit back to back in one list; a row is an
+2. Ragged rows packed with no per-row padding. Tokens of all rows sit back to back in one list; a row is an
    offset and a length. Only the total `T` is bucketed, so captured GPU graphs are keyed by one number.
-3. **Decomposition depends on the request, never on cache state.** Snapshots are published only at positions the
+3. Decomposition depends on the request, never on cache state. Snapshots are published only at positions the
    request declares (or at the end of the state). A token's result depends on the tokens before it in its own chain and
    on nothing else in the batch, and must not change with whether that context was computed in this pass or restored
    from a snapshot. So a cache hit and a cache miss compute identical bits (tier 3 in section 14).
@@ -492,7 +492,7 @@ struct Pack  { id, hash; schema token ids; SchemaSpans; };     // tokenised once
 struct Profile { id; dtype per tensor class; quant recipe; deltanet variant; kv_fmt; state_fmt; };
 ```
 
-**GEMM provider.** The contract that makes batching invisible: output row `t` never depends on other rows. Strata
+GEMM provider. The contract that makes batching invisible: output row `t` never depends on other rows. Strata
 already wraps this shape, fp32 out with optional dequantise-to-scratch (`Strata@fb58e0d:include/strata/prefill/gemm.hpp:28-48`).
 
 ```
@@ -502,7 +502,7 @@ gemm_dq (X f16, Wq s8|GGUF blocks -> f16 scratch, Y f32)           // compressed
 caps()  -> dtypes, ISA, version, integer_exact
 ```
 
-**Sequence kernel.**
+Sequence kernel:
 `deltanet_scan(rows, mixed, a, b, z, const state_in[parent], const tail_in[parent], y, opt state_out[row], variant)`
 runs convolution, recurrence and gated norm for the rows of one wave, parallel over (row, value head, column), and
 writes `state_out` only at the declared boundaries of rows that publish. The default variant is sequential: token by
@@ -511,27 +511,27 @@ The chunked variant (32-token chunks, WY form) is opt-in per device: on the recu
 5090 but 0.73x on an RTX 3060 (measured elsewhere, `Strata@fb58e0d:docs/DETAILS.md:1431-1436`). The variants give
 different bits, so the variant is part of the profile and of the kernel-environment hash.
 
-**Attention.** A row's context is a list of at most three segments: ancestor pages from the trie, an in-pass prefix row,
+For attention, a row's context is a list of at most three segments: ancestor pages from the trie, an in-pass prefix row,
 and its own tokens. Scores against shared context are one unmasked GEMM per parent group; the row's own suffix is a causal
 tile; the two merge by online softmax. Long rows use a tiled kernel with memory linear in length: untiled, 16 x 32k^2 x 4
 bytes = 69 GB per layer on 4B at 32k tokens (derived by Kev, `kev@5e42a7a:kev/predictors.py:38-48`).
 
-- **Every layer, every token.** The head reads the final hidden state of every position (section 3.3), so no layer is
+- Every layer, every token. The head reads the final hidden state of every position (section 3.3), so no layer is
   pruned for any token. The old "last-layer pruning" (state rows computing only `k` and `v` in the last attention layer,
   branch rows computing attention and MLP only at readout positions) is superseded and gone.
-- **Head memory output.** The pass must hand over, for each request, `LayerNorm`-ready hidden states of all positions (or
+- Head memory output. The pass must hand over, for each request, `LayerNorm`-ready hidden states of all positions (or
   the head's memory projection of them). At 0.8B that is 2 KB per token at bf16 (derived), 3.3 MB for the 1,605-token
   reference alert of section 12.
-- **Loader and artefacts.** GGUF v3 container; geometry comes from `sepal.*` keys, never hard-wired or derived. The
+- Loader and artefacts. GGUF v3 container; geometry comes from `sepal.*` keys, never hard-wired or derived. The
   embedding table stays in host memory; a pass uploads only the rows it needs, and the head gathers the rows of option
-  tokens from it (section 3.7). Artefacts: `base-<size>-<profile>`; `adapter-<name>` (LoRA, **Clef head weights and its
-  config**, calibration table keyed by profile); optional `merged-...`. The release also ships a human-readable `sepal.json`
+  tokens from it (section 3.7). Artefacts: `base-<size>-<profile>`; `adapter-<name>` (LoRA, Clef head weights and its
+  config, calibration table keyed by profile); optional `merged-...`. The release also ships a human-readable `sepal.json`
   (prompt version, system line, readout, temperature and thresholds per profile; see [MODEL.md](MODEL.md)); the packaging
   tool writes the same metadata into the adapter artefact, which the runner reads. Until a packaging tool exists, the
   runner reads Unsloth's folder directly: `adapter_model.safetensors`, `joint_head.safetensors`, `joint_head_config.json`,
   `unsloth_decision_config.json` (section 3.6).
 
-**Readout.** One readout: the Clef head of section 3.4, run in fp32 after the trunk pass. Requests of one batch can be
+Readout. One readout: the Clef head of section 3.4, run in fp32 after the trunk pass. Requests of one batch can be
 padded to a common `[Q, O]` layout as Unsloth does (`unsloth@2026.10.4:unsloth/models/clef.py:281-340`, `:404-`); the padded
 logits are masked to `-1e4` past each question's options. The head is the only place where questions meet, and its
 output for a request depends on that request's own hidden states only. The old readouts and layouts (pointer head,
@@ -539,19 +539,19 @@ label-row slots; isolated branches, one sequence, pack-first) are in section 20.
 
 ## 7. Caches
 
-**What the new prompt allows.** The sequence is `[system prefix][state][schema][suffix]`. The causal backbone makes the hidden
+What the new prompt allows. The sequence is `[system prefix][state][schema][suffix]`. The causal backbone makes the hidden
 state of a token depend only on the tokens before it. Two consequences decide everything below.
 
-1. **What is cacheable: the system prefix plus a prefix of the state tokens.** The first 36 tokens (system line, `STATE:`;
+1. What is cacheable: the system prefix plus a prefix of the state tokens. The first 36 tokens (system line, `STATE:`;
    count computed by this project by tokenising the template string with the pilot's tokenizer, not through Unsloth's
    encoder) are identical for every request. The state is tokenised on its own (section 3.2), so its token ids depend on
    the state text alone and not on the schema. Position `p` of the first `36 + k` tokens therefore has the same K/V, the
    same DeltaNet state and the same final hidden state in every request whose rendered state begins with the same first `k`
-   tokens. A snapshot at position `36 + k` is exactly the state the oracle would have computed, **provided that the oracle
-   would have read at least `k` state tokens**. The oracle keeps `cut = min(len(state_ids), max_state_tokens,
+   tokens. A snapshot at position `36 + k` is exactly the state the oracle would have computed, provided that the oracle
+   would have read at least `k` state tokens. The oracle keeps `cut = min(len(state_ids), max_state_tokens,
    max_length - fixed_length)` state tokens, where `fixed_length` includes the schema, so `cut` depends on the schema's
    length when the state is long. A snapshot at `k > cut` must not be used; a snapshot at `k <= cut` may.
-2. **What is not cacheable: anything after the state's last token.** The schema block follows the state, so its K/V and
+2. What is not cacheable: anything after the state's last token. The schema block follows the state, so its K/V and
    states depend on the whole state, and the suffix and the head's inputs depend on all of it.
 
 So:
@@ -562,67 +562,67 @@ So:
 | In-flight coalescing | Same key | Everything | Removes duplicate storms |
 | State-prefix snapshot | `H(parent.key, token ids)` + `base_sha` + adapter + profile | The trunk pass over the system prefix and the first `k` state tokens, and the head's memory for them | **Valid only when the token prefix is identical.** Nodes at declared boundaries and at the end of the state |
 | Per-question branch snapshot | none | not valid | Question `j` attends to questions `1..j-1` in the backbone and the model was trained on the concatenation (item 3 below) |
-| Cross-request question-pack compute | none | not valid | The schema follows the state, so nothing computed for it can be shared across states. Only its **token ids and spans** are reusable (a registered pack, tokenised once) |
+| Cross-request question-pack compute | none | not valid | The schema follows the state, so nothing computed for it can be shared across states. Only its token ids and spans are reusable (a registered pack, tokenised once) |
 
-**Three details a builder must get right.**
+There are three details a builder must get right.
 
-1. **The head needs more than the trunk's state.** The head reads the final hidden state of **every** prefix token as
+1. The head needs more than the trunk's state. The head reads the final hidden state of every prefix token as
    memory (section 3.3). A snapshot must carry, for the tokens it covers, either the final-layer hidden states or the
    head's `memory_projection(LayerNorm(h))`. Storing the projection is enough for state tokens, because no state token
-   belongs to a question or option span and the global vector is the last token of the sequence: **1,024 bytes per token**
+   belongs to a question or option span and the global vector is the last token of the sequence: 1,024 bytes per token
    at width 512 and bf16 (0.8B / 2B / 4B), 2,048 at width 1,024 (9B) (derived). The per-layer key/value projections of that
    memory depend only on each token's own memory vector and may be cached too or recomputed (about 0.7% of trunk FLOPs at 0.8B, derived).
-2. **A snapshot is a position, and a recurrent state cannot be cut.** K/V can be used up to any `k`, but a DeltaNet state
+2. A snapshot is a position, and a recurrent state cannot be cut. K/V can be used up to any `k`, but a DeltaNet state
    exists only at the positions where it was saved. If `cut` falls before the last snapshot, use the nearest earlier one (or
    none) and recompute from there. The state's rendered text has to tokenise to the same ids as the cached prefix, so key the
    trie by token ids, never by text.
-3. **Per-question branches are not a valid shortcut.** Running each question as a separate branch after the state snapshot
+3. Per-question branches are not a valid shortcut. Running each question as a separate branch after the state snapshot
    would change the hidden states the head reads, and the model was trained on one concatenated sequence. Adding, removing
    or reordering a question changes every later question's tokens and, through the unmasked field self-attention, every
    field. This is what makes a result depend on the other questions (section 19, item 3). The old benefit of branching,
    K/V not replicated for 64 questions, is gone with it; a request is one row.
 
-**Why nodes only at declared boundaries.** K/V pages are shared between a node and its ancestors, but the DeltaNet state is a
+Why nodes only at declared boundaries. K/V pages are shared between a node and its ancestors, but the DeltaNet state is a
 full copy per node. Derived size of one node for a 600-token state (anchor: section 3.8):
 
-- **4B:** 600 x 32,768 bytes = 19.7 MB of K/V, plus 48 MiB (50.3 MB) of fp32 recurrent state, plus 2.4 MB of conv tails
+- 4B: 600 x 32,768 bytes = 19.7 MB of K/V, plus 48 MiB (50.3 MB) of fp32 recurrent state, plus 2.4 MB of conv tails
   (24 layers x 3 taps x 8,192 channels x 4 bytes), plus 0.6 MB of head memory (600 x 1,024 bytes): about 73 MB in all. That
   falls to 48 MB with fp16 state, and to 38 MB with int8 K/V as well.
-- **0.8B / 2B:** 7.4 MB of K/V, plus 18 MiB (18.9 MB) of state, plus 1.3 MB of conv tails (18 layers x 3 taps x 6,144
+- 0.8B / 2B: 7.4 MB of K/V, plus 18 MiB (18.9 MB) of state, plus 1.3 MB of conv tails (18 layers x 3 taps x 6,144
   channels x 4 bytes), plus 0.6 MB of head memory: about 28 MB.
 
 The state part dominates below about 1,500 tokens at every size. A node per token is not affordable, and an undeclared
 boundary would break idea 3 of section 6. Boundaries are chosen on token ids (for example at a newline that the trie has seen),
 and the declared-segment extension of section 10 only suggests them.
 
-**Tiers and eviction.** Tiers are device, host and disk. Roots marked `cache: pin` are never evicted; other nodes are
+Tiers and eviction. Tiers are device, host and disk. Roots marked `cache: pin` are never evicted; other nodes are
 least-recently-used by bytes and are demoted one tier at a time before being dropped. Strata uses the same retention rule
 for its checkpoint chain (`Strata@fb58e0d:include/strata/program/conv_cache.hpp:1-40`). Snapshots are refcounted, so eviction
 never frees pages under a running pass. They are keyed by adapter: a LoRA changes every layer, so one adapter's prefix is
 useless to another. Tail rows never publish.
 
-**Bit-exactness against the oracle.** Unsloth runs the whole sequence in one pass. A prefix-plus-tail split changes where the
+Bit-exactness against the oracle. Unsloth runs the whole sequence in one pass. A prefix-plus-tail split changes where the
 DeltaNet kernels start a chunk, so the runner will not match the oracle bit for bit, only within the tolerances of section 14.
 That is also true of a miss against a hit once the kernel decomposition differs; idea 3 of section 6 keeps those two equal.
 
 ## 8. Scheduler and memory planner
 
-- **Lanes.** Short and long (state over 4k tokens). A long state cannot delay short requests.
-- **Token-budget batches.** A batch is filled by tokens, not by request count, up to the planner's limit.
-- **Bandwidth floor.** A pass reads every weight once, so it costs at least (weight bytes / memory bandwidth). With
+- Lanes: short and long (state over 4k tokens). A long state cannot delay short requests.
+- Token-budget batches: a batch is filled by tokens, not by request count, up to the planner's limit.
+- Bandwidth floor: a pass reads every weight once, so it costs at least (weight bytes / memory bandwidth). With
   FLOPs per token about 2 x parameters, the break-even is about (peak FLOP/s / bandwidth in bytes/s) x (bytes per
   weight / 2) tokens, independent of model size. Derived: roughly 100 tokens on an RTX 3060, 200-400 on an H100,
   about 3 on a CPU; Kev states 200-400 for H100-class cards at bf16 (`kev@5e42a7a:kev/cuda_graphs.py:54-55`). So a
   CPU is always compute-bound and runs work as it arrives, and a GPU pass is not dispatched below the floor: the
   scheduler holds a sub-floor batch until more tokens arrive or the earliest deadline runs out of slack.
-- **Deadlines, fairness, backpressure.** Earliest deadline first (`deadline_ms`, `priority`) with per-tenant
+- Deadlines, fairness, backpressure: earliest deadline first (`deadline_ms`, `priority`) with per-tenant
   fairness, so one caller's storm cannot starve another. The queue is bounded; when it is full the server answers 429.
 
-**Planner.** From geometry, profile and device memory it computes resident weights, scratch per pass as a function of
+Planner: from geometry, profile and device memory, it computes resident weights, scratch per pass as a function of
 `T`, the snapshot budget per tier, the largest batch and the longest state the device admits. It refuses instead of
 overcommitting, following `Strata@fb58e0d:include/strata/plan/plan.hpp:1-12`. A load that does not fit fails at start
 and names the profile that would fit; a request that cannot fit is rejected at admission. This matters most on
-Windows, where an oversubscribed GPU allocation does not fail but pages to system memory (measured elsewhere,
+Windows, where an oversubscribed GPU allocation pages to system memory instead of failing (measured elsewhere,
 `Strata@fb58e0d:src/program/generate.cpp:4309`). Target (derived, R3): **superseded** (was 64 questions on a 4.8k state in weights + 1.5 GB, built on branch rows); the new R3 target is in section 16.
 
 A first version of the planner exists (`runner/include/sepal/planner.hpp`, `runner/src/plan/planner.cpp`, tool
@@ -655,7 +655,7 @@ updated its figures for the head are wrong by that amount; the trunk figures are
 
 ## 10. API
 
-**HTTP.** `POST /v1/systemone` accepts the TypeSafe body unchanged: `model`, `state` (a string or any JSON value), `questions`
+HTTP: `POST /v1/systemone` accepts the TypeSafe body unchanged: `model`, `state` (a string or any JSON value), `questions`
 (a dict of id to `{type, instructions, criteria}`), as Cloudflare's `systemone()` does
 (`unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_model.py:547-576`; `kev@5e42a7a:kev/api.py:102-160` for the older mapping).
 The response has `answers` per question (section 3.5) and `usage.input_tokens` (the length of the whole sequence, schema
@@ -663,7 +663,7 @@ included). Question order in the request is the order in the prompt. The extensi
 
 | Field | Meaning |
 |---|---|
-| `state_segments`: `[{text, cache: pin \| lru \| none, key}]` | Replaces `state`. The texts are concatenated with no separator, so the rendered state is the same text the model was trained on. **Not** a list in `state`: a list `state` is a JSON value and is rendered as compact JSON. Segment ends are hints for snapshot boundaries, which are placed on token ids |
+| `state_segments`: `[{text, cache: pin \| lru \| none, key}]` | Replaces `state`. The texts are concatenated with no separator, so the rendered state is the same text the model was trained on. Do not put a list in `state`: a list `state` is a JSON value and is rendered as compact JSON. Segment ends are hints for snapshot boundaries, which are placed on token ids |
 | `pack: "<id>"` | Uses a registered pack (pre-tokenised schema) in place of inline `questions`. Saves tokenisation only (section 7) |
 | `max_length` | Request-level cap on the whole sequence, up to the server limit (open question, section 19 item 4) |
 | `deadline_ms`, `priority` | Scheduling hints |
@@ -698,13 +698,13 @@ POST /v1/systemone
             "prefix_tokens_reused": 412, "result_cache": "miss", "truncated": false} }
 ```
 
-- **C ABI.** `sepal_open`, `sepal_pack_register`, `sepal_adapter_load`, `sepal_submit`, `sepal_decide_batch`, plus
+- C ABI: `sepal_open`, `sepal_pack_register`, `sepal_adapter_load`, `sepal_submit`, `sepal_decide_batch`, plus
   the close, poll and free calls fixed in R1. The server is a client of this ABI.
-- **Python.** A wheel: `eng = sepal.Engine("sepal-2b"); pack = eng.pack(questions); eng.decide(state, pack)`.
-- **Adapter selection and hot-swap.** LoRA is applied unmerged and selected per row, so rows of different adapters
+- Python. A wheel: `eng = sepal.Engine("sepal-2b"); pack = eng.pack(questions); eng.decide(state, pack)`.
+- Adapter selection and hot-swap: LoRA is applied unmerged and selected per row, so rows of different adapters
   share one batch: the base GEMM runs once and each adapter adds its low-rank term on its own rows. Loading does not
   stop the server. An unloaded adapter finishes its in-flight rows; its snapshots and results are then evicted.
-- **Auth and bind defaults.** Bind 127.0.0.1. A non-loopback bind refuses to start without an API key.
+- Auth and bind defaults: bind 127.0.0.1. A non-loopback bind refuses to start without an API key.
 
 ## 11. Precision profiles
 
@@ -719,7 +719,7 @@ POST /v1/systemone
 | K/V | fp16 | fp16; int8 opt-in | fp16 |
 | Clef head | fp32 (stored bf16, scalars fp32; upcasting is exact) | fp32 | fp32 |
 
-**Accumulation on `gpu-f16`.** Operands are fp16 everywhere in that column; what the tensor cores add the products into is a
+Accumulation on `gpu-f16`. Operands are fp16 everywhere in that column; what the tensor cores add the products into is a
 separate choice, and the GPU engine's default makes it fp16 for the four groups of matrix multiplies (MLP gate/up, MLP down,
 the input projections, the output projections), which runs the multiplies at twice the fp32-accumulate rate on a GeForce card.
 In natural batching that is cuBLAS `CUBLAS_COMPUTE_16F`; in strict batching (the mode whose cache hit equals its miss bit for
@@ -729,7 +729,7 @@ batch-invariant by construction. Measured against the fp32 transformers golden o
 of p = 0.5), strict max |dp| 2.0e-3 (p99 1.5e-3, 1 flip), against 1.9e-3 and 0 flips with fp32 accumulation; both inside the
 `gpu-f16` row of the gate table in section 14. The fp32 accumulation stays selectable (`multiply_path = Cublas`, no `fp16_accumulate`).
 
-**Weight size per profile.** Computed by this project's code: `trunk_weight_bytes` in `runner/src/plan/planner.cpp`,
+Weight size per profile. Computed by this project's code: `trunk_weight_bytes` in `runner/src/plan/planner.cpp`,
 from the geometry of section 3.8 and the table above, printed by `sepal-info`. Body weights only, in GB of 10^9 bytes;
 the embedding table is separate and stays in host memory on the GPU profiles. Per-channel quantisation scales are
 not counted (below 0.1% of an 8-bit matrix, per the planner's header).
@@ -746,7 +746,7 @@ tensors kept at 32. Nothing in the design shrinks a quantised 9B to 6.92 GB: tha
 all-8-bit arithmetic. The size can grow instead: if the per-tensor ablation of section 18 goes badly, the attention
 projections and the DeltaNet `in_proj_qkv / z`, which the table quantises "pending ablation", also stay at 16 bits.
 
-**What the planner says about the 9B on an 8 GB card** (computed by this project's code, same file; the card is
+What the planner says about the 9B on an 8 GB card (computed by this project's code, same file; the card is
 taken as 8 GiB = 8.59 GB, the embedding is on the host, and the working-buffer part is the planner's estimate, so
 these are plans, not runs):
 
@@ -762,7 +762,7 @@ usable depends on how much of the card the driver, the display and the CUDA cont
 project has measured: the 9B on an 8 GB card stays **unverified**, and the first real load in R4 settles it. On a
 12 GiB card the same default request is granted under `gpu-q8w` with room for 37 snapshots (same code).
 
-**Evidence** (all measured elsewhere, on larger siblings; none on our sizes):
+Evidence (all measured elsewhere, on larger siblings; none on our sizes):
 
 - No 4-bit profile. Reported on a larger sibling: KLD at the 99.9th percentile about 0.10 at Q8 and 0.41 at Q4;
   `ssm_out`, `attn_*`, the gates and beta / alpha are the sensitive tensors; Unsloth advises against 4-bit QLoRA on
@@ -772,13 +772,13 @@ project has measured: the 9B on an 8 GB card stays **unverified**, and the first
 - int8 activations on the same 27B cost +0.9% perplexity on gate / up only, +2.2% on the whole MLP and +3.7% on all
   linear layers (same table). Hence `cpu-q8` quantises MLP activations first and leaves the rest to an ablation.
 
-**Coupling to training.** Adapters are served unmerged on quantised profiles. Training the adapter against the exact
+Coupling to training: adapters are served unmerged on quantised profiles. Training the adapter against the exact
 dequantised base the runner computes is the intended mitigation for those profiles, adopted only if the go / no-go
 experiment in [MODEL.md](MODEL.md) passes. Until then quantised profiles serve the standard adapter with per-profile
 calibration and must pass the gates of section 14. On float profiles a merge follows Kev's rule: add the delta in
 fp32 and round once (`kev@5e42a7a:kev/checkpoint.py:93-96`).
 
-**Calibration.** One temperature is fitted per (adapter, profile, kernel set) and stored in the adapter's calibration
+Calibration: one temperature is fitted per (adapter, profile, kernel set) and stored in the adapter's calibration
 table; thresholds are refitted with it ([MODEL.md](MODEL.md)). Every answer carries the profile id. The temperature
 divides the logits before the per-question softmax (section 3.5). Unsloth's own per-type and per-option-count temperatures
 and the order trap of section 3.5 apply if the runner reads `unsloth_decision_config.json`.
@@ -789,28 +789,27 @@ puts such a load on a float32-activation path (`unsloth@2026.10.4:unsloth/models
 recurrent state and the small tensors in fp32 and was measured on the earlier GPU engine to stay within the gate on goldens of
 the old format (above), but it has not been run on the trained Sepal model; the Tier 4 gate on the new goldens decides.
 
-**Training precision.** The pilot trained and scored in bf16 (`reports/pilot-unsloth/REPORT.md:9`). Unsloth also offers a
+Training precision: the pilot trained and scored in bf16 (`reports/pilot-unsloth/REPORT.md:9`). Unsloth also offers a
 dynamic 4-bit base (`load_in_4bit`) whose dequantised weights differ from ours; an adapter trained on that base is served on
 the same base only (`unsloth@2026.10.4:unsloth/models/decision.py:594-703`, `config["load_in_4bit"]`). The coupling to
 training above is unchanged.
 
 ## 12. Throughput model
 
-Redone on 2026-10-13 for the one-prompt layout. Every figure in this section is **derived** unless marked otherwise. None
-is measured by this project.
+Redone on 2026-10-13 for the one-prompt layout. Every figure in this section is derived unless marked otherwise. None is measured by this project.
 
-- **FLOPs per token** are 2 x non-embedding parameters: 1.00 G at 0.8B, 2.75 G at 2B, 7.14 G at 4B and 13.84 G at 9B
+- FLOPs per token are 2 x non-embedding parameters: 1.00 G at 0.8B, 2.75 G at 2B, 7.14 G at 4B and 13.84 G at 9B
   (derived; anchor: the parameter counts read from the base model files, section 3.8). The head adds 0.7% (0.8B) to 0.24% (9B)
   of that per token (section 3.4); it is left out of the rates below.
-- **GEMM share** is taken as about 80% of pass time. Anchor, measured elsewhere: 79% of a 4k-token prefill on a 27B
+- GEMM share is taken as about 80% of pass time. Anchor, measured elsewhere: 79% of a 4k-token prefill on a 27B
   (`HyperQwen@3acb93f:docs/optimizations.md:125`).
-- **Token accounting.** The sequence is `fixed + state + questions`. The fixed part is the sum of the three template
+- Token accounting. The sequence is `fixed + state + questions`. The fixed part is the sum of the three template
   pieces, computed by this project by tokenising the template strings with the pilot tokenizer (not through Unsloth's
-  encoder): system prefix 36, `SCHEMA FIELDS` head 7, suffix 18 = **61 tokens**. A question block is 26 tokens of scaffold
+  encoder): system prefix 36, `SCHEMA FIELDS` head 7, suffix 18 = 61 tokens. A question block is 26 tokens of scaffold
   (`FIELD n`, `ID:`, `TYPE:`, `INSTRUCTION:`, `ALLOWED OPTIONS:`, `END FIELD`, with a one-token id), plus the id's own tokens,
   the instruction, and per option 13 tokens of scaffold (`OPTION k: `, the JSON keys and quotes, the newline) plus the
   option's own id and description. The JSON per option is why a question costs far more than in the old format.
-- **Reference alert (redefined).** A 600-token state, of which the first 400 tokens are shared with other alerts, and 8
+- Reference alert (redefined). A 600-token state, of which the first 400 tokens are shared with other alerts, and 8
   `choice` questions with 3 options each. Each question carries 50 tokens of own content (instruction, option ids and
   descriptions) and a 3-token id: both are assumptions carried from the old reference alert (unverified). One question
   block is then `26 + 3 + 3 x 13 + 50 = 118` tokens (derived).
@@ -841,12 +840,12 @@ the weight size; the weights it would run on are the 7.33 GB of `gpu-q8w` (secti
 | 24 GB GPU | 19-62 / 26-86 | 7.5-25 / 10-34 | 6.9-18 / 9.4-25 | 3.5-9.4 / 4.8-13 | derived; anchor: llama.cpp CUDA prefill on RTX 3090 and 4090, scaled by FLOPs per token |
 | 4 x 24 GB | 71-240 / 98-330 | 29-95 / 39-130 | 26-69 / 36-94 | 13-36 / 18-49 | derived; the 24 GB row times about 3.8 |
 
-**One measured anchor on the new model (pilot).** Unsloth's forward scored the fixed 900-record subset of the pilot in 111 s on
+One measured anchor on the new model (pilot). Unsloth's forward scored the fixed 900-record subset of the pilot in 111 s on
 an RTX 3060 under native Windows, with the reference causal convolution and eager RMSNorm (`reports/pilot-unsloth/REPORT.md:41-47`):
 about 8.1 records/s (derived from that figure). The records are the pilot's short records, not the reference alert, and
 whether the 111 s includes loading is not stated. R0 re-measures this as the baseline (section 17).
 
-**Anchors**, all measured elsewhere (third-party reports; sources in [REFERENCES.md](REFERENCES.md)). The llama.cpp
+Anchors, all measured elsewhere (third-party reports; sources in [REFERENCES.md](REFERENCES.md)). The llama.cpp
 figures were read by a research pass on 2026-10-08 and have not been re-read since; re-read each source before quoting.
 
 - LiteRT model page, dynamic int8: 0.8B prefill at 70.5 tokens/s on a Raspberry Pi 5 and 666 on an M4 Max CPU.
@@ -860,33 +859,33 @@ figures were read by a research pass on 2026-10-08 and have not been re-read sin
 
 What moves these figures:
 
-- **Weak-machine levers:** int8 GEMM; not computing at all (result cache, coalescing, prefix snapshots); the smallest
+- Weak-machine levers: int8 GEMM; not computing at all (result cache, coalescing, prefix snapshots); the smallest
   model that passes the size rule in [MODEL.md](MODEL.md). The pack-first lever of the old document is gone.
-- **Scale levers:** padding-free token-budget batches; prefix-affinity routing on the state's leading tokens; fp16 state for
+- Scale levers: padding-free token-budget batches; prefix-affinity routing on the state's leading tokens; fp16 state for
   snapshot density. For the routing, measured elsewhere on other serving stacks: 2.0x and 2.9x against round-robin (llm-d
   post "sticky until saturated"), and 82,665 -> 158,596 tokens/s as the cache hit rate rose from 20% to 75% (SGLang v0.4 post).
-- **Schema tokens are the new target.** With 59% of the reference alert in the question block, shorter instructions and
+- Schema tokens are the new target. With 59% of the reference alert in the question block, shorter instructions and
   fewer or shorter option descriptions cut cost directly. That is a training and data choice ([MODEL.md](MODEL.md)); the
   runner cannot change the prompt without changing the answers.
-- **Not budgeted: early exit.** Reported as least suited to state-space-family models such as this one (measured
+- Not budgeted: early exit. Reported as least suited to state-space-family models such as this one (measured
   elsewhere: arXiv 2603.23701); no stage builds it.
 
 ## 13. Scale-out
 
-- **Workers.** One process per GPU, or per NUMA node on CPU hosts. A worker owns its weights, queues and trie.
-- **Router.** Stateless; bounded-load consistent hashing on (adapter, first pinned segment key), so requests that
+- Workers. One process per GPU, or per NUMA node on CPU hosts. A worker owns its weights, queues and trie.
+- Router. Stateless; bounded-load consistent hashing on (adapter, first pinned segment key), so requests that
   share a prefix reach the worker that holds it. A key stays sticky until that worker's queued tokens pass a
   threshold, then spills to the next worker on the ring.
-- **Shared and not shared.** Snapshots and queues are not shared between workers. An optional shared result cache is
+- Shared and not shared. Snapshots and queues are not shared between workers. An optional shared result cache is
   keyed with the kernel-environment id, so workers with different kernels never exchange answers.
-- **Deployment.** Docker or systemd by default; Kubernetes only beyond one host.
-- **Failure handling.** A decision is a pure function of its request, so the router retries on another worker. A
+- Deployment. Docker or systemd by default; Kubernetes only beyond one host.
+- Failure handling. A decision is a pure function of its request, so the router retries on another worker. A
   lost worker loses only cache; pinned roots are rebuilt from the disk tier or recomputed. `/readyz` stays false
   until weights are loaded. Targets (derived, R6): 4 GPUs >= 3.6x one; prefix hit >= 70% on a trace; recovery < 2 s.
 
 ## 14. Verification and reproducibility
 
-**Oracles (revised 2026-10-13).** O1: the forward of the **trained model** in fp32 on CPU, in two forms: O1a, Cloudflare's own
+Oracles (revised 2026-10-13). O1: the forward of the trained model in fp32 on CPU, in two forms: O1a, Cloudflare's own
 `joint_schema_model.py` (`load_release_model`, `unsloth@2026.10.4:unsloth/_vendor/clef/joint_schema_model.py:494-520`, Apache-2.0)
 on a merged 16-bit folder produced by `save_pretrained_merged` (section 3.6); O1b, Unsloth's own forward and encoder
 (`FastDecisionModel.predict`, `unsloth@2026.10.4:unsloth/models/decision.py:1704-1726`; AGPL-3.0-only, read and run as a black box, never copied). O1a
@@ -894,9 +893,9 @@ is the licence-clean oracle; O1b is checked against it once, because Unsloth's h
 the same state dict. O2: our own scalar FP64 forward. O3: llama.cpp F32 (non-gating, trunk only). Kev's PyTorch path is no
 longer an oracle for this model.
 
-**State of O2.** It exists as `sepal_runner/refengine/`: a NumPy float64 forward pass driven by a geometry object, with
+State of O2. It exists as `sepal_runner/refengine/`: a NumPy float64 forward pass driven by a geometry object, with
 the snapshot contents of section 3.8, a row executor in which a row's result depends on its own chain only, and the two
-**old** readouts (pointer head, label rows). **It has no Clef head and no one-sequence encoder**: the trunk part is
+old readouts (pointer head, label rows). **It has no Clef head and no one-sequence encoder**: the trunk part is
 unaffected, the readout and the request layout must be added from section 3 (R1 work, section 16). Its tests run on random weights and small test geometries and check its own invariants (a row continued
 from a stored snapshot equals the same row computed in one go; branches do not see each other; left-padding with
 zero input is exact). It has not been compared with O1 or with any real checkpoint, so it is not yet an oracle for
@@ -935,30 +934,29 @@ Reference tolerances, measured elsewhere by Kev: fp32 paths agree below 1e-4 (`k
 (`kev@5e42a7a:README.md:409`); one swapped conv kernel moved a bf16 27B by 0.03-0.06 (cause at
 `kev@5e42a7a:runs/drift-v1/REPORT.md:14-22`, size at `kev@5e42a7a:runs/drift-v1/REPORT.md:91-92`).
 
-- **Golden sets.** v1 (R0): edge cases (one question with two options, 255 options, a schema that exactly fits and one token over,
+- Golden sets. v1 (R0): edge cases (one question with two options, 255 options, a schema that exactly fits and one token over,
   a state cut by 1 token and by many, each limit +/- 1, `noul` with custom criteria, `score` with 10 levels, option
   order permuted in the request, delimiter forgeries in the state, non-ASCII); 500 synthetic alert-shaped requests with shared
   prefixes; SOCDecide development rows converted by `sepal/train/unsloth_convert.py` (Kev's public development rows are no
-  longer used); long states. Each set stores fp32 CPU reference outputs from O1a with the kernel-environment block. **A
-  tokeniser golden** is part of v1: the token ids and spans of Unsloth's `encode_record` for every request, which the runner's
+  longer used); long states. Each set stores fp32 CPU reference outputs from O1a with the kernel-environment block. A tokeniser golden is part of v1: the token ids and spans of Unsloth's `encode_record` for every request, which the runner's
   encoder must reproduce exactly (section 17).
-- **Determinism rules.** Fixed reduction trees per row. Threads partition outputs only, so no thread count changes
+- Determinism rules. Fixed reduction trees per row. Threads partition outputs only, so no thread count changes
   the order of a sum. No TF32 and no fast-math: Kev measured TF32 dot products in a DeltaNet kernel moving an fp32
   read by about 0.003 in p (measured elsewhere, `kev@5e42a7a:AGENTS.md:431-432`).
-- **Kernel-environment block.** Runner sha, compiler, provider and version, ISA, GPU, driver, OS mode, profile and
+- Kernel-environment block. Runner sha, compiler, provider and version, ISA, GPU, driver, OS mode, profile and
   weight shas, hashed onto every answer and every benchmark row. Results compare bit for bit only on equal hashes.
-- **Accepting a new backend.** A provider is accepted when it declares `caps()`, passes a batch-invariance test (row
+- Accepting a new backend. A provider is accepted when it declares `caps()`, passes a batch-invariance test (row
   `t` gives the same bits in any batch) and passes tiers 1-4.
-- **Accepting a hardware report.** It needs its kernel-environment block, tier 4 results from the same build and the
+- Accepting a hardware report. It needs its kernel-environment block, tier 4 results from the same build and the
   benchmark's 200-item parity subset at max |dp| <= 0.02 ([BENCHMARK.md](BENCHMARK.md)). Throughput alone is not recorded.
 
 ## 15. Language, build, packaging
 
-- **Language.** C++20. The kernels and every lifted component are C++.
-- **Build.** CMake presets; hash-pinned dependencies; CUDA 12.9 baseline (unverified); static CPU binary, ISA dispatch.
-- **Packages.** Wheels `sepal-runner` and `sepal-runner-cu12`; images `sepal:cpu` and `sepal:cuda12`.
-- **Platforms.** Windows native and Linux are first-class; WSL2 for development.
-- **Licences.** oneDNN and KleidiAI Apache-2.0; ggml and Strata MIT; Kev Apache-2.0; Clef Apache-2.0 (the head and encoder are implemented from it); **Unsloth's decision modules AGPL-3.0-only: read, never copied (section 19, item 1)**; the CUDA runtime with cuBLAS
+- Language. C++20. The kernels and every lifted component are C++.
+- Build. CMake presets; hash-pinned dependencies; CUDA 12.9 baseline (unverified); static CPU binary, ISA dispatch.
+- Packages. Wheels `sepal-runner` and `sepal-runner-cu12`; images `sepal:cpu` and `sepal:cuda12`.
+- Platforms. Windows native and Linux are first-class; WSL2 for development.
+- Licences. oneDNN and KleidiAI Apache-2.0; ggml and Strata MIT; Kev Apache-2.0; Clef Apache-2.0 (the head and encoder are implemented from it); **Unsloth's decision modules AGPL-3.0-only: read, never copied (section 19, item 1)**; the CUDA runtime with cuBLAS
   under the NVIDIA EULA (dynamically linked, never static); hipBLAS unverified until R5. Vendored code gets a `NOTICE` entry.
 
 ```
@@ -997,15 +995,15 @@ derived targets.
 The old R3 target "64 questions on a 4.8k state <= weights + 1.5 GB" is dropped: with questions in one sequence the working
 memory grows with the total sequence, which the planner bounds by `max_length`.
 
-**Status on 2026-10-13.** No stage has met its exit criterion and the estimates are unchanged; the runner is paused.
+Status on 2026-10-13. No stage has met its exit criterion and the estimates are unchanged; the runner is paused.
 
-- **R0: not started.** No baseline, golden set, settling experiment or substrate memo exists.
-- **R1: started, on the old contract.** Written and unit-tested: the build, the geometry presets with validation and derived
+- R0: not started. No baseline, golden set, settling experiment or substrate memo exists.
+- R1: started, on the old contract. Written and unit-tested: the build, the geometry presets with validation and derived
   sizes, the element types, the reference provider for `gemm_f`, RMSNorm, SiLU, the SwiGLU MLP, softmax, the causal convolution
   with a carried tail, and the planner. Not written: the GGUF loader, the encoder, the DeltaNet recurrence, attention, the fp32
   executor, the oneDNN provider, the C ABI, the Python wheel, and now the Clef head. All of these except the head are
   independent of the decision. The planner's pointer-head sizing is superseded (section 8).
-- **Outside the stage list.** The FP64 reference of R1's scope was written in Python (`sepal_runner/refengine/`) with the old readouts, and the
+- Outside the stage list. The FP64 reference of R1's scope was written in Python (`sepal_runner/refengine/`) with the old readouts, and the
   token layouts of the old design as `sepal/model/layouts.py` (removed 2026-10-14; it is in git history); neither is the new contract. The C++ encoder must instead
   reproduce `encode_record` token for token (section 17).
 
@@ -1013,22 +1011,22 @@ memory grows with the total sequence, which the planner bounds by `max_length`.
 
 For a future builder; nothing here has been started.
 
-1. **Secure an artefact.** `runs/pilot-unsloth/U1/final` is git-ignored and exists on one machine. Copy it to a stable place,
+1. Secure an artefact. `runs/pilot-unsloth/U1/final` is git-ignored and exists on one machine. Copy it to a stable place,
    record the sha256 of each file (section 3.6), and note the base snapshot hash `dc7cdfe2` from `unsloth_decision_config.json`.
    Rewrite the local path in `adapter_config.json` before sharing.
-2. **Build the oracle O1a.** In a Transformers process, produce a merged 16-bit folder (`save_pretrained_merged`) from the adapter,
+2. Build the oracle O1a. In a Transformers process, produce a merged 16-bit folder (`save_pretrained_merged`) from the adapter,
    or merge by hand with Kev's fp32 rule, and run Cloudflare's `joint_schema_model.py` on it. Check it against Unsloth's own
    `predict` on a handful of requests (they should agree to rounding).
-3. **Build golden set v1 and the tokeniser golden** (section 14): requests, `encode_record` ids and spans, and fp32 outputs, with
+3. Build golden set v1 and the tokeniser golden (section 14): requests, `encode_record` ids and spans, and fp32 outputs, with
    the environment block.
-4. **Measure the baseline.** Unsloth's forward on the RTX 3060 (pilot: 111 s for 900 records, section 12): records/s,
+4. Measure the baseline. Unsloth's forward on the RTX 3060 (pilot: 111 s for 900 records, section 12): records/s,
    tokens/s and peak memory on the reference alert and on the real record-length mix.
-5. **Run the settling experiment** of section 5, as redefined, against a pinned llama.cpp build on the laptop CPU and the 3060.
-6. **Write the runner's encoder** and compare its ids to the tokeniser golden on at least 10,000 real requests before any other
+5. Run the settling experiment of section 5, as redefined, against a pinned llama.cpp build on the laptop CPU and the 3060.
+6. Write the runner's encoder and compare its ids to the tokeniser golden on at least 10,000 real requests before any other
    code depends on it. The piecewise tokenisation (section 3.2) is the main trap.
-7. **Confirm the geometry** of section 3.8 by loading the four base model files; write the `sepal.*` GGUF key specification,
+7. Confirm the geometry of section 3.8 by loading the four base model files; write the `sepal.*` GGUF key specification,
    including the head tensors and their config.
-8. **Write the substrate memo**: the decision, the measured numbers, and revised throughput targets that replace the derived
+8. Write the substrate memo: the decision, the measured numbers, and revised throughput targets that replace the derived
    figures of section 12. Settle or record the open questions of section 19.
 
 ## 18. Risks and the experiments that resolve them
@@ -1054,10 +1052,10 @@ For a future builder; nothing here has been started.
 
 Each is open; none is decided by this document.
 
-1. **Licence of the code the runner may use (release question, left for later by the owner).** Facts, read on 2026-10-13:
+1. Licence of the code the runner may use (release question, left for later by the owner). Facts, read on 2026-10-13:
    - Cloudflare's `joint_schema_model.py` (the encoder, the head, `systemone`) is Apache-2.0: the Hub repositories
      `Cloudflare/clef` and `Cloudflare/clef-flash` say Apache-2.0 and carry a `LICENSE` file (REFERENCES.md section 2.6; the Clef page
-     was re-read on 2026-10-13); Unsloth vendors it **byte for byte** with that `LICENSE` and a manifest naming the upstream
+     was re-read on 2026-10-13); Unsloth vendors it byte for byte with that `LICENSE` and a manifest naming the upstream
      revision `6a3ac5fc030a3f33f7fa860a1271886b64a6606d` and the sha256 of both files
      (`unsloth@2026.10.4:unsloth/_vendor/clef/clef_manifest.json`, `README.md`, `LICENSE`). The vendored `.py` itself has no
      SPDX header; its licence is the `LICENSE` beside it.
@@ -1073,34 +1071,34 @@ Each is open; none is decided by this document.
      forward in `clef.py` and the temperature and calibration code). Implement the head and encoder from Cloudflare's
      Apache-2.0 source or from section 3. Using Unsloth to train and as an oracle process does not copy its code into the
      runner; the legal reading for the trained weights and for any hosted use is not decided (needs a lawyer; deferred until before release).
-2. **Option-order sensitivity.** `choice` options are sorted by key in the prompt, so the order in the request never reaches the
+2. Option-order sensitivity. `choice` options are sorted by key in the prompt, so the order in the request never reaches the
    model. Whether the model is sensitive to the *key names* and to their sorted position is untested; our own training
    shuffled option order and gated on the flip rate ([MODEL.md](MODEL.md)), which Unsloth's trainer does not do
    (`reports/pilot-unsloth/REPORT.md:53`).
-3. **Question isolation is lost.** Questions share one sequence; later questions see earlier ones in the backbone and fields
+3. Question isolation is lost. Questions share one sequence; later questions see earlier ones in the backbone and fields
    attend to each other in the head (section 3.4, step 5). Adding, removing or reordering a question can change other answers. The
    old design's isolated branches would have measured and bounded this; arm A3's gate was meant to. Nothing measures it now.
    Training ran with `permute_fields` off by default (`unsloth@2026.10.4:unsloth/models/decision.py:233`, `:1093-1094`), so the
    pilot always saw the dataset's field order (not verified that the pilot's call left the default): order sensitivity is plausible.
    The API fixes the order as given by the caller.
-4. **Truncation policy against the 65,536-token API limit.** Unsloth cuts the end of the state silently to fit `max_length`
+4. Truncation policy against the 65,536-token API limit. Unsloth cuts the end of the state silently to fit `max_length`
    and trains at 4,096-6,144, serves at 16,384. The Kev-derived API admitted 65,536 state tokens. Which limit the runner
    admits, whether it rejects or cuts, and whether cuts are reported (`truncated`, section 10) is open. The model has
    never seen a state past its training length; its quality there is unverified.
-5. **Head training path.** Cloudflare trained the head together with the adapter (unverified, REFERENCES.md); the pilot trained it
+5. Head training path. Cloudflare trained the head together with the adapter (unverified, REFERENCES.md); the pilot trained it
    from scratch with the LoRA. The 2B / 4B / 9B head sizes in section 3.4 are the default rule, not a decision.
-6. **Merged versus unmerged serving.** The pilot saved an adapter, not a merged model. A merged folder has not been produced
+6. Merged versus unmerged serving. The pilot saved an adapter, not a merged model. A merged folder has not been produced
    and loaded with Cloudflare's loader (section 3.6). Merging bf16 weights costs a rounding that the unmerged path does not.
-7. **Temperature.** None is fitted yet. Unsloth fits per-type and per-option-count temperatures on a held-out set and clamps them
+7. Temperature. None is fitted yet. Unsloth fits per-type and per-option-count temperatures on a held-out set and clamps them
    to [0.5, 5.0]; ours is fitted per (adapter, profile, kernel set). The two must not be applied twice, and the type-order
    trap of section 3.5 applies.
-8. **Delimiter forgery.** Caller text is tokenised as it comes, so `<|im_end|>` or `<|im_start|>` in a state becomes the real
+8. Delimiter forgery. Caller text is tokenised as it comes, so `<|im_end|>` or `<|im_start|>` in a state becomes the real
    special token, in training as in serving. Neutralising it (as Kev's `user_tokens` did) changes tokens relative to training.
    Whether to neutralise in the runner and in the data together is a security decision for a SOC product.
-9. **fp16 and the DeltaNet** (section 11): whether `gpu-f16` is safe on the trained model.
-10. **Hidden-state cost across the boundary.** The head needs all positions; whether it runs inside the runner (planned) or
+9. fp16 and the DeltaNet (section 11): whether `gpu-f16` is safe on the trained model.
+10. Hidden-state cost across the boundary. The head needs all positions; whether it runs inside the runner (planned) or
     outside is a build decision that affects the llama.cpp fork option.
-11. **Where Unsloth's code is wrong or unstable.** It was read at a single version and a pilot used one machine; the
+11. Where Unsloth's code is wrong or unstable. It was read at a single version and a pilot used one machine; the
     format could change between releases. Pin the version and re-read `encode_record` on every upgrade (section 17, item 6).
 
 ## 20. Superseded design (before 2026-10-13)

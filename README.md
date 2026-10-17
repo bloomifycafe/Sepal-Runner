@@ -1,13 +1,13 @@
 # Sepal-Runner
 
-The fast inference runner for the [Sepal](https://github.com/bloomifycafe/Sepal) decision models: a C++20 engine (CPU and CUDA) behind a
+The fast inference runner for the [Sepal](https://github.com/bloomifycafe/Sepal) decision models. It has a C++20 engine (CPU and CUDA) behind a
 small C ABI, and a Python front end that tokenises requests, batches them into engine calls and serves the Decision API,
-`POST /v1/systemone`. It scores the trained model (Qwen3.5 with the LoRA merged in, and Clef's `JointSchemaHead` reading the final hidden
+`POST /v1/systemone`. The engine scores the trained model (Qwen3.5 with the LoRA merged in, and Clef's `JointSchemaHead` reading the final hidden
 state of every position) in one forward pass per request, however many yes/no or multiple-choice questions the request carries.
 
-This repository was split from Sepal on 2026-10-17 with the git history of the files that moved. Sepal trains and evaluates the model and
-holds the benchmark; this repository serves it. The design document is [docs/RUNNER.md](docs/RUNNER.md) (links in it to `reports/`,
-`MODEL.md` and the like point into the Sepal repository).
+This repository was split from Sepal on 2026-10-17, keeping the git history of the files that moved. Sepal trains and evaluates the model and
+holds the benchmark. This repository serves it. The design document is [docs/RUNNER.md](docs/RUNNER.md). Links in it to `reports/`,
+`MODEL.md` and similar paths point into the Sepal repository.
 
 Licence: Apache-2.0 ([LICENSE](LICENSE), [NOTICE](NOTICE)). Status: engine and front end are built and tested; nothing here trains a model.
 
@@ -77,7 +77,7 @@ A profile is the precision of the engine; it is also the identity of an answer, 
 | `gpu-f32-strict`, `gpu-f16-strict` | as above, batch-invariant | the hidden states of a request are bit-identical alone, among other requests and at any place of a batch; 8 to 22% slower |
 | `cpu-q8` (opt-in) | int8 weights x int8 activations | fails its gate: off |
 
-The **fast mode is the default**: `cpu-*`, `gpu-f32` and `gpu-f16` answers may differ in the last bits depending on which requests share an
+Fast mode is the default. `cpu-*`, `gpu-f32` and `gpu-f16` answers may differ in the last bits depending on which requests share an
 engine call, and the GPU DeltaNet layers may use the chunked kernels. Ask for a `-strict` profile when a request must give the same bits
 every time. Name the server after its profile (`--name sepal-gpu-f16`): the `model` field of every answer then says which mode produced
 it, and `GET /stats` and `/health` report the same name. (The answer JSON has no separate profile field; adding one is open, see
@@ -97,7 +97,7 @@ Python (`sepal_runner/shared/scoring.py`).
 ## Measured against the oracle
 
 The oracle is the fp32 forward of the trained model (Unsloth 2026.10.4, transformers 5.17, torch 2.8) on the golden set: 30 cases from 185 to 31,850
-tokens, 165 questions. All numbers below are **measured** (machine named); the full tables, shapes and caveats are in `runner/README.md` and
+tokens, 165 questions. Every number below was measured on the machine named. The full tables, shapes and caveats are in `runner/README.md` and
 `runner/cuda/README.md`, and `docs/RUNNER.md` explains the markers (measured / derived / read from source / unverified).
 
 | What | Result | Machine and date |

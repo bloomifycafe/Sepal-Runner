@@ -1,12 +1,12 @@
 # Reference engine: verification against the upstream model
 
-> **Moved from Sepal (2026-10-17).** This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
+> Moved from Sepal (2026-10-17). This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
 
 `sepal_runner/refengine/` was written from a study of another project's code, without the model's own source. Twelve
 details of its arithmetic were therefore listed as unverified. This document records how they were checked against
 the Qwen3.5 implementation in `transformers`, what was measured, and what is still not covered.
 
-**Result.** All twelve readings are what the upstream model computes. No arithmetic in the engine changed.
+Result: all twelve readings are what the upstream model computes. No arithmetic in the engine changed.
 `UNVERIFIED` is now empty.
 
 | Comparison (engine in NumPy float64 against upstream) | Largest absolute difference | Hidden-state magnitude |
@@ -21,10 +21,10 @@ the Qwen3.5 implementation in `transformers`, what was measured, and what is sti
   RTX 3060 12 GB.
 - Upstream source: `transformers/models/qwen3_5/modeling_qwen3_5.py`. Every line number below is in that file at
   version 5.19.0. The cache is `transformers/cache_utils.py`.
-- **Execution path.** `flash-linear-attention`, `causal-conv1d` and `kernels` are not installed, so upstream ran its
+- Execution path: `flash-linear-attention`, `causal-conv1d` and `kernels` are not installed, so upstream ran its
   own PyTorch functions, and logged that it did: `torch_chunk_gated_delta_rule` (L291), `torch_recurrent_gated_delta_rule`
   (L428), `causal_conv1d_fn` (L260), `causal_conv1d_update` (L240). The fast kernels were not run.
-- **Checkpoint.** `Qwen/Qwen3.5-0.8B-Base`, revision `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`, Apache-2.0, one
+- Checkpoint: `Qwen/Qwen3.5-0.8B-Base`, revision `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68`, Apache-2.0, one
   safetensors file of 1,746,942,600 bytes.
 
 Every number here comes from one of two commands, which print the full report as JSON:
@@ -127,7 +127,7 @@ Hidden states have root mean square 3.6 to 4.1 and largest magnitude 36.3 to 43.
 also agrees at every position in every row. The float16 row is the stored bfloat16 weights converted with `.half()`,
 which is itself lossy, then run in float16; it measures upstream's half precision, not the engine.
 
-**Timing.** The engine took 1.30 s, 2.17 s, 2.62 s and 3.69 s for 10, 36, 53 and 85 tokens, after 1.2 s to copy the
+Timing: the engine took 1.30 s, 2.17 s, 2.62 s and 3.69 s for 10, 36, 53 and 85 tokens, after 1.2 s to copy the
 weights to float64. Upstream took 0.18 to 0.43 s in float32 on CPU and about 1 s in float64. The whole tool, with the
 weights already in the cache, ran in 42.3 s. Timings are single runs from `time.perf_counter`.
 
@@ -146,16 +146,16 @@ Read from `config.json` and from the tensor shapes in the safetensors file; equa
 | tied LM head | `tie_word_embeddings` true at both config levels; no `lm_head` tensor in the file; the official loader's `lm_head.weight` is the embedding object |
 | rotary | theta 1e7, partial factor 0.25, `mrope_section` [11, 11, 10]; `rms_norm_eps` 1e-6 |
 
-- **Conv bias: none.** The only conv tensor is `conv1d.weight`, and the module is built with `bias=False` (L515).
+- Conv bias: none. The only conv tensor is `conv1d.weight`, and the module is built with `bias=False` (L515).
   The text model has no bias tensor of any kind.
-- **Norm weights are stored zero-centred**, except the gated norm. The code scales by `1 + w` (L844) and initialises
+- Norm weights are stored zero-centred, except the gated norm. The code scales by `1 + w` (L844) and initialises
   `w` to zero (L933-935). Stored means: `input_layernorm` 0.411 (range -0.605 to 1.469), `post_attention_layernorm`
   0.224, `q_norm` 0.506, `k_norm` 0.504, final norm 3.309; the gated norm, which is plain, 0.941 (range 0.348 to
   1.194). The statistics alone would not decide it. Running the engine with scale `w` instead of `1 + w` on the
   10-token sequence does: largest difference 34.8, cosine 0.028, top token 0/10.
-- **Stored dtype.** bfloat16, except `A_log` and the final `norm.weight`, which are float32. All are exact in float32
+- Stored dtype: bfloat16, except `A_log` and the final `norm.weight`, which are float32. All are exact in float32
   and float64, so both sides compute from identical values.
-- **Other tensors in the file.** 320 belong to the text model, under the prefix `model.language_model.`, and the
+- Other tensors in the file: 320 belong to the text model, under the prefix `model.language_model.`, and the
   engine uses all of them. The rest are a vision tower (`model.visual.*`) and a multi-token-prediction head (`mtp.*`,
   which upstream also ignores, L915).
 - The text model is loaded strictly from the stored tensors. As a cross-check, `Qwen3_5ForConditionalGeneration.from_pretrained`
@@ -180,10 +180,10 @@ The upstream cache holds, per DeltaNet layer, `conv_states[0]` [1, conv dim, K] 
 [1, value heads, key dim, value dim]; per attention layer, `keys` and `values` [1, kv heads, tokens, head dim], the
 keys after their norm and RoPE. Those are the only tensors (asserted by a test). Differences from the engine's snapshot:
 
-- **The conv state has K columns; the snapshot has K-1.** The oldest column is never read: zeroing it leaves the
+- The conv state has K columns, and the snapshot has K-1. The oldest column is never read: zeroing it leaves the
   continuation bit-identical on both cached paths (test). After fewer than K tokens it is left-padded with zeros,
   like the engine's tail. An exporter of upstream caches must drop the first column.
-- **No state is missing from the snapshot.** Upstream derives the next position from the cached key length
+- No state is missing from the snapshot. Upstream derives the next position from the cached key length
   (L1251-1252); the engine is given `start_position` and records `n_tokens`, which was equal in every case.
 - In an unmodified upstream model the cached recurrent state is float32 even when the weights are float64.
 
@@ -200,15 +200,15 @@ keys after their norm and RoPE. Those are the only tensors (asserted by a test).
 
 None of the twelve. Outside them, the following was not checked:
 
-- **The fast kernels.** `flash-linear-attention`, `causal-conv1d` and the hub kernels were not installed, so parity
+- The fast kernels: `flash-linear-attention`, `causal-conv1d` and the hub kernels were not installed, so parity
   is with upstream's PyTorch fallback, which upstream describes as the reference for them.
-- **Key-head sharing on a real checkpoint.** 0.8B has 16 key and 16 value heads, so sharing is the identity there.
+- Key-head sharing on a real checkpoint: 0.8B has 16 key and 16 value heads, so sharing is the identity there.
   It is confirmed on the tiny model (2 and 4) and in the source. The 4B and 9B geometries (16 and 32) rely on that.
-- **The 2B, 4B and 9B checkpoints** were not downloaded; their presets are unchecked against real configs.
-- **Longer sequences.** At most 150 tokens on the tiny model and 85 on the real one.
-- **Batches with padding.** Upstream zeroes padded positions before the DeltaNet mixer (L227-236, L547). The engine
+- The 2B, 4B and 9B checkpoints were not downloaded; their presets are unchecked against real configs.
+- Longer sequences: at most 150 tokens on the tiny model and 85 on the real one.
+- Batches with padding: upstream zeroes padded positions before the DeltaNet mixer (L227-236, L547). The engine
   runs one unpadded row at a time and has no counterpart.
-- **Non-text positions.** With images the three RoPE axes differ (L185-203); the engine has one axis.
-- **The cache's `record_past` mode** (`cache_utils.py` L1028-1061), which keeps more conv history for cropping.
-- **The pointer head and the readouts** are Sepal's own and have no upstream counterpart; the tool loads the head as
+- Non-text positions: with images the three RoPE axes differ (L185-203); the engine has one axis.
+- The cache's `record_past` mode (`cache_utils.py` L1028-1061), which keeps more conv history for cropping.
+- The pointer head and the readouts are Sepal's own and have no upstream counterpart; the tool loads the head as
   zeros.
