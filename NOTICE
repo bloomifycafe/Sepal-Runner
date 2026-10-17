@@ -1,0 +1,31 @@
+Sepal-Runner
+Copyright 2026 Bloomify
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It was split out of the Sepal repository (https://github.com/bloomifycafe/Sepal, Apache-2.0, commit f846e8d) with the git history of
+the files that moved. A few small modules of Sepal that the Python front end needs are copied into sepal_runner/shared/ (each names its
+origin in its first lines): the record conversion (sepal/train/unsloth_convert.py, socdecide/schema.py), the request handling
+(sepal/serve/decision_api.py), the temperature and softmax post-processing (sepal/train/unsloth_arm.py, sepal/eval/predictor.py) and
+the reading of the calibrated temperatures (sepal/eval/calibrate.py, sepal/eval/checkpoint.py).
+
+Third-party code
+----------------
+
+Clef (clef-flash, Cloudflare), licensed under the Apache License, Version 2.0: the JointSchemaHead and the prompt layout
+(joint_schema_model.py) that the engine implements, and the encoder that sepal_runner/encode.py reimplements on the tokenizers library.
+
+Portions of this software are adapted from Kev (https://github.com/jaredpalmer/kev, commit 5e42a7a), Copyright its authors, licensed
+under the Apache License, Version 2.0. Each adapted file names its origin in its first line. The adapted files are:
+
+  sepal_runner/refengine/attention.py
+  sepal_runner/refengine/deltanet.py
+  sepal_runner/refengine/executor.py
+  sepal_runner/refengine/readout.py
+  sepal_runner/shared/temperatures.py     (from sepal/eval/calibrate.py, which is adapted from Kev)
+
+Strata (MIT) and HyperQwen (Apache-2.0) were read as design references (see runner/README.md, Provenance, and runner/cuda/README.md);
+llama.cpp (MIT) is used as a benchmark baseline. No code of Unsloth (AGPL-3.0-only) is copied here: Unsloth is only ever run, as a black box, to produce the
+oracle that the golden vectors come from (sepal_runner/oracle*.py, tools/runner_*).
+
+The projects the design draws on, with their licences, are listed in Sepal's docs/REFERENCES.md (https://github.com/bloomifycafe/Sepal).

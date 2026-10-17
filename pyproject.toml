@@ -1,0 +1,28 @@
+[project]
+name = "sepal-runner"
+version = "0.1.0"
+description = "Fast inference runner for the Sepal decision models: a C++ engine (CPU and CUDA) with a Python front end serving POST /v1/systemone"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.26", "tokenizers>=0.22"]
+
+[project.optional-dependencies]
+# Reading golden-vector files (tests, tools/runner_golden_parity.py).
+golden = ["safetensors"]
+# The NumPy reference engine's tests that compare against PyTorch.
+verify = ["torch>=2.8", "safetensors"]
+dev = ["pytest>=8", "safetensors"]
+
+[project.scripts]
+sepal-runner = "sepal_runner.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sepal_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
