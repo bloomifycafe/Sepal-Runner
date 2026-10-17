@@ -1,7 +1,7 @@
 """Shared fixtures: the tiny geometry and one set of seeded random weights for it."""
 import pytest
 
-from sepal.refengine import PRESETS, ModelConfig, Weights, random_weights
+from sepal_runner.refengine import PRESETS, ModelConfig, Weights, random_weights
 
 
 @pytest.fixture(scope="session")

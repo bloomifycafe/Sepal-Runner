@@ -31,9 +31,9 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from sepal.refengine import PRESETS, Row, label_row_probabilities, run_rows  # noqa: E402
-from sepal.refengine import upstream  # noqa: E402
-from sepal.refengine.weights import _random_tensor, body_shapes, embedding_shapes  # noqa: E402
+from sepal_runner.refengine import PRESETS, Row, label_row_probabilities, run_rows  # noqa: E402
+from sepal_runner.refengine import upstream  # noqa: E402
+from sepal_runner.refengine.weights import _random_tensor, body_shapes, embedding_shapes  # noqa: E402
 
 OUT = REPO / "runner" / "tests" / "fixtures" / "tiny_checkpoint"
 PREFIX = "model.language_model."

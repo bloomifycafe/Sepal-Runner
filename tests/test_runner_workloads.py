@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 
-from sepal.runner import workloads as w
+from sepal_runner import workloads as w
 
 
 def _wazuh_rows(n=40):

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from refengine_support import EXACT, all_offsets, assert_snapshots_close, hidden_of, snapshot_arrays, snapshot_of, token_ids
-from sepal.refengine import Row, empty_snapshot, random_weights, run_rows
+from sepal_runner.refengine import Row, empty_snapshot, random_weights, run_rows
 
 LENGTH = 10
 

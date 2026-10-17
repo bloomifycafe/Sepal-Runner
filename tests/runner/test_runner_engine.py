@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from sepal.runner import engine as eng
-from sepal.runner.encode import Encoder
-from sepal.runner.mock import FakeLib, MockEngine
-from sepal.train.unsloth_arm import UnslothScorer
+from sepal_runner import engine as eng
+from sepal_runner.encode import Encoder
+from sepal_runner.mock import FakeLib, MockEngine
+from sepal_runner.shared.scoring import UnslothScorer
 
 QUESTIONS = {
     "c": {"type": "choice", "instructions": "Which?", "criteria": {"b": "second", "a": "first"}},

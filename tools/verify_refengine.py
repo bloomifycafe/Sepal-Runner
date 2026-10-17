@@ -25,8 +25,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sepal.refengine import PRESETS, Row, run_rows  # noqa: E402
-from sepal.refengine import attention, executor, upstream  # noqa: E402
+from sepal_runner.refengine import PRESETS, Row, run_rows  # noqa: E402
+from sepal_runner.refengine import attention, executor, upstream  # noqa: E402
 
 REPO = "Qwen/Qwen3.5-0.8B-Base"
 TEXTS = (

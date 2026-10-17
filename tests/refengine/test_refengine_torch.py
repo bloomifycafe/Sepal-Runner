@@ -2,9 +2,9 @@
 import numpy as np
 import pytest
 
-from sepal.refengine.attention import grouped_query_attention
-from sepal.refengine.deltanet import causal_conv
-from sepal.refengine.primitives import rms_norm, sigmoid, silu, softplus, swiglu_mlp
+from sepal_runner.refengine.attention import grouped_query_attention
+from sepal_runner.refengine.deltanet import causal_conv
+from sepal_runner.refengine.primitives import rms_norm, sigmoid, silu, softplus, swiglu_mlp
 
 torch = pytest.importorskip("torch")
 F = torch.nn.functional

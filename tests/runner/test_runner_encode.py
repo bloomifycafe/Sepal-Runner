@@ -1,4 +1,4 @@
-"""`sepal.runner.encode` against (a) a plain sequential reading of docs/RUNNER.md 3.2 on a tiny tokenizer, and (b) ids and spans that
+"""`sepal_runner.encode` against (a) a plain sequential reading of docs/RUNNER.md 3.2 on a tiny tokenizer, and (b) ids and spans that
 Unsloth's own encoder produced (tests/fixtures/runner_encode_expected.json, made by tools/runner_encode_compare.py fixtures) on the real
 Qwen3.5 tokenizer, when that tokenizer.json is available (SEPAL_TOKENIZER or runs/box-results/full08b/U2-s0/final/tokenizer.json)."""
 from __future__ import annotations
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from sepal.runner.encode import SYSTEM_PROMPT, Encoder, encode_record, question_options, render
+from sepal_runner.encode import SYSTEM_PROMPT, Encoder, encode_record, question_options, render
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "tests" / "fixtures" / "runner_encode_expected.json"
@@ -145,7 +145,7 @@ def test_max_state_tokens(tiny_tokenizer):
 
 
 def real_tokenizer_path():
-    for candidate in (os.environ.get("SEPAL_TOKENIZER"), ROOT / "runs" / "box-results" / "full08b" / "U2-s0" / "final" / "tokenizer.json"):
+    for candidate in (os.environ.get("SEPAL_TOKENIZER"), (Path(os.environ["SEPAL_TOKENIZER_DIR"]) / "tokenizer.json") if os.environ.get("SEPAL_TOKENIZER_DIR") else None, ROOT / "runs" / "box-results" / "full08b" / "U2-s0" / "final" / "tokenizer.json"):
         if candidate and Path(candidate).is_file():
             return Path(candidate)
     return None

@@ -1,5 +1,5 @@
 // The two readouts: from final hidden states at the readout positions to a probability per option.
-// A port of sepal/refengine/readout.py, function for function (that file is adapted from
+// A port of sepal_runner/refengine/readout.py, function for function (that file is adapted from
 // jaredpalmer/kev@5e42a7a kev/model.py, Apache-2.0).
 //
 // Every question is read out on its own, from its own hidden states: nothing here mixes questions, so a

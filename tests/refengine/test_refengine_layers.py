@@ -3,10 +3,10 @@ import numpy as np
 import pytest
 
 from refengine_support import EXACT
-from sepal.refengine.attention import apply_rope, attention_mixer, grouped_query_attention, rope_angles, unpack_query_and_gate
-from sepal.refengine.deltanet import causal_conv, delta_rule_scan, deltanet_mixer, l2_normalise, share_key_heads
-from sepal.refengine.primitives import project, rms_norm, sigmoid, silu, softmax, softplus, swiglu_mlp
-from sepal.refengine.snapshot import empty_layer_state
+from sepal_runner.refengine.attention import apply_rope, attention_mixer, grouped_query_attention, rope_angles, unpack_query_and_gate
+from sepal_runner.refengine.deltanet import causal_conv, delta_rule_scan, deltanet_mixer, l2_normalise, share_key_heads
+from sepal_runner.refengine.primitives import project, rms_norm, sigmoid, silu, softmax, softplus, swiglu_mlp
+from sepal_runner.refengine.snapshot import empty_layer_state
 
 RNG_SEED = 7
 

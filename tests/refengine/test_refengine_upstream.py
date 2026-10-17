@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 from refengine_support import all_offsets, snapshot_arrays, token_ids
 
-from sepal.refengine import PRESETS, UNVERIFIED, Row, attention, deltanet, run_rows
-from sepal.refengine.primitives import sigmoid, softmax
+from sepal_runner.refengine import PRESETS, UNVERIFIED, Row, attention, deltanet, run_rows
+from sepal_runner.refengine.primitives import sigmoid, softmax
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
 pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
-from sepal.refengine import upstream  # noqa: E402
+from sepal_runner.refengine import upstream  # noqa: E402
 
 PARITY = 1e-9            # float64 against float64: the two computations differ only in the order of operations
 FLOAT32_NOISE = 5e-3     # the unmodified upstream model computes its norms, RoPE and delta rule in float32

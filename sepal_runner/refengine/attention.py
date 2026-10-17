@@ -5,7 +5,7 @@ The projection, the packing of the output gate with the query and the order of o
 ``attention_forward``. The rotary embedding and the attention product are library calls there, so they are written
 out here as their own functions. Each was since checked against the upstream transformers model and found to be
 what it computes (docs/REFENGINE-VERIFICATION.md; the upstream lines are cited next to
-``sepal.refengine.UNVERIFIED``).
+``sepal_runner.refengine.UNVERIFIED``).
 """
 from __future__ import annotations
 

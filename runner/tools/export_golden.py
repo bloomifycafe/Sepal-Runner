@@ -1,4 +1,4 @@
-"""Export golden vectors for the C++ runner from the NumPy float64 reference engine (``sepal.refengine``).
+"""Export golden vectors for the C++ runner from the NumPy float64 reference engine (``sepal_runner.refengine``).
 
 Run from the repository root::
 
@@ -22,7 +22,7 @@ File format (``SEPALGV1``; every integer and float is little-endian)::
         f64 ...   the values in row-major (C) order, prod(shape) of them
 
 The header holds what is not a float array: the geometry (``config``, with the field names of
-``sepal.refengine.ModelConfig``), the seed, the oracle's ``UNVERIFIED`` list as it stood when the file was written,
+``sepal_runner.refengine.ModelConfig``), the seed, the oracle's ``UNVERIFIED`` list as it stood when the file was written,
 and ``cases``, which gives every test request (token ids, start positions, parents, readout offsets) and the NAME of
 each array that holds an expected result. Array names are paths: ``weights/<tensor name>`` for the model, then one
 prefix per case. The cases:
@@ -56,11 +56,11 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
-from sepal import refengine  # noqa: E402
-from sepal.refengine import attention, deltanet, executor, readout  # noqa: E402
-from sepal.refengine.primitives import project, rms_norm, sigmoid, silu  # noqa: E402
-from sepal.refengine.snapshot import AttentionState, DeltaNetState  # noqa: E402
-from sepal.refengine.weights import EMBEDDING, FINAL_NORM  # noqa: E402
+from sepal_runner import refengine  # noqa: E402
+from sepal_runner.refengine import attention, deltanet, executor, readout  # noqa: E402
+from sepal_runner.refengine.primitives import project, rms_norm, sigmoid, silu  # noqa: E402
+from sepal_runner.refengine.snapshot import AttentionState, DeltaNetState  # noqa: E402
+from sepal_runner.refengine.weights import EMBEDDING, FINAL_NORM  # noqa: E402
 
 MAGIC = b"SEPALGV1"
 PRESET = "tiny"
@@ -277,7 +277,7 @@ def build(seed: int) -> tuple[dict, Arrays]:
     cases["label"] = label
 
     header = {
-        "format": "sepal-golden", "version": 1, "generator": "runner/tools/export_golden.py", "oracle": "sepal.refengine",
+        "format": "sepal-golden", "version": 1, "generator": "runner/tools/export_golden.py", "oracle": "sepal_runner.refengine",
         "preset": PRESET, "seed": seed, "config": dataclasses.asdict(config),
         "layer_kinds": list(kinds),
         "unverified": [list(item) for item in refengine.UNVERIFIED],

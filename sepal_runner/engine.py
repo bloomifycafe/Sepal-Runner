@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from sepal.runner.encode import DEFAULT_MAX_LENGTH, Encoder
+from sepal_runner.encode import DEFAULT_MAX_LENGTH, Encoder
 
 API_VERSION = 1
 LIB_ENV = "SEPAL_RUNNER_LIB"
@@ -250,7 +250,7 @@ def open_runner_api(final: str | os.PathLike, base: str | os.PathLike, lib: str 
     """Open the library on a checkpoint and tokenise with that checkpoint's `tokenizer.json`."""
     options = {"final_dir": str(final), "base_dir": str(base), "profile": profile, "max_tokens": max_tokens, **(extra or {})}
     if lib == "mock":                    # the Python front end alone over a fake engine: for load tests and dry runs
-        from sepal.runner.mock import FakeLib, MockEngine
+        from sepal_runner.mock import FakeLib, MockEngine
 
         lib = FakeLib(MockEngine(max_tokens=max_tokens))
     engine = CEngine(options, lib)

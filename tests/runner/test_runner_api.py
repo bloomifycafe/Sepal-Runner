@@ -9,12 +9,12 @@ import urllib.request
 
 import pytest
 
-from sepal.runner import engine as eng
-from sepal.runner.encode import Encoder
-from sepal.runner.mock import MockEngine
-from sepal.serve import decision_api as dec
-from sepal.serve import runner_api as srv
-from sepal.train.unsloth_arm import UnslothScorer
+from sepal_runner import engine as eng
+from sepal_runner.encode import Encoder
+from sepal_runner.mock import MockEngine
+from sepal_runner.shared import decision as dec
+from sepal_runner import server as srv
+from sepal_runner.shared.scoring import UnslothScorer
 
 LIMIT = 2500
 
@@ -268,6 +268,7 @@ def test_bind_rules(tiny_tokenizer):
 def test_decision_index_http_engine_talks_to_it(http):
     """`socdecide.adapters.systemone_http.SystemOneHTTP` (what the Decision Index uses) against the runner server: answers parse, and a
     request over the window is `Unsupported`, as against decision_api."""
+    pytest.importorskip("socdecide")      # the benchmark package of the Sepal repository; skipped without it
     from socdecide.adapters.base import Unsupported
     from socdecide.adapters.systemone_http import SystemOneHTTP
 

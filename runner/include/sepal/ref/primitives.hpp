@@ -1,5 +1,5 @@
 // Elementwise functions, norms and the projection helper shared by every layer of the reference path.
-// A port of sepal/refengine/primitives.py, function for function.
+// A port of sepal_runner/refengine/primitives.py, function for function.
 //
 // Everything in sepal::ref is a template over the element type T. With T = double it is the FP64 reference
 // forward pass, compared with the NumPy oracle to 1e-9; with T = float the same code is the unoptimised float32

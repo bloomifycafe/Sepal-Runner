@@ -2,7 +2,7 @@
 
 The C++20 inference engine for the Sepal decision models. The design is [../docs/RUNNER.md](../docs/RUNNER.md).
 This directory holds the first two slices of stage R1, with no third-party dependencies: a tested CPU foundation,
-and on it a complete forward pass (the reference path) that is compared with the NumPy oracle `sepal/refengine`.
+and on it a complete forward pass (the reference path) that is compared with the NumPy oracle `sepal_runner/refengine`.
 
 ## What is here
 
@@ -18,7 +18,7 @@ and on it a complete forward pass (the reference path) that is compared with the
 | Golden file | `include/sepal/golden.hpp`, `src/io/golden.cpp`, `include/sepal/json.hpp`, `src/io/json.cpp` | The reader of the golden-vector format and the small JSON reader its header needs |
 | Safetensors | `include/sepal/safetensors.hpp`, `src/io/safetensors.cpp`, `include/sepal/mapped_file.hpp`, `src/io/mapped_file.cpp` | A zero-copy safetensors reader (read-only mapping on Windows and POSIX; every offset, size, alignment and overlap checked) and `Checkpoint`, one or many files with or without an index |
 | Loader | `include/sepal/loader.hpp`, `src/model/loader.cpp` | `config.json` to a `ModelConfig` (compared with the closest preset), checkpoint names to engine names, the ignored tensors listed, `Weights<float/double>` for the reference path and a raw zero-copy view in the stored precision; `DecisionReadout` for the label-row readout. See "Real checkpoints" |
-| Reference path | `include/sepal/ref/*.hpp` | The whole forward pass and the request semantics, ported function for function from `sepal/refengine`: see "The reference path" below |
+| Reference path | `include/sepal/ref/*.hpp` | The whole forward pass and the request semantics, ported function for function from `sepal_runner/refengine`: see "The reference path" below |
 | Tools | `tools/sepal_info.cpp`, `tools/sepal_bench.cpp`, `tools/sepal_run.cpp`, `tools/export_golden.py`, `tools/make_tiny_checkpoint.py` | `sepal-info`: a preset's derived quantities and a memory plan for a budget. `sepal-bench`: tokens per second of the reference path. `sepal-run`: one pass of a real checkpoint. `export_golden.py`: writes the golden file from the oracle. `make_tiny_checkpoint.py`: writes the loader's test checkpoint |
 | Tests | `tests/` | A small self-registering harness (`tests/test.hpp`) and one suite per part; `tests/golden/tiny.sgv` is the golden file |
 
@@ -74,7 +74,7 @@ Where the port differs from the oracle in form, and why:
 
 ### Oracle details ported as unverified
 
-The oracle lists, in `sepal.refengine.UNVERIFIED`, the details the Kev reference files do not settle. Each is
+The oracle lists, in `sepal_runner.refengine.UNVERIFIED`, the details the Kev reference files do not settle. Each is
 ported as it stands and lives in exactly ONE function, marked `UNVERIFIED` in its comment with the oracle's name
 for it. When one changes in the oracle, change that one function and regenerate the golden file.
 
@@ -154,7 +154,7 @@ that row to one significant figure; a 16-token run of 0.8B gave 3.40 tokens/s.
 
 ## Golden vectors
 
-`tools/export_golden.py` imports `sepal.refengine`, builds the `tiny` preset with seeded random weights, runs a
+`tools/export_golden.py` imports `sepal_runner.refengine`, builds the `tiny` preset with seeded random weights, runs a
 fixed set of requests through the oracle and writes `tests/golden/tiny.sgv` (671 kB, committed). The C++ tests take
 the weights, the requests and the expected results from that file only. To regenerate it, from the repository root:
 

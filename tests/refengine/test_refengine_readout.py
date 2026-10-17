@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from refengine_support import token_ids
-from sepal.refengine import Row, label_row_probabilities, label_rows, pointer_probabilities, run_rows
-from sepal.refengine.readout import label_row_logits, pointer_logits
+from sepal_runner.refengine import Row, label_row_probabilities, label_rows, pointer_probabilities, run_rows
+from sepal_runner.refengine.readout import label_row_logits, pointer_logits
 
 STATE_LENGTH = 9
 # (token seed, branch length, offsets of the option ends); the decide token is the last of its branch

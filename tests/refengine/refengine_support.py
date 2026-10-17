@@ -1,7 +1,7 @@
 """Helpers shared by the reference-engine tests."""
 import numpy as np
 
-from sepal.refengine import AttentionState, DeltaNetState, ModelConfig, Row, Snapshot, Weights, run_rows
+from sepal_runner.refengine import AttentionState, DeltaNetState, ModelConfig, Row, Snapshot, Weights, run_rows
 
 EXACT = 1e-10   # two orderings of the same float64 computation agree to this; the C++ fp64 path is held to it too
 

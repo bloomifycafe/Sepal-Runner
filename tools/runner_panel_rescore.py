@@ -40,7 +40,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     from sepal.eval.panel import rows_for
-    from sepal.runner.engine import open_runner_api
+    from sepal_runner.engine import open_runner_api
     from sepal.train import readout, roundspec
     from sepal.train.unsloth_arm import MAX_SCORE_LEN, PanelScorer, UnslothScorer, fitted_temperatures
 

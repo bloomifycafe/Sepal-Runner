@@ -1,5 +1,5 @@
 // The full-attention mixer: gated grouped-query attention with per-head norms and partial RoPE.
-// A port of sepal/refengine/attention.py, function for function (that file is adapted from
+// A port of sepal_runner/refengine/attention.py, function for function (that file is adapted from
 // jaredpalmer/kev@5e42a7a kev/fused_qwen35.py, Apache-2.0).
 //
 // The oracle marks four details of this mixer as not yet verified against the real model (see

@@ -28,9 +28,10 @@ def softmax(z, t):
 
 
 def main(argv=None) -> int:
-    from sepal.runner.engine import open_runner_api
-    from sepal.train.unsloth_arm import UnslothScorer, fitted_temperatures
-    from sepal.serve.decision_api import NoTruncateApi
+    from sepal_runner.engine import open_runner_api
+    from sepal_runner.shared.scoring import UnslothScorer
+    from sepal_runner.shared.temperatures import fitted_temperatures
+    from sepal_runner.shared.decision import NoTruncateApi
 
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--golden", required=True)

@@ -5,7 +5,7 @@ The projection, the split sizes and the order of operations are Kev's ``deltanet
 convolution, the recurrence and the gated norm to library kernels whose bodies are not in the reference files, so
 each of those is written out here as its own small function. Each was since checked against the upstream
 transformers model and found to be what it computes (docs/REFENGINE-VERIFICATION.md; the upstream lines are cited
-next to ``sepal.refengine.UNVERIFIED``).
+next to ``sepal_runner.refengine.UNVERIFIED``).
 """
 from __future__ import annotations
 

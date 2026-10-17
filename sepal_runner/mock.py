@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 
-from sepal.runner.engine import Batch
+from sepal_runner.engine import Batch
 
 
 class MockEngine:

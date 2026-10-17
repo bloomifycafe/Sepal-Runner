@@ -1,9 +1,9 @@
 """The golden set of the fast runner: oracle outputs for a fixed list of cases, read by every runner test.
 
-    python -m sepal.runner.oracle_golden cpu      [--threads 12]            fp32 on the CPU (no GPU needed): the small set, manifest last
-    python -m sepal.runner.oracle_golden served   [--cross-check]           GPU, hold the lock: add logits_bf16 + as-served probabilities, fp32 GPU cross-check
-    python -m sepal.runner.oracle_golden long     --workloads DIR           GPU, hold the lock: one request per workload shape, fp32 and bf16
-    python -m sepal.runner.oracle_golden manifest                           rewrite manifest.json from the case files on disk
+    python -m sepal_runner.oracle_golden cpu      [--threads 12]            fp32 on the CPU (no GPU needed): the small set, manifest last
+    python -m sepal_runner.oracle_golden served   [--cross-check]           GPU, hold the lock: add logits_bf16 + as-served probabilities, fp32 GPU cross-check
+    python -m sepal_runner.oracle_golden long     --workloads DIR           GPU, hold the lock: one request per workload shape, fp32 and bf16
+    python -m sepal_runner.oracle_golden manifest                           rewrite manifest.json from the case files on disk
 
 Format (docs: the rt-oracle brief, also in each file's metadata): one `<case>.safetensors` per case with the tensors `input_ids` I32 [L],
 `question_types` I32 [Q] (noul 0, choice 1, score 2), `instruction_spans` I32 [Q,2], `option_offsets` I32 [Q+1], `option_spans` I32 [P,2]
@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-from sepal.runner import oracle
+from sepal_runner import oracle
 
 GOLDEN_DIR = oracle.RUNS / "runner-golden" / "full08b"
 SUITE_DEV = oracle.RUNS / "suites" / "socdecide-0.7.0" / "development.jsonl"

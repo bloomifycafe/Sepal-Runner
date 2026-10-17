@@ -1,4 +1,4 @@
-"""Exactness of `sepal.runner.encode` against Unsloth's `unsloth.models.clef.encode_record` (the oracle, run as a black box).
+"""Exactness of `sepal_runner.encode` against Unsloth's `unsloth.models.clef.encode_record` (the oracle, run as a black box).
 
     uv run python tools/runner_encode_compare.py cases --out CASES.jsonl [--sec 3000 --gen 1000] [--spec experiments/rounds/full08b.yaml]
     <oracle venv python> tools/runner_encode_compare.py compare --final DIR --cases CASES.jsonl --golden DIR --out RESULT.json
@@ -98,7 +98,7 @@ def cmd_compare(args) -> int:
     from transformers import AutoTokenizer
     from unsloth.models import clef
 
-    from sepal.runner.encode import Encoder
+    from sepal_runner.encode import Encoder
     from tokenizers import Tokenizer
 
     final = Path(args.final)

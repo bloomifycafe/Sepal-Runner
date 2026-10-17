@@ -1,7 +1,7 @@
 """The pure parts of the runner oracle tools (no torch, no GPU): the golden case list and its conversion to encoder inputs."""
 from __future__ import annotations
 
-from sepal.runner import oracle_golden as g
+from sepal_runner import oracle_golden as g
 
 
 def test_synthetic_cases_cover_the_brief():

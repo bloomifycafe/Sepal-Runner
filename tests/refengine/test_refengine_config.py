@@ -5,7 +5,7 @@ import importlib
 import numpy as np
 import pytest
 
-from sepal.refengine import PRESETS, REAL_PRESETS, UNVERIFIED, Weights, parameter_counts, random_weights, weight_shapes
+from sepal_runner.refengine import PRESETS, REAL_PRESETS, UNVERIFIED, Weights, parameter_counts, random_weights, weight_shapes
 
 # docs/RUNNER.md section 3: non-embedding parameters and the layer split, read from the base model files
 PUBLISHED = {"0.8B": (498e6, 18, 6), "2B": (1.37e9, 18, 6), "4B": (3.57e9, 24, 8), "9B": (6.92e9, 24, 8)}
@@ -96,5 +96,5 @@ def test_unverified_entries_name_real_functions():
     assert len({name for name, _ in UNVERIFIED}) == len(UNVERIFIED)
     for name, description in UNVERIFIED:
         module, function = name.split(".")
-        assert callable(getattr(importlib.import_module(f"sepal.refengine.{module}"), function))
+        assert callable(getattr(importlib.import_module(f"sepal_runner.refengine.{module}"), function))
         assert description

@@ -1,5 +1,5 @@
 // Weights: the tensor names and shapes a geometry implies, and a read-only container keyed by tensor name.
-// A port of sepal/refengine/weights.py.
+// A port of sepal_runner/refengine/weights.py.
 //
 // Names follow the transformers Qwen3.5 text model (`layers.<i>.linear_attn.in_proj_qkv.weight` and so on).
 // Projections are stored one tensor per projection, as checkpoints hold them. Three groups: the embedding table,

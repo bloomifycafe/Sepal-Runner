@@ -1,6 +1,6 @@
 // Loading a real checkpoint: its config.json as a ModelConfig, its tensors under the engine's names, and the
 // decision readout that comes with a fine-tuned decision model.
-// A port of sepal/refengine/upstream.py (`model_config`, `text_model_arrays`, `engine_weights`).
+// A port of sepal_runner/refengine/upstream.py (`model_config`, `text_model_arrays`, `engine_weights`).
 //
 // A checkpoint directory holds `config.json` and safetensors files. The text model's tensors sit under a prefix
 // that depends on how the checkpoint was saved (`model.language_model.`, `language_model.`, `model.` or none);

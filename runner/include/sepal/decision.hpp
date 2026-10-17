@@ -1,7 +1,7 @@
 // The serving contract every backend (CPU, CUDA) implements for the trained Sepal decision model: Qwen3.5 base +
 // merged LoRA + Clef JointSchemaHead (docs/RUNNER.md section 3).
 //
-// The caller (the Python front end, sepal/runner) renders and tokenises the one-prompt layout of RUNNER.md 3.2 and
+// The caller (the Python front end, sepal_runner) renders and tokenises the one-prompt layout of RUNNER.md 3.2 and
 // hands the engine token ids plus the spans the head reads. The engine returns RAW logits per question, one per
 // option in encoded order. Temperatures, softmax, key mapping and the HTTP API are the caller's: they are the same
 // Python code the oracle uses (sepal.train.unsloth_arm.UnslothScorer), so post-processing cannot drift.

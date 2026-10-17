@@ -1,4 +1,4 @@
-/* C ABI of the Sepal runner (RUNNER.md section 10). The Python binding (sepal/runner/engine.py, ctypes) and any
+/* C ABI of the Sepal runner (RUNNER.md section 10). The Python binding (sepal_runner/engine.py, ctypes) and any
  * other client use only this header. Every backend library (sepal_runner_cpu.dll / libsepal_runner_cpu.so and
  * sepal_runner_cuda.dll / ...) exports the same functions.
  *

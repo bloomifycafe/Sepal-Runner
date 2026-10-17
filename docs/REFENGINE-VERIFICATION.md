@@ -1,6 +1,8 @@
 # Reference engine: verification against the upstream model
 
-`sepal/refengine/` was written from a study of another project's code, without the model's own source. Twelve
+> **Moved from Sepal (2026-10-17).** This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
+
+`sepal_runner/refengine/` was written from a study of another project's code, without the model's own source. Twelve
 details of its arithmetic were therefore listed as unverified. This document records how they were checked against
 the Qwen3.5 implementation in `transformers`, what was measured, and what is still not covered.
 
@@ -40,7 +42,7 @@ the RoPE table (L177, L186), the decay (L609), the whole delta rule (L328-331, L
 attention path (L731). A model converted with `.double()` is therefore only float32-accurate, and its cached
 recurrent state is float32.
 
-To compare at float64, `sepal.refengine.upstream.float64_arithmetic` runs the same upstream code with `torch.float32`,
+To compare at float64, `sepal_runner.refengine.upstream.float64_arithmetic` runs the same upstream code with `torch.float32`,
 `torch.float` and `Tensor.float()` meaning float64 inside that module, and with the RoPE frequencies recomputed in
 float64. No upstream line is replaced. Both variants are reported below: "float64" is the promoted run, "unmodified"
 is the `.double()` model as it ships.
@@ -188,8 +190,8 @@ keys after their norm and RoPE. Those are the only tensors (asserted by a test).
 ## What changed in the engine
 
 - No arithmetic. `deltanet.py`, `attention.py`, `primitives.py` and `executor.py` compute what they computed before.
-- `sepal/refengine/__init__.py`: `UNVERIFIED` is empty; each former entry is a comment citing the upstream lines.
-- New `sepal/refengine/upstream.py`: builds the upstream config and model for a geometry, converts upstream tensors
+- `sepal_runner/refengine/__init__.py`: `UNVERIFIED` is empty; each former entry is a comment citing the upstream lines.
+- New `sepal_runner/refengine/upstream.py`: builds the upstream config and model for a geometry, converts upstream tensors
   to engine weights and an upstream cache to an engine snapshot, and provides the float64 promotion. It imports
   PyTorch and transformers only when called.
 - New `tests/refengine/test_refengine_upstream.py` and `tools/verify_refengine.py`.

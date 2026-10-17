@@ -1,9 +1,9 @@
 """R0 baseline of the oracle (the model as sepal.serve.decision_api serves it) and of llama.cpp prefill, on the shared workloads.
 
-    python -m sepal.runner.r0_bench gpu    --shapes t1k_q1 ... [--batch-tokens 16384 32768 65536] [--passes 2]    (hold the GPU lock, GPU otherwise idle)
-    python -m sepal.runner.r0_bench cpu    --shapes t1k_q1 ... [--threads 12] [--budget-seconds 300]
-    python -m sepal.runner.r0_bench llama  --device gpu|cpu [--threads 12] [--prompts 1024 4096 16384]
-    python -m sepal.runner.r0_bench table                                                              (markdown table from the JSON files)
+    python -m sepal_runner.r0_bench gpu    --shapes t1k_q1 ... [--batch-tokens 16384 32768 65536] [--passes 2]    (hold the GPU lock, GPU otherwise idle)
+    python -m sepal_runner.r0_bench cpu    --shapes t1k_q1 ... [--threads 12] [--budget-seconds 300]
+    python -m sepal_runner.r0_bench llama  --device gpu|cpu [--threads 12] [--prompts 1024 4096 16384]
+    python -m sepal_runner.r0_bench table                                                              (markdown table from the JSON files)
 
 Run in the Unsloth environment (runs/pilot-unsloth/venv) with PYTHONPATH set to the repo root. Results: runs/runner-bench/r0/*.json.
 `gpu` times (a) batch 1: `decision_api.answer` per request, one at a time, exactly as the server answers (encode + forward + softmax),
@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-RUNS = Path(os.environ.get("SEPAL_RUNS", "E:/MYCOMPANY/BlumSOC/Sepal/runs"))
+RUNS = Path(os.environ.get("SEPAL_RUNS", "runs"))
 WORKLOADS = RUNS / "runner-bench" / "workloads"
 OUT = RUNS / "runner-bench" / "r0"
 LLAMA = Path(os.environ.get("LLAMA_BENCH", "E:/MYCOMPANY/BlumSOC/bench/llama.cpp-b11514/bin/llama-bench.exe"))
@@ -85,7 +85,7 @@ def summarise(latencies: list[float], tokens: list[int]) -> dict:
 def run_gpu(args) -> None:
     import torch
 
-    from sepal.runner import oracle
+    from sepal_runner import oracle
     from sepal.serve.decision_api import answer, to_record
 
     t0 = time.perf_counter()
@@ -158,7 +158,7 @@ def run_gpu(args) -> None:
 # ---- CPU -------------------------------------------------------------------------------------------------------------------
 
 def run_cpu(args) -> None:
-    from sepal.runner import oracle
+    from sepal_runner import oracle
 
     oracle.hide_gpu()
     import torch

@@ -14,7 +14,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNS = Path(os.environ.get("SEPAL_RUNS", r"E:\MYCOMPANY\BlumSOC\Sepal\runs"))
+RUNS = Path(os.environ.get("SEPAL_RUNS", "runs"))
 FINAL = RUNS / "box-results" / "full08b" / "U2-s0" / "final"
 BASE = Path(os.environ.get("SEPAL_BASE", r"C:\Users\FSNaix\.cache\huggingface\hub\models--Qwen--Qwen3.5-0.8B-Base\snapshots\dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"))
 OUT = RUNS / "runner-golden" / "_stage"

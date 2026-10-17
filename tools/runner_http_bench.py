@@ -1,4 +1,4 @@
-"""HTTP load generator for a `/v1/systemone` server (sepal.serve.runner_api or decision_api): concurrent keep-alive clients over request
+"""HTTP load generator for a `/v1/systemone` server (sepal_runner.server or decision_api): concurrent keep-alive clients over request
 bodies, requests per second and latency percentiles as the client sees them, so the Python front end's overhead is visible next to the
 engine's own numbers.
 

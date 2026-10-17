@@ -1,10 +1,10 @@
 """`POST /v1/systemone` served by the Sepal runner (C++ engine behind the C ABI, Python front end).
 
-    python -m sepal.serve.runner_api --final DIR --base DIR --lib PATH --profile gpu-f16 [--host 127.0.0.1] [--port 8000] [--name sepal]
+    python -m sepal_runner.server --final DIR --base DIR --lib PATH --profile gpu-f16 [--host 127.0.0.1] [--port 8000] [--name sepal]
 
-The same wire format, refusals and answer JSON as `sepal.serve.decision_api` (it reuses `to_record`, `Refused`, `NoTruncateApi`,
-`UnslothScorer` for the encoding, the temperatures and the softmax, and `build_answer`), but the model is the runner: a request is
-tokenised on a thread pool (`sepal.runner.encode`, the fast `tokenizers` library), the encoded records of concurrent requests are
+The same wire format, refusals and answer JSON as Sepal's `sepal.serve.decision_api` (it uses the copies in `sepal_runner.shared` of
+`to_record`, `Refused`, `NoTruncateApi`, `UnslothScorer` for the temperatures and the softmax, and `build_answer`), but the model is the runner: a request is
+tokenised on a thread pool (`sepal_runner.encode`, the fast `tokenizers` library), the encoded records of concurrent requests are
 coalesced into one `sepal_score` call (a token budget and a short maximum wait), and identical requests are answered once: a result
 cache keyed by the canonical request, and in-flight coalescing of identical requests that arrive while the first is being scored.
 
@@ -29,9 +29,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from sepal.eval.predictor import ContextOverflow
-from sepal.serve.decision_api import MAX_OPTIONS, NoTruncateApi, Refused, build_answer, to_record  # noqa: F401
-from sepal.train.unsloth_arm import MAX_SCORE_LEN, UnslothScorer
+from sepal_runner.shared.decision import MAX_OPTIONS, NoTruncateApi, Refused, build_answer, to_record  # noqa: F401
+from sepal_runner.shared.scoring import MAX_SCORE_LEN, ContextOverflow, UnslothScorer
 
 TOKEN_BUDGET = 65536        # tokens of one engine call at most (a single longer request goes alone)
 MAX_BATCH_REQUESTS = 64
@@ -378,8 +377,8 @@ def build_service(api: Any, temperatures: Any, name: str, *, backend: Any = None
 def load_service(final: str, base: str, lib: str | None, profile: str, name: str, *, calibrated: bool = True, **options) -> tuple[RunnerService, Any]:
     from pathlib import Path
 
-    from sepal.runner.engine import open_runner_api
-    from sepal.train.unsloth_arm import fitted_temperatures
+    from sepal_runner.engine import open_runner_api
+    from sepal_runner.shared.temperatures import fitted_temperatures
 
     api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
     temperatures = fitted_temperatures(str(Path(final).parent)) if calibrated else None

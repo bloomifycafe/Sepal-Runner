@@ -1,6 +1,6 @@
 """Shared benchmark workloads of the fast runner: realistic SOC log windows with many yes/no questions and one tool-selection question.
 
-    python -m sepal.runner.workloads [--out runs/runner-bench/workloads] [--only SHAPE ...]
+    python -m sepal_runner.workloads [--out runs/runner-bench/workloads] [--only SHAPE ...]
 
 Deterministic (every random choice is seeded by the shape name and the request index). Real log text from `runs/data` (read only):
 Wazuh alerts of the AIT-ADS testbed (syslog, Apache, auditd lines), the LANL authentication log, Sysmon events of the Splunk attack data.
@@ -256,7 +256,7 @@ class Builder:
     def __init__(self, pools: dict[str, list[dict]], limit: int = ORACLE_WINDOW):
         from transformers import AutoTokenizer
 
-        from sepal.runner import oracle
+        from sepal_runner import oracle
 
         self.clef = oracle.load_vendored_clef()
         self.tokenizer = AutoTokenizer.from_pretrained(str(oracle.FINAL), local_files_only=True)
@@ -391,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=str(OUT))
     parser.add_argument("--only", nargs="*", help="shape names (default: all)")
     args = parser.parse_args(argv)
-    from sepal.runner import oracle
+    from sepal_runner import oracle
 
     oracle.hide_gpu()
     out = Path(args.out)

@@ -13,7 +13,7 @@ import sys
 
 import numpy as np
 
-from sepal.runner import oracle, oracle_golden as g
+from sepal_runner import oracle, oracle_golden as g
 
 
 def stats(a, b, name):

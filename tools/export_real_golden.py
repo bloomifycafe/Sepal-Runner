@@ -204,7 +204,7 @@ def main() -> None:
                    "layers": torch.stack(layers).numpy(), "final_hidden": final.numpy(),
                    "probs": probabilities(final, readout, temperature, 4)}
         if model_for_f64 is not None:
-            from sepal.refengine import upstream
+            from sepal_runner.refengine import upstream
 
             with upstream.float64_arithmetic(model_for_f64):
                 layers64, final64 = run_layers(model_for_f64, ids)

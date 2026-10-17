@@ -1,5 +1,5 @@
 // The row executor: the engine's request semantics, one row at a time.
-// A port of sepal/refengine/executor.py, function for function (that file is adapted from
+// A port of sepal_runner/refengine/executor.py, function for function (that file is adapted from
 // jaredpalmer/kev@5e42a7a kev/fused_qwen35.py, Apache-2.0).
 //
 // A request is a set of rows. A row is a run of tokens that continues a parent: a stored snapshot, another row

@@ -1,6 +1,6 @@
 """Batch scoring without a server.
 
-    python -m sepal.runner score --in requests.jsonl --out answers.jsonl --final DIR --base DIR --lib PATH --profile gpu-f16
+    python -m sepal_runner score --in requests.jsonl --out answers.jsonl --final DIR --base DIR --lib PATH --profile gpu-f16
 
 `requests.jsonl` holds one `/v1/systemone` body per line; `answers.jsonl` gets one line per request, in order: the answer JSON the Decision
 API returns, or `{"error": {"status": 422, "detail": "..."}}` for a refused or failed request. The requests go through the same service as
@@ -15,7 +15,7 @@ import time
 
 
 def score(args) -> int:
-    from sepal.serve import runner_api
+    from sepal_runner import server as runner_api
 
     service, engine = runner_api.load_service(args.final, args.base, args.lib, args.profile, args.name, **runner_api.service_options(args))
     try:
@@ -37,9 +37,9 @@ def score(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from sepal.serve import runner_api
+    from sepal_runner import server as runner_api
 
-    parser = argparse.ArgumentParser(prog="python -m sepal.runner", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="python -m sepal_runner", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("score", help="score a JSONL file of request bodies")
     p.add_argument("--in", dest="input", required=True)

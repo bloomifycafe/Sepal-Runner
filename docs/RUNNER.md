@@ -1,5 +1,7 @@
 # Sepal runner
 
+> **Moved from Sepal (2026-10-17).** This document was written in the Sepal repository; links to `../reports/`, `MODEL.md`, `DATA.md`, `BENCHMARK.md`, `ROADMAP.md` and `REFERENCES.md` point into https://github.com/bloomifycafe/Sepal. Python paths read `sepal_runner/...` (was `sepal/runner`, `sepal/refengine`, `sepal/serve/runner_api.py`).
+
 Design document for the inference runner that serves the Sepal decision models. A future runner builder starts here.
 
 ## Status and what changed on 2026-10-13
@@ -7,7 +9,7 @@ Design document for the inference runner that serves the Sepal decision models. 
 **Runner status.** Paused since 2026-10-11; nobody is building it. Two pieces of this design exist as code: the first
 C++ slice of stage R1 in `runner/` (build, model geometry as data, a reference matrix-multiply provider, basic
 operations, a refusing memory planner; listed in `runner/README.md`), and a NumPy float64 reference implementation of
-the trunk and of the old request semantics in `sepal/refengine/`. Neither has loaded a model file. The runner has no
+the trunk and of the old request semantics in `sepal_runner/refengine/`. Neither has loaded a model file. The runner has no
 DeltaNet step, no attention, no weight loader, no executor and no server, and has been built with MSVC on Windows
 only. Stage R0 has not started. Nothing in the runner was measured on a model.
 
@@ -892,14 +894,14 @@ is the licence-clean oracle; O1b is checked against it once, because Unsloth's h
 the same state dict. O2: our own scalar FP64 forward. O3: llama.cpp F32 (non-gating, trunk only). Kev's PyTorch path is no
 longer an oracle for this model.
 
-**State of O2.** It exists as `sepal/refengine/`: a NumPy float64 forward pass driven by a geometry object, with
+**State of O2.** It exists as `sepal_runner/refengine/`: a NumPy float64 forward pass driven by a geometry object, with
 the snapshot contents of section 3.8, a row executor in which a row's result depends on its own chain only, and the two
 **old** readouts (pointer head, label rows). **It has no Clef head and no one-sequence encoder**: the trunk part is
 unaffected, the readout and the request layout must be added from section 3 (R1 work, section 16). Its tests run on random weights and small test geometries and check its own invariants (a row continued
 from a stored snapshot equals the same row computed in one go; branches do not see each other; left-padding with
 zero input is exact). It has not been compared with O1 or with any real checkpoint, so it is not yet an oracle for
 the model, only a definition of the request semantics. Twelve arithmetic details that Kev's reference hands to
-library kernels were written out from their description and are listed in `sepal/refengine/__init__.py`
+library kernels were written out from their description and are listed in `sepal_runner/refengine/__init__.py`
 (`UNVERIFIED`) until a real model confirms them:
 
 - DeltaNet: the convolution's tap order and absence of bias; the L2 normalisation's epsilon placement; how value
@@ -975,7 +977,7 @@ planner}.hpp` (C++ headers; the C ABI is not written), `src/{core, model, plan, 
 exist. The slice was built and tested with MSVC 19.44 on Windows 11 (as `runner/README.md` records; the Release
 configuration was rebuilt and its 8 test entries passed on 2026-10-09). It has not been compiled with GCC or Clang,
 so Linux, which this section names as first-class, is untested. The FP64 reference path is in Python
-(`sepal/refengine/`), not in this tree.
+(`sepal_runner/refengine/`), not in this tree.
 
 ## 16. Stages R0-R6
 
@@ -1003,7 +1005,7 @@ memory grows with the total sequence, which the planner bounds by `max_length`.
   with a carried tail, and the planner. Not written: the GGUF loader, the encoder, the DeltaNet recurrence, attention, the fp32
   executor, the oneDNN provider, the C ABI, the Python wheel, and now the Clef head. All of these except the head are
   independent of the decision. The planner's pointer-head sizing is superseded (section 8).
-- **Outside the stage list.** The FP64 reference of R1's scope was written in Python (`sepal/refengine/`) with the old readouts, and the
+- **Outside the stage list.** The FP64 reference of R1's scope was written in Python (`sepal_runner/refengine/`) with the old readouts, and the
   token layouts of the old design as `sepal/model/layouts.py` (removed 2026-10-14; it is in git history); neither is the new contract. The C++ encoder must instead
   reproduce `encode_record` token for token (section 17).
 
@@ -1131,7 +1133,7 @@ decide(state_segments, pack, adapter, profile):
 `k` and `q` are the pointer head's two projections. Each is a plain linear layer with a bias term:
 `k(h) = W_k h + b_k` and `q(h) = W_q h + b_q`, with `W` of shape `[256, hidden_size]` and `b` of length 256
 ([MODEL.md](MODEL.md), section 3). Unlike the trunk's projections they are not bias-free, and the reference
-implementation defines them so (`sepal/refengine/readout.py`, `sepal/refengine/weights.py`). The head therefore has
+implementation defines them so (`sepal_runner/refengine/readout.py`, `sepal_runner/refengine/weights.py`). The head therefore has
 `2 x (256 x hidden_size + 256)` parameters.
 
 `user_tokens` rewrites `<|name|>` so caller text cannot produce a delimiter token (`kev@5e42a7a:kev/model.py:78-81`).

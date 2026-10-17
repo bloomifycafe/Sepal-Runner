@@ -1,5 +1,5 @@
 // Snapshots: what a run of tokens leaves behind for the rows that continue it.
-// A port of sepal/refengine/snapshot.py.
+// A port of sepal_runner/refengine/snapshot.py.
 //
 // Per Gated DeltaNet layer that is the recurrent state and the conv tail (the last K-1 conv inputs); per
 // attention layer the keys (after their norm and RoPE) and the values of every token so far.
