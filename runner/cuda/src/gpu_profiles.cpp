@@ -17,6 +17,13 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
         else if (key == "max_call_tokens") g.max_call_tokens = static_cast<std::size_t>(value.as_uint());
         else if (key == "trunk_budget_mib") g.trunk_budget_bytes = static_cast<std::size_t>(value.as_uint()) << 20;
         else if (key == "prefix_entries") g.prefix_entries = static_cast<std::size_t>(value.as_uint());
+        else if (key == "deltanet") {
+            const std::string& mode = value.as_string();
+            if (mode == "scan") g.deltanet = cuda::DeltaNetMode::Scan;
+            else if (mode == "auto") g.deltanet = cuda::DeltaNetMode::Auto;
+            else if (mode == "chunked") g.deltanet = cuda::DeltaNetMode::Chunked;
+            else throw std::invalid_argument("deltanet must be scan, auto or chunked");
+        }
     }
     TrainedModel model = TrainedModel::open(o.final_dir, o.base_dir);
     return std::make_unique<cuda::GpuDecisionEngine>(model, g);
@@ -25,8 +32,10 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
 } // namespace
 
 void register_backend_profiles() {
-    const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries"};
+    const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries", "deltanet"};
     register_profile({"gpu-f16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16"); }});
+    register_profile({"gpu-f16-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16-strict"); }});
+    register_profile({"gpu-f32-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32-strict"); }});
     register_profile({"gpu-f32", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32"); }});
 }
 

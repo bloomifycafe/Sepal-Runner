@@ -1521,15 +1521,45 @@ The whole CTest suite on the merged tree (main at 46f3b7d), with all the real-mo
 type, `prune_last_layer` off, the trunk's final-normed hidden state of every token goes to the head on the device (a hook inside
 `CudaEngine::run`), only logits come back. Requests are cut into groups that fit the head's capacity, a group is one batch of rows
 (no padding), long requests are chunked, and with `prefix_cache` on a snapshot of the trunk plus the head's memory rows at a cut before
-the first question span is reused (RUNNER.md section 7). Profiles `gpu-f16` and `gpu-f32`; `sepal_runner_cuda` is the C ABI library
-(`sepal-score --library` works; extra keys `prefix_cache`, `max_call_tokens`, `trunk_budget_mib`, `prefix_entries`).
-Tools: `sepal-gpu-parity` (golden), `sepal-gpu-bench` (workloads; `--batch N`, `--phases on`, `--call-tokens N`, `--dump/--compare`).
+the first question span is reused (RUNNER.md section 7). Rows of a trunk call: `max_call_tokens` (0: 65536 with 20 GiB free, 32768 from 10 GiB).
 
-Parity on the golden set (20 cases), RTX 3090, CUDA 12.8 build, measured: head alone (hidden_fp32 -> logits_fp32) max |dlogit|
-1.9e-6; gpu-f32 end to end max |dlogit| 2.6e-5, max |dp| 3.6e-6 (T=1) and 2.3e-6 (calibrated), 0 flips, batch 1 and 20;
-gpu-f16 max |dp| 7.9e-3 (batch 1) / 1.06e-2 (batch 20), p99 <= 7.5e-3, 0 flips. Prefix reuse against no reuse: 1.1e-5 in f32.
+**Profiles = the id of every answer.** `gpu-f16` and `gpu-f32` are the fast mode (default): a request's answer may differ in the last
+bits with the requests it shares a call with, and the DeltaNet layers may use the chunked kernels. `gpu-f16-strict` and `gpu-f32-strict`
+run the trunk in strict mode (`gemm_rows` 128, batch-invariant multiplies, the scan kernel): the hidden states of a request are
+bit-identical alone, among other requests and at any place of a batch. The head runs on cuBLAS and adds at most 5e-7 of logit noise with
+the batch it shares (measured, batch 1 vs 3 vs all at once); a per-request head pass would remove it. `sepal_runner_cuda` is the C ABI
+library registering the four names (`sepal-score --library` works; extra keys `prefix_cache`, `max_call_tokens`, `trunk_budget_mib`,
+`prefix_entries`, `deltanet` = scan | auto | chunked). Tools: `sepal-gpu-parity` (golden, prints the gates, exit 3 on a miss),
+`sepal-gpu-bench` (workloads; `--batch N`, `--phases on`, `--call-tokens`, `--int8`, `--deltanet`, `--dump/--compare`),
+`sepal-cuda-chunk-check` (the chunked DeltaNet against the scan kernel, with timing).
 
-Where the time goes (3090, `--phases on`, summed over 2 reps, batch 1): t16k_q8 DeltaNet 6.6 s, multiplies 3.4 s, attention 2.6 s,
-elementwise 0.5 s; t4k_q8 DeltaNet 4.2 s, multiplies 2.3 s, attention 0.6 s. A Gated DeltaNet scan is one block per (row, head):
-a single 16k row uses 16 blocks on 82 SMs. Several rows per call help (`max_call_tokens` auto 65536 on >=20 GiB free: 16k shapes
-28k -> 39k tok/s). The next step is splitting a head's value columns (independent in the recurrence) over several blocks.
+**Chunked DeltaNet** (`src/kernels_deltanet_chunked.{hpp,cu}`, `DeltaNetMode`, float16 path, natural mode). The scan kernel is one block
+per (row, head) walking the tokens: a single 16k row uses 16 of the 3090's 82 SMs and takes 15.3 ms per layer on any card (the chain per
+token, not the card, sets the time; splitting the value columns over blocks does not shorten it). The chunked form cuts a row into
+chunks of 64 tokens (WY representation): W, U, Q, K, the 64 x 64 mask and (I + A)^-1 per chunk and head are computed in parallel
+(`prepare` kernel), a short loop over chunks per (row, head, 32 value columns) does four small tensor-core products per chunk (`state`
+kernel, operands fetched with cp.async one chunk ahead), then the gated RMSNorm. Operands are binary16, accumulation float32; against the
+scan kernel a layer differs by 2e-4 of the rms on average (max 2-4% of the rms over 16k tokens); end to end the golden gates hold
+(below). A row continued from a snapshot restarts its chunk grid, so it is not the uncut row bit for bit (strict profiles never use it).
+`Auto` chooses per wave with a cost model (scan: 0.93 us per token of the longest row per wave of 16 x rows blocks; chunked: 0.235 us per
+token x 82 / SM count): it picks the chunked kernels when few rows leave the card idle (RTX 3090, per layer, `sepal-cuda-chunk-check`:
+1 x 16384 tokens scan 15.3 ms / chunked 3.8 ms, 2 x 8192 7.7 / 3.9, 4 x 4096 3.8 / 3.9; 1 x 65536 54.8 / 13.5; 1 x 512 0.44 / 0.18;
+RTX 3060, 1 x 16384 12.9 / 9.6, 8 x 1024 4.1 / 4.8). The phases of `prepare` are each latency-bound (about 10k cycles for a block's conv,
+KK, solve, products); padding the shared-memory operands against bank conflicts took it from 2.5 to 1.8 ms and the state loop from 3.3 to
+1.7 ms (hi/lo splitting of the state costs 25% and changes the result by less than the binary16 rounding of the chunk matrices, so it is
+off).
+
+**Parity on the golden set** (30 cases from 185 to 31,850 tokens, RTX 3090, CUDA 12.8, measured): head alone (hidden_fp32 -> logits_fp32)
+max |dlogit| 1.9e-6; gpu-f32 max |dlogit| 1.1e-4, max |dp| 7e-6 (T=1) and 7e-6 (calibrated), 0 flips, batch 1 and 20; gpu-f32-strict
+5.8e-6; gpu-f16 max |dp| 7.9e-3 (scan) / 6.8e-3 (chunked) at batch 1 and 1.3e-2 at batch 20, p99 5.7e-3, 0 flips; gpu-f16-strict 2.3e-3.
+Prefix reuse against none: 1.1e-5 (f32). `ctest -R cuda_golden` runs these with the gates (skipped without SEPAL_TRAINED_FINAL,
+SEPAL_TRAINED_BASE, SEPAL_GOLDEN_DIR).
+
+**int8 on the trained model: off.** All four multiply groups on int8 weights, W8A16: max |dp| 0.073 (gate 0.03); W8A8: 0.13, 2 flips of
+165 questions (1.2%); W8A8 without the down projection: 0.13, 2 flips. It does not pass the gpu-f16 gate; the option stays (`--int8`).
+
+**Where the time goes** (3090, `--phases on`, fp16, batch 1, per request of 16k tokens, before the chunked kernels): DeltaNet 275 ms,
+multiplies 140 ms, attention 108 ms (about 65 TFLOP/s, about 90% of the card's fp16 peak: nothing to win by tuning), elementwise 20 ms.
+Saturated, the multiplies are more than half of the call and run near the fp16 tensor limit, so the saturated numbers are within about
+1.4x of what the card can do with these FLOPs; the levers are fewer FLOPs (prefix reuse: 3.4x on `shared_t4k_q8`) and, for one long
+request, the chunked DeltaNet.

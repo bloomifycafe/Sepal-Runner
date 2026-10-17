@@ -60,7 +60,9 @@ double pct(std::vector<double> v, double q) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on", dump_path, compare_path;
+    std::string final_dir, base_dir, workload, profile = "gpu-f16", multiply = "auto", out_path, label, prefix = "on", dump_path, compare_path, int8_groups;
+    bool int8_act = true;
+    std::string deltanet = "auto";
     bool profile_phases = false;
     std::size_t call_tokens = 0;
     std::size_t batch = 1, reps = 3, warmup = 1;
@@ -74,6 +76,9 @@ int main(int argc, char** argv) {
         else if (a == "--reps") reps = std::stoull(v);
         else if (a == "--warmup") warmup = std::stoull(v);
         else if (a == "--multiply") multiply = v;
+        else if (a == "--int8") int8_groups = v;
+        else if (a == "--deltanet") deltanet = v;
+        else if (a == "--int8-act") int8_act = v == "on";
         else if (a == "--prefix-cache") prefix = v;
         else if (a == "--out") out_path = v;
         else if (a == "--dump") dump_path = v;
@@ -94,6 +99,13 @@ int main(int argc, char** argv) {
         if (multiply == "cublas") options.multiply_path = cuda::MultiplyPath::Cublas;
         else if (multiply == "invariant") options.multiply_path = cuda::MultiplyPath::Invariant;
         options.prefix_cache = prefix == "on";
+        options.int8.gate_up = int8_groups.find("gate_up") != std::string::npos;
+        options.int8.down = int8_groups.find("down") != std::string::npos;
+        options.int8.mixer_in = int8_groups.find("mixer_in") != std::string::npos;
+        options.int8.mixer_out = int8_groups.find("mixer_out") != std::string::npos;
+        options.int8.int8_activations = int8_act;
+        if (deltanet == "scan") options.deltanet = cuda::DeltaNetMode::Scan;
+        else if (deltanet == "chunked") options.deltanet = cuda::DeltaNetMode::Chunked;
         if (call_tokens != 0) options.max_call_tokens = call_tokens;
         cuda::GpuDecisionEngine engine(model, options);
         if (profile_phases) engine.trunk().set_profiling(true);

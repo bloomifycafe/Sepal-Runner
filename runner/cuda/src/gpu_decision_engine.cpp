@@ -82,7 +82,10 @@ struct GpuDecisionEngine::Impl {
     std::uint64_t clock = 0;
 
     Impl(const TrainedModel& m, const GpuDecisionOptions& o) : model(m), options(o) {
-        if (o.profile != "gpu-f16" && o.profile != "gpu-f32") throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16 or gpu-f32)");
+        const bool strict = o.profile == "gpu-f16-strict" || o.profile == "gpu-f32-strict";
+        const bool f16 = o.profile == "gpu-f16" || o.profile == "gpu-f16-strict";
+        if (!f16 && o.profile != "gpu-f32" && o.profile != "gpu-f32-strict")
+            throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16, gpu-f32, gpu-f16-strict or gpu-f32-strict)");
         if (options.max_call_tokens == 0) {
             std::size_t free_bytes = 0, total = 0;
             check(cudaSetDevice(o.device), "cudaSetDevice");
@@ -90,19 +93,22 @@ struct GpuDecisionEngine::Impl {
             const std::size_t gib = std::size_t{1} << 30;
             options.max_call_tokens = free_bytes >= 20 * gib ? 65536 : free_bytes >= 10 * gib ? 32768 : 16384;
         }
-        options.head.call_tokens = std::max(options.head.call_tokens, options.max_call_tokens); // one trunk call goes into the head whole
+        options.head.call_tokens = std::max(options.head.call_tokens, options.max_call_tokens);
+        options.head.memory_tokens = std::max(options.head.memory_tokens, options.max_call_tokens); // one trunk call goes into the head whole
         vocab = model.config().vocab_size;
         check(cudaSetDevice(o.device), "cudaSetDevice");
         EngineOptions eo;
         eo.device = o.device;
-        eo.precision = o.profile == "gpu-f16" ? Precision::F16 : Precision::F32;
+        eo.precision = f16 ? Precision::F16 : Precision::F32;
         eo.prune_last_layer = false; // the head reads every position
         eo.max_call_tokens = options.max_call_tokens;
         eo.max_call_rows = o.max_call_rows;
         eo.multiply_path = o.multiply_path;
         eo.fp16_accumulate = o.fp16_accumulate;
         eo.half_state = o.half_state;
-        eo.gemm_rows = o.gemm_rows;
+        eo.gemm_rows = strict && o.gemm_rows == 0 ? 128 : o.gemm_rows;
+        eo.int8_multiply = o.int8;
+        eo.deltanet = strict ? DeltaNetMode::Scan : o.deltanet;
         const std::size_t head_bytes = clef_head_device_bytes(model.head_config(), options.head);
         if (o.trunk_budget_bytes != 0) {
             eo.memory_budget_bytes = o.trunk_budget_bytes;

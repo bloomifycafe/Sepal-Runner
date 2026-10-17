@@ -31,6 +31,7 @@ std::string call_name(const char* expression) {
 
 void check_cuda(cudaError_t status, const char* expression, const std::string& context = {}) {
     if (status == cudaSuccess) return;
+    (void)cudaGetLastError(); // the error is reported by the exception: do not leave it for the next call's check
     throw CudaError(call_name(expression), static_cast<long long>(status), cudaGetErrorString(status), context);
 }
 

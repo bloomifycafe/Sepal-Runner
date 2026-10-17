@@ -151,7 +151,7 @@ set_tests_properties(cuda_parity_real PROPERTIES TIMEOUT 900)
 set_source_files_properties(src/kernels_deltanet.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
 # A library of its own, so that the kernels build and test without the cuBLAS provider.
-add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu)
+add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu src/kernels_deltanet_chunked.cu)
 target_include_directories(sepal_cuda_deltanet_kernels PUBLIC src)
 target_include_directories(sepal_cuda_deltanet_kernels SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_deltanet_kernels PRIVATE sepal_cuda_flags)
@@ -314,3 +314,29 @@ set_target_properties(sepal_runner_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden 
 add_executable(sepal-gpu-bench tools/gpu_bench.cpp)
 target_include_directories(sepal-gpu-bench SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal-gpu-bench PRIVATE sepal_cuda_gpu_decision sepal_core sepal_cuda_flags)
+
+add_executable(sepal-cuda-chunk-check tools/chunk_check.cpp)
+target_link_libraries(sepal-cuda-chunk-check PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
+
+# The chunked DeltaNet kernels against the scan kernel (random data, rows of 7 to 4096 tokens; exit status 1 when a difference is over 5% of the rms).
+add_test(NAME cuda_deltanet_chunked_float COMMAND sepal-cuda-chunk-check)
+add_test(NAME cuda_deltanet_chunked_half_input COMMAND sepal-cuda-chunk-check --input half --lengths 1000,64,130,3000,1,2,3 --seed 5)
+add_test(NAME cuda_deltanet_chunked_half_state COMMAND sepal-cuda-chunk-check --input half --half-state on --lengths 700,64,257 --seed 7)
+add_test(NAME cuda_deltanet_chunked_no_state COMMAND sepal-cuda-chunk-check --state off --lengths 512,65,64,129 --seed 9)
+foreach(t float half_input half_state no_state)
+  set_tests_properties(cuda_deltanet_chunked_${t} PROPERTIES TIMEOUT 600
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
+
+# The trained model against the golden set, with the gates of docs/RUNNER.md 14. Skipped (exit 77) unless SEPAL_TRAINED_FINAL,
+# SEPAL_TRAINED_BASE and SEPAL_GOLDEN_DIR are set (the golden set: runs/runner-golden/full08b).
+add_test(NAME cuda_golden_gpu_f32 COMMAND sepal-gpu-parity --profile gpu-f32 --max-tokens 20000 --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f16_scan COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet scan --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f16_chunked COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet chunked --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f16_batch20 COMMAND sepal-gpu-parity --profile gpu-f16 --batch 20 --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f16_strict COMMAND sepal-gpu-parity --profile gpu-f16-strict --max-tokens 20000 --skip-without-env on)
+add_test(NAME cuda_golden_gpu_f32_strict COMMAND sepal-gpu-parity --profile gpu-f32-strict --max-tokens 20000 --skip-without-env on)
+foreach(t gpu_f32 gpu_f16_scan gpu_f16_chunked gpu_f16_batch20 gpu_f16_strict gpu_f32_strict)
+  set_tests_properties(cuda_golden_${t} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()

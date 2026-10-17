@@ -168,6 +168,17 @@ enum class MultiplyPath {
     Auto,
 };
 
+/// How the Gated DeltaNet layers run. The scan kernel (src/kernels_deltanet.cu) is the token-serial recurrence: bit-exact, one block per
+/// (row, head), so a single long row uses 16 blocks of the card and takes the same time on any card. The chunked kernels
+/// (src/kernels_deltanet_chunked.cu) cut a row into chunks of 64 tokens and use the tensor cores: a long row gets several times faster on a big
+/// card, but they cost more per token than the scan when the card is already full of rows, and their numbers are not bit-exact (binary16
+/// operands, float32 accumulation; a row continued from a snapshot is not the uncut row bit for bit). Float16 path, natural mode only.
+enum class DeltaNetMode {
+    Scan,    ///< always the scan kernel
+    Auto,    ///< per wave of a call: the chunked kernels when a cost model says they are quicker, else the scan
+    Chunked, ///< the chunked kernels for every wave they take (tests, measurements)
+};
+
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
@@ -187,6 +198,8 @@ struct EngineOptions {
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;
+    /// Float16 path, natural mode (gemm_rows 0) only; strict mode and the float32 path always scan. See DeltaNetMode.
+    DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Float16 path only: keep the per-channel statistics of the activations of the four multiply groups while calls run
     /// (CudaEngine::activation_stats). Calibration for Int8Smoothing; slows a call down. Off by default.
     bool collect_activation_stats = false;

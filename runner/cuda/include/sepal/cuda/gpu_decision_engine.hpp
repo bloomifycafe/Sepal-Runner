@@ -22,7 +22,11 @@
 namespace sepal::cuda {
 
 struct GpuDecisionOptions {
-    std::string profile = "gpu-f16"; // or "gpu-f32"
+    /// "gpu-f16", "gpu-f32" (fast mode: the default; a request's answer may differ in the last bits with the requests it shares a call with)
+    /// or "gpu-f16-strict", "gpu-f32-strict" (strict mode: the trunk's answer for a request is bit-identical alone, among other requests and in
+    /// any place of a batch; the scan kernel for DeltaNet, the engine's batch-invariant multiplies, gemm_rows 128). The profile id of every
+    /// answer is this string, so a result says which mode made it.
+    std::string profile = "gpu-f16";
     int device = 0;
     /// The longest request. The trunk's call buffers are sized for max_call_tokens, not for this: a longer request is cut.
     std::uint64_t max_tokens = 32768;
@@ -38,6 +42,10 @@ struct GpuDecisionOptions {
     Fp16Accumulate fp16_accumulate;
     bool half_state = false;
     std::size_t gemm_rows = 0;
+    /// int8 weights for chosen multiply groups of the gpu-f16 trunk (off by default; see the int8 section of README.md).
+    Int8Multiply int8;
+    /// The Gated DeltaNet layers: scan kernel, chunked tensor-core kernels, or a per-wave choice (see DeltaNetMode). gpu-f16 only.
+    DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Prefix reuse (RUNNER.md section 7): a snapshot of the trunk plus the head's memory rows at a cut before the first question
     /// span. The cut is the last occurrence of `schema_marker` (token ids; empty: the longest common prefix with a recent request).
     bool prefix_cache = false;
