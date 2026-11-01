@@ -207,45 +207,72 @@ void TrainedModel::embedding_row(std::uint32_t token, float* out) const {
     convert_floating(row, out);
 }
 
+namespace {
+
+// One tensor of the base converted to T, with its LoRA delta added when the adapter has one.
+template <class T, class Impl>
+BasicTensor<T> merge_tensor(const Impl& m, const std::string& name, const RawTensor& raw) {
+    BasicTensor<T> w(raw.shape);
+    convert_floating(*raw.source, w.data());
+    const auto it = m.pairs.find(name);
+    if (it != m.pairs.end()) {
+        const std::size_t out = raw.shape[0], in = raw.shape[1], r = m.lora.rank;
+        std::vector<double> a(r * in);
+        {
+            std::vector<float> tmp(r * in);
+            convert_floating(*it->second.a, tmp.data());
+            for (std::size_t i = 0; i < tmp.size(); ++i) a[i] = static_cast<double>(tmp[i]);
+        }
+        std::vector<float> b(out * r);
+        convert_floating(*it->second.b, b.data());
+        const T scale = static_cast<T>(m.lora.scale());
+        T* weights = w.data();
+        // W' = W + (alpha / r) * (B @ A); the product of each element is accumulated in double, rows in parallel.
+        parallel_for(out, [&](std::size_t o) {
+            std::vector<double> acc(in, 0.0);
+            for (std::size_t k = 0; k < r; ++k) {
+                const double bk = static_cast<double>(b[o * r + k]);
+                const double* ak = a.data() + k * in;
+                for (std::size_t i = 0; i < in; ++i) acc[i] += bk * ak[i];
+            }
+            T* row = weights + o * in;
+            for (std::size_t i = 0; i < in; ++i) row[i] = row[i] + scale * static_cast<T>(acc[i]);
+        }, 16);
+    }
+    return w;
+}
+
+} // namespace
+
 template <class T>
 Weights<T> TrainedModel::merged_weights() const {
     const Impl& m = *impl_;
     typename Weights<T>::Map tensors;
-    for (const auto& [name, raw] : m.base.raw()) {
-        BasicTensor<T> w(raw.shape);
-        convert_floating(*raw.source, w.data());
-        const auto it = m.pairs.find(name);
-        if (it != m.pairs.end()) {
-            const std::size_t out = raw.shape[0], in = raw.shape[1], r = m.lora.rank;
-            std::vector<double> a(r * in);
-            {
-                std::vector<float> tmp(r * in);
-                convert_floating(*it->second.a, tmp.data());
-                for (std::size_t i = 0; i < tmp.size(); ++i) a[i] = static_cast<double>(tmp[i]);
-            }
-            std::vector<float> b(out * r);
-            convert_floating(*it->second.b, b.data());
-            const T scale = static_cast<T>(m.lora.scale());
-            T* weights = w.data();
-            // W' = W + (alpha / r) * (B @ A); the product of each element is accumulated in double, rows in parallel.
-            parallel_for(out, [&](std::size_t o) {
-                std::vector<double> acc(in, 0.0);
-                for (std::size_t k = 0; k < r; ++k) {
-                    const double bk = static_cast<double>(b[o * r + k]);
-                    const double* ak = a.data() + k * in;
-                    for (std::size_t i = 0; i < in; ++i) acc[i] += bk * ak[i];
-                }
-                T* row = weights + o * in;
-                for (std::size_t i = 0; i < in; ++i) row[i] = row[i] + scale * static_cast<T>(acc[i]);
-            }, 16);
-        }
-        tensors.emplace(name, std::move(w));
-    }
+    for (const auto& [name, raw] : m.base.raw()) tensors.emplace(name, merge_tensor<T>(m, name, raw));
     for (const auto& [name, shape] : head_shapes(m.base.config())) tensors.emplace(name, BasicTensor<T>(shape));
     return Weights<T>::adopt(m.base.config(), std::move(tensors));
 }
 
+template <class T>
+BasicTensor<T> TrainedModel::merged_tensor(const std::string& name) const {
+    const Impl& m = *impl_;
+    return merge_tensor<T>(m, name, m.base.raw_tensor(name));
+}
+
+template <class T>
+Weights<T> TrainedModel::merged_scope(const std::string& prefix) const {
+    const Impl& m = *impl_;
+    const std::string head = prefix + ".";
+    typename Weights<T>::Map tensors;
+    for (const auto& [name, raw] : m.base.raw())
+        if (name.compare(0, head.size(), head) == 0) tensors.emplace(name, merge_tensor<T>(m, name, raw));
+    return Weights<T>::partial(std::move(tensors)).scope(prefix);
+}
+
 template Weights<float> TrainedModel::merged_weights<float>() const;
 template Weights<double> TrainedModel::merged_weights<double>() const;
+template BasicTensor<float> TrainedModel::merged_tensor<float>(const std::string&) const;
+template Weights<float> TrainedModel::merged_scope<float>(const std::string&) const;
+template Weights<double> TrainedModel::merged_scope<double>(const std::string&) const;
 
 } // namespace sepal

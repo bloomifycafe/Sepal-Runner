@@ -51,6 +51,17 @@ public:
     template <class T>
     Weights<T> merged_weights() const;
 
+    /// One tensor by engine name, merged like `merged_weights` (the base tensor alone when the adapter has none for it).
+    /// Throws std::out_of_range for a name the base does not have.
+    template <class T>
+    BasicTensor<T> merged_tensor(const std::string& name) const;
+
+    /// Only the tensors whose engine name starts with `prefix + "."` (for example "layers.3" or "norm"), merged the same way and
+    /// addressed relative to the prefix, without the geometry check. The CPU engine uses it to merge and pack one layer at a time,
+    /// so the whole model is never held in float32 (at 4B that is 17 GB; one layer is under 0.4 GB).
+    template <class T>
+    Weights<T> merged_scope(const std::string& prefix) const;
+
     /// Row `token` of the (tied, unadapted) output embedding, float32, hidden_size values: the head's lexical vectors.
     void embedding_row(std::uint32_t token, float* out) const;
 

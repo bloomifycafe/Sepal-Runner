@@ -31,11 +31,9 @@ public:
         t.delta_chunk = options.delta_chunk;
         t.force_isa = options.force_isa;
         t.isa = options.isa;
-        {
-            const Weights<float> merged = model_.merged_weights<float>();
-            trunk_ = std::make_unique<CpuTrunk>(
-                model_.config(), merged, [this](std::uint32_t token, float* out) { model_.embedding_row(token, out); }, t);
-        }
+        trunk_ = std::make_unique<CpuTrunk>(
+            model_.config(), [this](const std::string& scope) { return model_.merged_scope<float>(scope); },
+            [this](std::uint32_t token, float* out) { model_.embedding_row(token, out); }, t);
         head_ = std::make_unique<CpuClefHead>(model_.head(), trunk_->pool(), trunk_->isa());
     }
 

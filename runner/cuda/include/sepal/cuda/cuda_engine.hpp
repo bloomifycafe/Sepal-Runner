@@ -354,6 +354,12 @@ public:
     explicit CudaEngine(const LoadedModel& model, const EngineOptions& options = {});
     /// Uploads weights that are in host memory (a geometry without a checkpoint, for example random weights).
     CudaEngine(const ModelConfig& config, const Weights<float>& weights, const EngineOptions& options = {});
+
+    /// The same, asking `fetch` for one tensor at a time by engine name. The reference it returns need only stay valid until the next
+    /// few calls (the engine uploads a tensor and moves on), so the caller may merge and drop tensors as it goes instead of holding
+    /// the whole model in float32.
+    using TensorFetch = std::function<const BasicTensor<float>&(const std::string&)>;
+    CudaEngine(const ModelConfig& config, const TensorFetch& fetch, const EngineOptions& options = {});
     ~CudaEngine();
     CudaEngine(const CudaEngine&) = delete;
     CudaEngine& operator=(const CudaEngine&) = delete;

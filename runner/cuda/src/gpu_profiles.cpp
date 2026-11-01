@@ -25,6 +25,10 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
             else throw std::invalid_argument("deltanet must be scan, auto or chunked");
         }
     }
+    if (g.profile == "gpu-q8w") { // int8 weights, binary16 activations, all four multiply groups (README.md, "int8 multiplies")
+        g.int8.gate_up = g.int8.down = g.int8.mixer_in = g.int8.mixer_out = true;
+        g.int8.int8_activations = false;
+    }
     TrainedModel model = TrainedModel::open(o.final_dir, o.base_dir);
     return std::make_unique<cuda::GpuDecisionEngine>(model, g);
 }
@@ -34,6 +38,7 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
 void register_backend_profiles() {
     const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries", "deltanet"};
     register_profile({"gpu-f16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16"); }});
+    register_profile({"gpu-q8w", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-q8w"); }});
     register_profile({"gpu-f16-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16-strict"); }});
     register_profile({"gpu-f32-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32-strict"); }});
     register_profile({"gpu-f32", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32"); }});

@@ -123,6 +123,24 @@ SEPAL_TEST(trained, merge_matches_numpy) {
     }
 }
 
+SEPAL_TEST(trained, streamed_merge_equals_whole_merge) {
+    // merged_tensor and merged_scope (what the engines use to avoid holding the whole model in float32) give the same bits as merged_weights.
+    const TrainedModel m = TrainedModel::open(tiny_final(), tiny_base());
+    const Weights<float> whole = m.merged_weights<float>();
+    const auto same = [](const BasicTensor<float>& a, const BasicTensor<float>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (a[i] != b[i]) return false;
+        return true;
+    };
+    for (const char* name : {"embed_tokens.weight", "norm.weight", "layers.0.mlp.up_proj.weight", "layers.3.self_attn.k_proj.weight"})
+        CHECK(same(m.merged_tensor<float>(name), whole[name]));
+    const Weights<float> layer = m.merged_scope<float>("layers.0");
+    for (const char* name : {"mlp.up_proj.weight", "mlp.down_proj.weight", "input_layernorm.weight"})
+        CHECK(same(layer[name], whole.scope("layers.0")[name]));
+    CHECK_EQ(m.merged_scope<float>("norm")["weight"].size(), whole["norm.weight"].size());
+}
+
 SEPAL_TEST(trained, embedding_row_is_the_base_row) {
     const TrainedModel m = TrainedModel::open(tiny_final(), tiny_base());
     const Weights<float> base = m.base().weights<float>();

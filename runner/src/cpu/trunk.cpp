@@ -163,7 +163,7 @@ struct CpuTrunk::Impl {
         return WeightKind::F32;
     }
 
-    void build(const Weights<float>& w);
+    void build(const WeightSource& source);
     void run_step(std::span<const std::span<const std::uint32_t>> requests, std::vector<RequestState>& states,
                   const std::vector<Segment>& segs, std::size_t rows, std::vector<std::vector<float>>& hidden,
                   const LayerObserver* observer);
@@ -175,7 +175,7 @@ struct CpuTrunk::Impl {
     std::uint64_t state_bytes(std::size_t tokens) const;
 };
 
-void CpuTrunk::Impl::build(const Weights<float>& w) {
+void CpuTrunk::Impl::build(const WeightSource& source) {
     require_valid(cfg);
     H = dimension(cfg.hidden_size);
     I = dimension(cfg.intermediate_size);
@@ -209,7 +209,7 @@ void CpuTrunk::Impl::build(const Weights<float>& w) {
     for (std::size_t i = 0; i < layers.size(); ++i) {
         Layer& L = layers[i];
         L.attention = cfg.is_full_attention(i);
-        const Weights<float> lw = w.scope("layers." + std::to_string(i));
+        const Weights<float> lw = source("layers." + std::to_string(i));
         L.input_norm1 = one_plus(lw["input_layernorm.weight"]);
         L.post_norm1 = one_plus(lw["post_attention_layernorm.weight"]);
         const Weights<float> mlp_w = lw.scope("mlp");
@@ -244,7 +244,7 @@ void CpuTrunk::Impl::build(const Weights<float>& w) {
             ++n_dn;
         }
     }
-    final_norm1 = one_plus(w["norm.weight"]);
+    final_norm1 = one_plus(source("norm")["weight"]);
 
     const std::size_t S = opt.step_tokens;
     x.resize(S * H);
@@ -492,7 +492,12 @@ void CpuTrunk::Impl::run_step(std::span<const std::span<const std::uint32_t>> re
 
 CpuTrunk::CpuTrunk(const ModelConfig& config, const Weights<float>& weights, EmbeddingFn embed, const TrunkOptions& options)
     : impl_(std::make_unique<Impl>(config, options, std::move(embed))) {
-    impl_->build(weights);
+    impl_->build([&weights](const std::string& scope) { return weights.scope(scope); });
+}
+
+CpuTrunk::CpuTrunk(const ModelConfig& config, const WeightSource& source, EmbeddingFn embed, const TrunkOptions& options)
+    : impl_(std::make_unique<Impl>(config, options, std::move(embed))) {
+    impl_->build(source);
 }
 
 CpuTrunk::~CpuTrunk() = default;

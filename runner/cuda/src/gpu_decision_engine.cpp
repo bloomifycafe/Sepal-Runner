@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <list>
 #include <numeric>
 #include <unordered_set>
 
@@ -83,9 +84,9 @@ struct GpuDecisionEngine::Impl {
 
     Impl(const TrainedModel& m, const GpuDecisionOptions& o) : model(m), options(o) {
         const bool strict = o.profile == "gpu-f16-strict" || o.profile == "gpu-f32-strict";
-        const bool f16 = o.profile == "gpu-f16" || o.profile == "gpu-f16-strict";
+        const bool f16 = o.profile == "gpu-f16" || o.profile == "gpu-f16-strict" || o.profile == "gpu-q8w";
         if (!f16 && o.profile != "gpu-f32" && o.profile != "gpu-f32-strict")
-            throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16, gpu-f32, gpu-f16-strict or gpu-f32-strict)");
+            throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16, gpu-q8w, gpu-f32, gpu-f16-strict or gpu-f32-strict)");
         if (options.max_call_tokens == 0) {
             std::size_t free_bytes = 0, total = 0;
             check(cudaSetDevice(o.device), "cudaSetDevice");
@@ -120,8 +121,17 @@ struct GpuDecisionEngine::Impl {
             eo.memory_budget_bytes = usable - head_bytes;
         }
         {
-            Weights<float> merged = model.merged_weights<float>();
-            trunk = std::make_unique<CudaEngine>(model.config(), merged, eo);
+            // One tensor at a time: merge it, hand it to the engine, keep the last few so a tensor asked for twice is not merged twice.
+            // The whole model in float32 would be 17 GB of host memory at 4B.
+            std::list<std::pair<std::string, BasicTensor<float>>> merged_cache;
+            const CudaEngine::TensorFetch fetch = [&](const std::string& name) -> const BasicTensor<float>& {
+                for (const auto& entry : merged_cache)
+                    if (entry.first == name) return entry.second;
+                merged_cache.emplace_back(name, model.merged_tensor<float>(name));
+                if (merged_cache.size() > 6) merged_cache.pop_front();
+                return merged_cache.back().second;
+            };
+            trunk = std::make_unique<CudaEngine>(model.config(), fetch, eo);
         }
         head = std::make_unique<CudaClefHead>(model.head(), options.head, trunk->stream_handle());
     }
@@ -283,6 +293,13 @@ std::vector<RequestLogits> GpuDecisionEngine::Impl::run_group(std::span<const En
         trunk_tokens += row_at;
         for (std::size_t k = 0; k < call.size(); ++k)
             if (keep[call[k]]) pending[call[k]] = std::move(results[k].snapshot);
+        // A snapshot the next segment of a request continued is spent unless it becomes a cache entry: give its state slot back now,
+        // so a long request cut into small calls (a small card, a small max_call_tokens) holds two slots at a time, not one per segment.
+        for (const std::size_t si : call) {
+            const RequestPlan& p = plans[segs[si].request];
+            const std::size_t pos = static_cast<std::size_t>(std::find(p.segments.begin(), p.segments.end(), si) - p.segments.begin());
+            if (pos > 0 && !segs[p.segments[pos - 1]].cache_cut) pending[p.segments[pos - 1]] = DeviceSnapshot();
+        }
     }
 
     // new cache entries: the head's memory rows of the prefix are copied out before the next batch overwrites the arena

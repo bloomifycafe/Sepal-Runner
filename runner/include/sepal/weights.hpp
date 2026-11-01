@@ -70,6 +70,14 @@ public:
         return w;
     }
 
+    /// Takes a subset of the tensors without the geometry check: for a streaming consumer that asks for one part of the model at a
+    /// time (the CPU trunk packs one layer, then drops its float32 copy). A name that is not there fails on access.
+    static Weights partial(Map tensors) {
+        Weights w;
+        w.tensors_ = std::make_shared<const Map>(std::move(tensors));
+        return w;
+    }
+
     /// The loader interface: any mapping of name to array (a checkpoint, a test fixture) becomes the model's
     /// weights in element type T, each value converted once.
     template <class U>

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### 2026-11-01: 4B on small machines
+
+Measured on the owner's PC (Ryzen 5 7600X 6 cores / 12 threads, 64 GB, RTX 3060 12 GB, Windows 11, MSVC 19.44, CUDA 13.1 from the pinned wheels) with
+Sepal-4B (F15-s0, LoRA r64 + Clef head on Qwen3.5-4B 851bf6e). Limits are simulated with CPU affinity and a Job Object memory cap; memory speed and
+clocks are those of this faster PC. Results: Sepal `runs/box-results/full15-4b/runner/`.
+
+- Loading no longer holds the whole model in float32. `TrainedModel::merged_scope` / `merged_tensor` merge the LoRA one layer (CPU) or one tensor
+  (GPU) at a time; `CpuTrunk` and `CudaEngine` take a fetch callback beside the old whole-model constructors (which are unchanged). Peak committed
+  memory at load, cpu-bf16 4B: 23.2 GiB -> 7.8 GiB (a 16 GB machine could not load it before); gpu 4B: 25.7 GiB -> 11.8 GiB. Same weights, same speed.
+- New profile `gpu-q8w` (int8 weights, binary16 activations, all four multiply groups; the engine option was there, the profile was not). 4B weights
+  4.6 GiB on the device against 8.0 GiB for `gpu-f16`.
+- The GPU engine gives a spent chain snapshot's state slot back as soon as the next segment has consumed it, so a long request cut into small calls
+  no longer needs one slot per segment. Measured: gpu-f16 on a 12 GB card with `max_call_tokens` 2048 stopped on the first long TOOL request with "0 of 8 state slots free"; after the change the 150-record TOOL sample scores to the end.
+- Test `trained.streamed_merge_equals_whole_merge` (bit-equal to the whole merge).
+
 ### 2026-10-17: split from Sepal
 
 - The runner left the Sepal repository (main at f846e8d) with the git history of its files: `runner/` (C++ engine, CPU and CUDA), the Python

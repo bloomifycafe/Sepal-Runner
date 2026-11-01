@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "sepal/config.hpp"
@@ -64,6 +65,11 @@ public:
     /// Packs the body of `weights` (every tensor except the embedding and the pointer head) for the profile. The
     /// head dimensions must be multiples of 8 (attention head_dim a multiple of 32) and the hidden size a multiple of 8.
     CpuTrunk(const ModelConfig& config, const Weights<float>& weights, EmbeddingFn embed, const TrunkOptions& options);
+
+    /// The same, asking `source` for one part at a time ("layers.3", then "norm"; each answer addressed relative to the scope). Each part is
+    /// packed and then released, so peak host memory is the packed weights plus one layer in float32, not the whole model in float32.
+    using WeightSource = std::function<Weights<float>(const std::string&)>;
+    CpuTrunk(const ModelConfig& config, const WeightSource& source, EmbeddingFn embed, const TrunkOptions& options);
     ~CpuTrunk();
     CpuTrunk(const CpuTrunk&) = delete;
     CpuTrunk& operator=(const CpuTrunk&) = delete;
