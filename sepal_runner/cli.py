@@ -4,8 +4,8 @@
     sepal serve E:\\models\\Sepal-4B                    # a local checkpoint directory (the one holding sepal.json)
     sepal serve BlossomsAI/Sepal-0.8B --dry-run      # print the plan and exit
 
-Profiles chosen automatically: `gpu-f16` on a CUDA card with 12 GB and up when the plan fits, otherwise `cpu-bf16`. `gpu-q8w` (int8 weights)
-fails the q8 parity gate on this model, so it is used only with `--allow-q8w`, with a printed warning. `cpu-q8` is never chosen.
+Profiles chosen automatically: `gpu-f16` on a CUDA card with 12 GB and up when the plan fits, otherwise `cpu-bf16`. `gpu-q8w` and `cpu-q8`
+(int8) exceed the q8 parity gate on this model (max |dp| on near-tie questions), so they are used only with `--allow-q8`, with a printed warning.
 A model that fits neither is refused with the numbers and what would fit, before any weights are loaded.
 
 Only public downloads, without login, unless $HF_TOKEN is set (the Sepal repositories are gated: accept the terms on the Hub first).
@@ -142,6 +142,12 @@ def model_shape(base: Path) -> Shape:
     return Shape(trunk, hidden, kv, int(50.3 * MIB * hidden / 2560))
 
 
+def cpu_need_q8(shape: Shape, window: int) -> int:
+    """Committed bytes of cpu-q8 (int8 weights with block scales; measured 5.7 GiB for 4B)."""
+    scale = shape.trunk_bytes / 7.14e9
+    return int(0.82 * shape.trunk_bytes + 0.9 * GIB + 0.8 * GIB * (window / 24576) * (scale + 0.3))
+
+
 def cpu_need(shape: Shape, window: int) -> int:
     """Committed bytes of cpu-bf16: packed bf16 weights, thread workspace, per-request state and K/V (fit: 4B 8.2 GiB short, 9.7 at 24k; 0.8B 2.0 and 2.4)."""
     scale = shape.trunk_bytes / (7.14e9)
@@ -273,10 +279,10 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     if choice in ("gpu-f16", "gpu-q8w") and not wants_gpu:
         raise Refusal(f"{choice} needs a CUDA GPU with nvidia-smi and the sepal_runner_cuda library; this machine has: {hw.describe()}"
                       f"{'' if gpu_lib else ' (library not found)'}")
-    if choice == "cpu-q8":
-        raise Refusal("cpu-q8 fails the parity gate on this model (max |dp| 0.49 against 0.05 allowed) and is not served")
+    if choice == "cpu-q8" and not args.allow_q8w:
+        raise Refusal("cpu-q8 exceeds the q8 parity gate on this model (max |dp| 0.14 on 300 SEC-dev records against 0.05 allowed, near-tie questions); add --allow-q8 to serve it anyway")
     if choice == "gpu-q8w" and not args.allow_q8w:
-        raise Refusal("gpu-q8w fails the q8 parity gate on this model (max |dp| 0.12 to 0.14 against 0.05, 1.1% flips on LONG-LOG); add --allow-q8w to serve it anyway")
+        raise Refusal("gpu-q8w fails the q8 parity gate on this model (max |dp| 0.12 to 0.14 against 0.05, 1.1% flips on LONG-LOG); add --allow-q8 to serve it anyway")
     gpu_fail = ""
     if wants_gpu and choice in ("auto", "gpu-f16", "gpu-q8w"):
         tried = []
@@ -306,18 +312,29 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     if not cpu_lib:
         raise Refusal("no sepal_runner_cpu library found: build runner/ (see runner/README.md) or set $SEPAL_RUNNER_LIB_DIR / --lib")
     budget = hw.ram_free - 1 * GIB
-    for window in [w for w in WINDOWS if w <= model_window] or [model_window]:
-        need = cpu_need(shape, window)
-        if need <= budget:
-            if window < model_window:
-                notes.append(f"context limited to {window} tokens by free RAM (the model's window is {model_window}); longer requests get 422")
-            return Plan("cpu-bf16", cpu_lib, window, {"threads": hw.cores}, notes, f"about {need / GIB:.1f} GiB of RAM")
-        if window <= 4096:
-            break
+    cpu_profiles = ["cpu-q8"] if choice == "cpu-q8" else ["cpu-bf16"] + (["cpu-q8"] if (args.allow_q8w and choice == "auto") else [])
+    for cpu_profile in cpu_profiles:
+        needs = cpu_need_q8 if cpu_profile == "cpu-q8" else cpu_need
+        for window in [w for w in WINDOWS if w <= model_window] or [model_window]:
+            need = needs(shape, window)
+            if need <= budget:
+                if window < model_window:
+                    notes.append(f"context limited to {window} tokens by free RAM (the model's window is {model_window}); longer requests get 422")
+                if cpu_profile == "cpu-q8":
+                    notes.append("WARNING: cpu-q8 serves int8 weights and activations; on this model it exceeds the documented q8 gate (max |dp| 0.14 on 300 SEC-dev "
+                                 "records, p99 0.034, 1 flip in 432). Answers near 0.5 can move by 0.1. It is about 1.5x faster than cpu-bf16 and needs 5.7 GiB for 4B.")
+                options = {"threads": hw.cores}
+                spare_mib = int((budget - need) * 0.4) // MIB
+                if spare_mib >= 512:       # states of shared log prefixes: the same log asked with other questions only runs its tail
+                    options["prefix_cache_mib"] = min(2048, spare_mib)
+                return Plan(cpu_profile, cpu_lib, window, options, notes, f"about {need / GIB:.1f} GiB of RAM")
+            if window <= 4096:
+                break
     need = cpu_need(shape, 4096)
     small = ""
     if shape.trunk_bytes > 2e9:
-        small = f" The smaller Sepal-0.8B needs about {cpu_need(Shape(int(1.0e9), 1024, 12288, 20 * MIB), 8192) / GIB:.1f} GiB."
+        small = f" With --allow-q8 the int8 profile needs about {cpu_need_q8(shape, 4096) / GIB:.1f} GiB." if not args.allow_q8w else ""
+        small += f" The smaller Sepal-0.8B needs about {cpu_need(Shape(int(1.0e9), 1024, 12288, 20 * MIB), 8192) / GIB:.1f} GiB."
     raise Refusal(f"this model does not fit on this machine: cpu-bf16 needs about {need / GIB:.1f} GiB of free RAM (4096-token window), "
                   f"{budget / GIB:.1f} GiB are available" + (f"; {gpu_fail}" if gpu_fail else "") + "." + small +
                   " What would fit: 16 GiB of RAM for 4B on CPU, or a 12 GB CUDA card for gpu-f16.")
@@ -373,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--api-key", default=os.environ.get("SEPAL_API_KEY"), help="required for a non-loopback --host")
     p.add_argument("--profile", default="auto", choices=["auto", "cpu-bf16", "gpu-f16", "gpu-q8w", "cpu-q8"])
-    p.add_argument("--allow-q8w", action="store_true", help="allow gpu-q8w (int8 weights; fails the parity gate on this model) when gpu-f16 does not fit")
+    p.add_argument("--allow-q8", "--allow-q8w", dest="allow_q8w", action="store_true",
+                   help="allow the int8 profiles (gpu-q8w, cpu-q8; they exceed the parity gate on this model) when the float profile does not fit")
     p.add_argument("--base", help="a local base model directory instead of fetching the pinned one")
     p.add_argument("--lib", help="path of the sepal_runner_* library")
     p.add_argument("--cache-dir", help="where downloads go (default ~/.cache/sepal-runner or $SEPAL_HOME)")

@@ -47,9 +47,16 @@ def test_q8w_needs_the_flag_and_prints_a_warning():
     assert plan.profile == "gpu-q8w" and any("WARNING" in n for n in plan.notes)
 
 
-def test_cpu_q8_is_never_served():
+def test_cpu_q8_needs_the_flag_and_fits_where_bf16_does_not():
     with pytest.raises(cli.Refusal):
         cli.make_plan(FOUR_B, hw(32), 24576, args(profile="cpu-q8"))
+    plan = cli.make_plan(FOUR_B, hw(9), 24576, args(allow_q8w=True))     # 8 GiB free: bf16 needs about 9 GiB, int8 about 6.5
+    assert plan.profile == "cpu-q8" and any("WARNING" in n for n in plan.notes)
+
+
+def test_cpu_plan_turns_on_the_prefix_cache_when_ram_is_spare():
+    assert cli.make_plan(FOUR_B, hw(32), 24576, args()).engine_options["prefix_cache_mib"] > 0
+    assert "prefix_cache_mib" not in cli.make_plan(SMALL, hw(3), 16384, args()).engine_options
 
 
 def test_model_that_does_not_fit_is_refused_with_what_would_fit():

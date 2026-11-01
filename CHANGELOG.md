@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### 2026-11-01: `sepal serve`, int8 blocks, CPU prefix states
+
+- `sepal serve MODEL` (`sepal_runner/cli.py`): fetch, hardware plan, serve; `/v1/models`, `/healthz`, `/readyz`; `examples/client.py`; `docker/Dockerfile.cpu`
+  (built and run here under Docker Desktop: the engine compiles with GCC on Linux, the container answers with an API key) and `docker/Dockerfile.cuda`
+  (written, not built or run).
+- cpu-q8 AVX-512 kernel: scales per block of 128 values for weights and activations, in a separate non-inlined block function (MSVC spilled otherwise).
+  4B, SEC-dev against the PyTorch reference: max |dp| 0.49 -> 0.14 over 300 records (p99 0.034, 1 flip of 432); TOOL (60 records) 0.017; LONG-LOG
+  (12 records) 0.23, 2 flips of 162. Still over the 0.05 gate, so opt-in. 1.55x the speed of cpu-bf16 at 4 and 6 cores; committed memory 5.7 GiB for 4B (bf16 8.2),
+  so 4B loads under an 8 GB cap.
+- CPU prefix states (`prefix_cache_mib`): a request that shares its leading tokens with an earlier one resumes from the state after them.
+  Same 4k log with 8 question sets, cpu-bf16, 6 threads: 27.5 s -> 6.9 s per request from the third on.
+
 ### 2026-11-01: 4B on small machines
 
 Measured on the owner's PC (Ryzen 5 7600X 6 cores / 12 threads, 64 GB, RTX 3060 12 GB, Windows 11, MSVC 19.44, CUDA 13.1 from the pinned wheels) with

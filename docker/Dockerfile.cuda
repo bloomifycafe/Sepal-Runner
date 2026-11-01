@@ -1,0 +1,20 @@
+# CUDA image: needs the NVIDIA container toolkit at run time (docker run --gpus all).
+#   docker build -f docker/Dockerfile.cuda -t sepal-runner:cuda .
+#   docker run --gpus all -p 8000:8000 -e SEPAL_API_KEY=change-me -v sepal-cache:/cache -e HF_TOKEN sepal-runner:cuda BlossomsAI/Sepal-4B
+# The CUDA toolkit comes from the pinned wheels (runner/cuda/toolchain-requirements.txt), as on Windows; cuBLAS ships with them.
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ cmake ninja-build ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY runner /src/runner
+RUN cmake -S /src/runner/cuda -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build /src/build --target sepal_runner_cuda
+
+FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY sepal_runner ./sepal_runner
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir ".[serve]"
+COPY --from=build /src/build/libsepal_runner_cuda.so /opt/sepal/lib/
+ENV PATH=/venv/bin:$PATH SEPAL_HOME=/cache SEPAL_RUNNER_LIB_DIR=/opt/sepal/lib
+VOLUME /cache
+EXPOSE 8000
+ENTRYPOINT ["sepal", "serve", "--host", "0.0.0.0", "--port", "8000"]

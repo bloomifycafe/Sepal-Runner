@@ -11,6 +11,44 @@ holds the benchmark. This repository serves it. The design document is [docs/RUN
 
 Licence: Apache-2.0 ([LICENSE](LICENSE), [NOTICE](NOTICE)). Status: engine and front end are built and tested; nothing here trains a model.
 
+## Quickstart
+
+```
+pip install -e ".[serve]"                 # numpy, tokenizers, huggingface_hub, psutil
+sepal serve BlossomsAI/Sepal-4B           # or a local checkpoint directory; add --dry-run to see the plan only
+python examples/client.py                 # one alert, two questions
+```
+
+`sepal serve` fetches the adapter and the pinned base on first use (Hub downloads are anonymous unless `HF_TOKEN` is set; the Sepal repositories are
+gated, so accept their terms on the Hub first, or point it at a directory you already have), looks at the CPU, RAM, GPU and free VRAM, and picks:
+
+- `gpu-f16` on a CUDA card with 12 GB and up, with `max_call_tokens`, `trunk_budget_mib`, `prefix_cache` and the context window computed from the free
+  VRAM; otherwise `cpu-bf16` with one thread per physical core and a prefix-state cache sized from the spare RAM.
+- `gpu-q8w` and `cpu-q8` (int8) only with `--allow-q8`, with a printed warning: on this model they exceed the q8 parity gate (see below).
+- A model that fits neither is refused before anything is loaded, with the numbers and what would fit.
+
+It prints the machine, profile, window and expected memory, then serves on `127.0.0.1:8000` (`--host` elsewhere needs `--api-key` or
+`$SEPAL_API_KEY`): `POST /v1/systemone` (the TypeSafe body unchanged), `POST /v1/systemone/batch`, `GET /v1/models`, `/healthz`, `/readyz`, `/metrics`.
+A request longer than the window gets `422 {"detail": "maximum context length is N tokens; the request needs more"}`.
+The runner libraries come from `runner/build/release` and `runner/cuda/build/release` (see Build), or `$SEPAL_RUNNER_LIB_DIR` / `--lib`.
+
+### What to expect (Sepal-4B)
+
+Measured on a Ryzen 5 7600X (6 cores / 12 threads) and an RTX 3060 12 GB with the limits below **simulated** (CPU affinity and a memory cap on a
+faster machine: memory speed and clocks are not those of a real cheap machine). Batch 1, one request per call. Short alert: about 900 tokens, 1 question.
+Long log: about 15.9k tokens, 32 questions. Source: `runs/box-results/full15-4b/runner/SUMMARY.md` in the Sepal repository.
+
+| Tier | Profile | Short alert p50 / p95 | Long log p50 | Committed memory |
+|---|---|---|---|---|
+| CPU 4 cores / 16 GB | cpu-bf16 | 8.3 / 8.6 s | 167 s | 8.2 GiB (9.3 on a long log) |
+| CPU 6 cores | cpu-bf16 | 5.7 / 6.1 s | 112 s | same |
+| CPU 2 cores / 8 GB | cpu-bf16 | does not load (needs 7.8 GiB) | | |
+| GPU 12 GB + 4 threads | gpu-f16 | 0.23 / 0.24 s (4.2 alerts/s at p95 <= 1 s) | 4.8 s | VRAM +11.1 GB |
+| GPU 8 GB | gpu-q8w (`--allow-q8`) | 0.36 s | not for states over about 7k tokens | VRAM +7.7 GB |
+
+Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass;
+`cpu-q8` and `gpu-q8w` fail the max |dp| gate on near-tie questions (0.12 to 0.14 against 0.05).
+
 ## What is in it
 
 | Path | What |
