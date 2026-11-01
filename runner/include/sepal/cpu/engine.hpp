@@ -22,6 +22,10 @@ struct CpuEngineOptions {
     std::size_t step_tokens = 4096;
     std::size_t delta_chunk = 64;            // 0: token-sequential DeltaNet
     std::size_t group_tokens = 65536;        // requests per trunk call are grouped up to this many tokens
+    std::size_t prefix_cache_mib = 0;        // host memory for prefix states (0: off). A request that shares its first tokens with an earlier one
+                                             // (the same log asked with other questions) resumes from the state after them
+    std::size_t prefix_min_tokens = 512;     // shortest shared prefix worth a state
+    std::size_t prefix_min_gain = 256;       // a new, longer state is only made when it adds at least this many tokens to the best hit
     bool force_isa = false;
     Isa isa = Isa::Avx2;
 };

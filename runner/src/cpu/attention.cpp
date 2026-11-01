@@ -34,6 +34,21 @@ KvCache::KvCache(std::size_t kv_heads, std::size_t head_dim, std::size_t capacit
     v_.zero();
 }
 
+void KvCache::copy_prefix_from(const KvCache& src, std::size_t tokens) {
+    if (src.kv_heads_ != kv_heads_ || src.head_dim_ != head_dim_ || src.nr_ != nr_) throw std::invalid_argument("KvCache::copy_prefix_from: different geometry");
+    if (tokens > capacity_ || tokens > src.capacity_) throw std::out_of_range("KvCache::copy_prefix_from: more tokens than the capacity");
+    for (std::size_t kvh = 0; kvh < kv_heads_; ++kvh) {
+        for (std::size_t t = 0; t < tokens; ++t) {
+            const float* ks = src.k_.data() + (kvh * (src.capacity_ / nr_) + t / nr_) * head_dim_ * nr_ + t % nr_;
+            float* kd = k_.data() + (kvh * (capacity_ / nr_) + t / nr_) * head_dim_ * nr_ + t % nr_;
+            for (std::size_t d = 0; d < head_dim_; ++d) kd[d * nr_] = ks[d * nr_];
+            for (std::size_t dp = 0; dp < head_dim_ / nr_; ++dp)
+                std::memcpy(v_.data() + (kvh * (head_dim_ / nr_) + dp) * capacity_ * nr_ + t * nr_,
+                            src.v_.data() + (kvh * (head_dim_ / nr_) + dp) * src.capacity_ * nr_ + t * nr_, nr_ * sizeof(float));
+        }
+    }
+}
+
 void KvCache::append(std::size_t pos, std::size_t kvh, const float* k, const float* v) {
     if (pos >= capacity_) throw std::out_of_range("KvCache::append: position beyond the capacity");
     float* kp = k_.data() + (kvh * (capacity_ / nr_) + pos / nr_) * head_dim_ * nr_ + pos % nr_;

@@ -92,6 +92,18 @@ struct RequestState {
     std::vector<std::unique_ptr<KvCache>> kv;     // per attention layer
 };
 
+}  // namespace
+
+std::uint64_t PrefixState::bytes() const {
+    std::uint64_t b = hidden.size() * 4ull;
+    for (const auto& s : dn_state) b += s.size() * 4ull;
+    for (const auto& s : conv_tail) b += s.size() * 4ull;
+    for (const auto& k : kv) b += k->bytes();
+    return b;
+}
+
+namespace {
+
 struct Segment {
     std::size_t request;
     std::size_t position;  // first position of the chunk
@@ -512,7 +524,7 @@ std::uint64_t CpuTrunk::weight_bytes() const { return impl_->weight_bytes; }
 const TrunkTimes& CpuTrunk::last_times() const { return impl_->times; }
 
 void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests, std::vector<std::vector<float>>& hidden,
-                       const LayerObserver* observer) {
+                       const LayerObserver* observer, const std::vector<Resume>* resume) {
     Impl& m = *impl_;
     for (const auto& r : requests) {
         if (r.empty()) throw std::invalid_argument("a request needs at least one token");
@@ -546,6 +558,18 @@ void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests,
                 rs.kv.push_back(std::make_unique<KvCache>(m.kv_heads, m.hd, requests[next_admit].size(), m.isa));
             }
             hidden[next_admit].assign(requests[next_admit].size() * m.H, 0.0f);
+            if (resume != nullptr && (*resume)[next_admit].from != nullptr) {
+                const PrefixState& from = *(*resume)[next_admit].from;
+                if (from.tokens >= requests[next_admit].size() || from.dn_state.size() != m.n_dn || from.kv.size() != m.n_attn)
+                    throw std::invalid_argument("forward: a prefix state does not fit its request");
+                for (std::size_t i = 0; i < m.n_dn; ++i) {
+                    std::memcpy(rs.dn_state[i].data(), from.dn_state[i].data(), from.dn_state[i].size() * sizeof(float));
+                    std::memcpy(rs.conv_tail[i].data(), from.conv_tail[i].data(), from.conv_tail[i].size() * sizeof(float));
+                }
+                for (std::size_t i = 0; i < m.n_attn; ++i) rs.kv[i]->copy_prefix_from(*from.kv[i], from.tokens);
+                std::memcpy(hidden[next_admit].data(), from.hidden.data(), from.hidden.size() * sizeof(float));
+                done[next_admit] = from.tokens;
+            }
             used += need;
             active.push_back(next_admit++);
         }
@@ -567,6 +591,14 @@ void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests,
             const std::size_t r = active[i];
             if (done[r] == requests[r].size()) {
                 used -= m.state_bytes(requests[r].size());
+                if (resume != nullptr && (*resume)[r].capture != nullptr) {
+                    PrefixState& out = *(*resume)[r].capture;
+                    out.tokens = requests[r].size();
+                    out.dn_state = std::move(states[r].dn_state);
+                    out.conv_tail = std::move(states[r].conv_tail);
+                    out.kv = std::move(states[r].kv);
+                    out.hidden = hidden[r];
+                }
                 states[r] = RequestState{};
                 active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
             } else {

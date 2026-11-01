@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "sepal/config.hpp"
+#include "sepal/cpu/aligned.hpp"
+#include "sepal/cpu/attention.hpp"
 #include "sepal/cpu/isa.hpp"
 #include "sepal/cpu/thread_pool.hpp"
 #include "sepal/weights.hpp"
@@ -59,6 +61,23 @@ struct TrunkTimes {
 /// Called after every layer for every segment of a step: (request, layer, first position, rows, x [rows, hidden]).
 using LayerObserver = std::function<void(std::size_t, std::size_t, std::size_t, std::size_t, const float*)>;
 
+/// The state of one request after its first `tokens` tokens: DeltaNet states, conv tails, K/V caches and the final-normed hidden state of every
+/// position so far. A request that starts with the same tokens resumes from it and only computes the rest.
+struct PrefixState {
+    std::size_t tokens = 0;
+    std::vector<AlignedBuffer<float>> dn_state, conv_tail;
+    std::vector<std::unique_ptr<KvCache>> kv;
+    std::vector<float> hidden;   // [tokens, hidden size]
+    std::uint64_t bytes() const;
+};
+
+/// Per request of a `forward` call: resume from `from` (the request's first `from->tokens` tokens must be the ones the state was made from),
+/// and/or leave the state after the request's last token in `capture`.
+struct Resume {
+    const PrefixState* from = nullptr;
+    PrefixState* capture = nullptr;
+};
+
 class CpuTrunk {
 public:
     /// Fills `out` with the embedding row of a token (hidden_size floats). Must be thread safe.
@@ -79,7 +98,7 @@ public:
     /// Runs the requests. `hidden[i]` is resized to [tokens_i, hidden_size] and filled with the final-normed hidden
     /// states. Throws std::invalid_argument for an empty request or a token outside the vocabulary.
     void forward(std::span<const std::span<const std::uint32_t>> requests, std::vector<std::vector<float>>& hidden,
-                 const LayerObserver* observer = nullptr);
+                 const LayerObserver* observer = nullptr, const std::vector<Resume>* resume = nullptr);
 
     const ModelConfig& config() const;
     const TrunkOptions& options() const;
