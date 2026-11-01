@@ -279,7 +279,7 @@ class RunnerService:
         self.scheduler.close()
 
 
-def make_handler(service: RunnerService, name: str, api_key: str | None = None):
+def make_handler(service: RunnerService, name: str, api_key: str | None = None, info: dict | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -301,10 +301,15 @@ def make_handler(service: RunnerService, name: str, api_key: str | None = None):
             return hmac.compare_digest(given.encode("utf-8"), api_key.encode("utf-8"))
 
         def do_GET(self):
-            if self.path == "/health":
+            if self.path in ("/health", "/healthz"):
                 return self._send(200, {"status": "ok", "model": name})
+            if self.path == "/readyz":     # the engine is loaded before the socket opens, so a bound server is ready unless it is saturated
+                busy = len(service._inflight) >= service.max_pending
+                return self._send(503 if busy else 200, {"status": "busy" if busy else "ready", "model": name})
             if not self._authorised():
                 return self._send(401, {"detail": "missing or wrong API key"})
+            if self.path == "/v1/models":
+                return self._send(200, {"object": "list", "data": [{"id": name, "object": "model", **(info or {})}]})
             if self.path == "/stats":
                 return self._send(200, service.snapshot())
             if self.path == "/metrics":
@@ -357,11 +362,11 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def serve(service: RunnerService, name: str, host: str, port: int, api_key: str | None = None) -> Server:
+def serve(service: RunnerService, name: str, host: str, port: int, api_key: str | None = None, info: dict | None = None) -> Server:
     """Binds and returns the server (the caller runs `serve_forever`); refuses a non-loopback host without an API key."""
     if not is_loopback(host) and not api_key:
         raise SystemExit(f"refusing to bind {host}: a non-loopback address needs an API key (--api-key or $SEPAL_API_KEY)")
-    return Server((host, port), make_handler(service, name, api_key))
+    return Server((host, port), make_handler(service, name, api_key, info))
 
 
 def build_service(api: Any, temperatures: Any, name: str, *, backend: Any = None, workers: int = 4, cache_size: int = 4096,
@@ -374,15 +379,16 @@ def build_service(api: Any, temperatures: Any, name: str, *, backend: Any = None
     return RunnerService(scorer, scheduler, name, workers=workers, cache_size=cache_size, max_pending=max_pending, request_timeout_s=request_timeout_s)
 
 
-def load_service(final: str, base: str, lib: str | None, profile: str, name: str, *, calibrated: bool = True, **options) -> tuple[RunnerService, Any]:
+def load_service(final: str, base: str, lib: str | None, profile: str, name: str, *, calibrated: bool = True, window: int = MAX_SCORE_LEN,
+                 engine_options: dict | None = None, **options) -> tuple[RunnerService, Any]:
     from pathlib import Path
 
     from sepal_runner.engine import open_runner_api
     from sepal_runner.shared.temperatures import fitted_temperatures
 
-    api, engine = open_runner_api(final, base, lib, profile, max_tokens=MAX_SCORE_LEN)
-    temperatures = fitted_temperatures(str(Path(final).parent)) if calibrated else None
-    return build_service(api, temperatures, name, **options), engine
+    api, engine = open_runner_api(final, base, lib, profile, extra=engine_options, max_tokens=window)
+    temperatures = fitted_temperatures(str(final)) if calibrated else None
+    return build_service(api, temperatures, name, limit=window, **options), engine
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:

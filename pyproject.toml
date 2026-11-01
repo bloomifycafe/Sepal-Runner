@@ -10,12 +10,15 @@ dependencies = ["numpy>=1.26", "tokenizers>=0.22"]
 [project.optional-dependencies]
 # Reading golden-vector files (tests, tools/runner_golden_parity.py).
 golden = ["safetensors"]
+# `sepal serve` fetching models from the Hub, and the machine probe.
+serve = ["huggingface_hub", "psutil"]
 # The NumPy reference engine's tests that compare against PyTorch.
 verify = ["torch>=2.8", "safetensors"]
 dev = ["pytest>=8", "safetensors"]
 
 [project.scripts]
 sepal-runner = "sepal_runner.__main__:main"
+sepal = "sepal_runner.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
