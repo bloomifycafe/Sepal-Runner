@@ -45,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--in", dest="input", required=True)
     p.add_argument("--out", dest="output", required=True)
     runner_api.add_arguments(p)
+    sub.add_parser("serve", help="fetch, plan and serve a model (same as the `sepal serve` command; see `sepal serve -h`)")
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] == ["serve"]:
+        from sepal_runner import cli
+
+        return cli.main(argv)
     args = parser.parse_args(argv)
     return score(args)
 

@@ -377,6 +377,50 @@ SEPAL_TEST(cpu_trunk, no_thread_count_or_batch_changes_a_bit) {
     }
 }
 
+SEPAL_TEST(cpu_trunk, a_request_resumed_from_a_prefix_state_gives_the_same_hidden_states) {
+    const ModelConfig cfg = small_config();
+    const Weights<float> w = random_weights<float>(cfg, 6);
+    const std::vector<std::uint32_t> full = tokens_of(300, 4, 64);
+    const std::vector<std::span<const std::uint32_t>> whole_request = {std::span<const std::uint32_t>(full)};
+    for (const Profile profile : {Profile::F32, Profile::BF16}) {
+        TrunkOptions opt;
+        opt.profile = profile;
+        opt.chunk_tokens = 64;
+        opt.step_tokens = 160;
+        opt.threads = 3;
+        CpuTrunk trunk(cfg, w, embedding_of(w, 64), opt);
+        std::vector<std::vector<float>> whole;
+        trunk.forward(whole_request, whole);
+        for (const std::size_t cut : {std::size_t{128}, std::size_t{100}}) {
+            PrefixState state;
+            std::vector<std::vector<float>> prefix_hidden;
+            const std::vector<std::span<const std::uint32_t>> prefix_request = {std::span<const std::uint32_t>(full.data(), cut)};
+            const std::vector<Resume> capture = {Resume{nullptr, &state}};
+            trunk.forward(prefix_request, prefix_hidden, nullptr, &capture);
+            CHECK_EQ(state.tokens, cut);
+            CHECK_EQ(state.hidden.size(), cut * cfg.hidden_size);
+            std::vector<std::vector<float>> resumed;
+            const std::vector<Resume> resume = {Resume{&state, nullptr}};
+            trunk.forward(whole_request, resumed, nullptr, &resume);
+            CHECK_EQ(resumed[0].size(), whole[0].size());
+            if (cut % opt.chunk_tokens == 0) {
+                CHECK(same_bits(resumed[0], whole[0]));       // the same chunks, so the same bits
+            } else {
+                double worst = 0;
+                for (std::size_t i = 0; i < whole[0].size(); ++i) worst = std::fmax(worst, std::fabs(static_cast<double>(resumed[0][i]) - whole[0][i]));
+                CHECK(worst < (profile == Profile::F32 ? 1e-4 : 5e-2));
+            }
+            // a state can be chained: resume from it and leave a longer one
+            PrefixState longer;
+            std::vector<std::vector<float>> scratch;
+            const std::vector<std::span<const std::uint32_t>> longer_request = {std::span<const std::uint32_t>(full.data(), 220)};
+            const std::vector<Resume> chain = {Resume{&state, &longer}};
+            trunk.forward(longer_request, scratch, nullptr, &chain);
+            CHECK_EQ(longer.tokens, std::size_t{220});
+        }
+    }
+}
+
 SEPAL_TEST(cpu_trunk, reduced_precision_profiles_stay_near_float32) {
     const ModelConfig cfg = small_config();
     const Weights<float> w = random_weights<float>(cfg, 8);

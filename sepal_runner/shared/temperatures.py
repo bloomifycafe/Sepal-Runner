@@ -74,8 +74,9 @@ def read_temperatures(checkpoint: str | Path) -> TypeTemperatures | None:
 
 def fitted_temperatures(run: str | Path) -> TypeTemperatures:
     """The temperatures a finished run recorded in `<run>/final/sepal.json`: the per-type table, else its single temperature for every question."""
-    table = read_temperatures(Path(run) / "final")
+    final = Path(run) / "final" if (Path(run) / "final" / META_FILE).is_file() else Path(run)   # a run directory, or the checkpoint itself
+    table = read_temperatures(final)
     if table is not None:
         return table
-    meta = json.loads((Path(run) / "final" / META_FILE).read_text(encoding="utf-8"))
+    meta = json.loads((final / META_FILE).read_text(encoding="utf-8"))
     return TypeTemperatures(single=float(meta.get("temperature", 1.0)), types={}, buckets={}, type_rows={}, bucket_rows={}, n_rows=0)

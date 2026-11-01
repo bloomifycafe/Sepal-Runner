@@ -29,6 +29,9 @@ public:
     std::size_t nr() const { return nr_; }               // panel width of the micro kernel
     std::size_t bytes() const { return (k_.size() + v_.size()) * sizeof(float); }
 
+    /// Copies the keys and values of tokens [0, tokens) from `src` (same kv heads, head dim and key tile; any capacity of at least `tokens`).
+    void copy_prefix_from(const KvCache& src, std::size_t tokens);
+
     /// Stores the key and value of token `pos` for kv head `kvh` (head_dim floats each).
     void append(std::size_t pos, std::size_t kvh, const float* k, const float* v);
 

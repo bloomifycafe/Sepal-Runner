@@ -1,0 +1,19 @@
+# CPU image: builds the C++ engine, installs the Python front end, runs `sepal serve`.
+#   docker build -f docker/Dockerfile.cpu -t sepal-runner:cpu .
+#   docker run -p 8000:8000 -e SEPAL_API_KEY=change-me -v sepal-cache:/cache -e HF_TOKEN sepal-runner:cpu BlossomsAI/Sepal-4B
+FROM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ cmake ninja-build ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY runner /src/runner
+RUN cmake -S /src/runner -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSEPAL_BUILD_TESTS=OFF && cmake --build /src/build --target sepal_runner_cpu
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY sepal_runner ./sepal_runner
+RUN pip install --no-cache-dir ".[serve]"
+COPY --from=build /src/build/libsepal_runner_cpu.so /opt/sepal/lib/libsepal_runner_cpu.so
+ENV SEPAL_HOME=/cache SEPAL_RUNNER_LIB_DIR=/opt/sepal/lib
+VOLUME /cache
+EXPOSE 8000
+# Inside a container the port must be reachable from outside, so bind 0.0.0.0: that requires SEPAL_API_KEY (the server refuses otherwise).
+ENTRYPOINT ["sepal", "serve", "--host", "0.0.0.0", "--port", "8000"]

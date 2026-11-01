@@ -21,9 +21,13 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
     number("step_tokens", opt.step_tokens);
     number("delta_chunk", opt.delta_chunk);
     number("group_tokens", opt.group_tokens);
+    number("prefix_cache_mib", opt.prefix_cache_mib);
+    number("prefix_min_tokens", opt.prefix_min_tokens);
     if (const auto it = o.extra.find("q8"); it != o.extra.end()) {
         const std::string& s = it->second.as_string();
         opt.q8.mlp = s.find("mlp") != std::string::npos;
+        opt.q8.gate_up = s.find("gate_up") != std::string::npos;
+        opt.q8.down = s.find("down") != std::string::npos;
         opt.q8.attention = s.find("attn") != std::string::npos;
         opt.q8.deltanet_in = s.find("dn_in") != std::string::npos;
     }
@@ -34,7 +38,7 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
 
 void register_backend_profiles() {
     register_ref_profiles();
-    const std::vector<std::string> keys = {"chunk_tokens", "step_tokens", "delta_chunk", "group_tokens"};
+    const std::vector<std::string> keys = {"chunk_tokens", "step_tokens", "delta_chunk", "group_tokens", "prefix_cache_mib", "prefix_min_tokens"};
     for (const char* name : {"cpu-f32", "cpu-bf16"}) {
         const std::string profile = name;
         register_profile({profile, "cpu", keys, [profile](const EngineOptions& o) { return make_fast(profile, o); }});

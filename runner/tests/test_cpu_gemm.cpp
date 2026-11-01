@@ -156,32 +156,47 @@ SEPAL_TEST(cpu_gemm, bf16_matches_reference_on_rounded_inputs) {
 
 SEPAL_TEST(cpu_gemm, i8_matches_integer_emulation) {
     for (const Isa isa : isas()) {
+        // AVX-512 VNNI: one scale per (feature or row, block of kBlockValues values); AVX2: one per feature or row.
+        const bool blocked = pick_variant(WeightKind::I8, isa) == Variant::I8_Z;
         for (const Shape s : shapes) {
+            const std::size_t block = blocked ? kBlockValues : s.k;
+            const std::size_t blocks = (s.k + block - 1) / block;
             const auto x = random_matrix(s.rows, s.k, 5, 3.0f);
             const auto w = random_matrix(s.n, s.k, 6, 0.5f);
             const auto y = run_gemm(x, w, s.rows, s.n, s.k, WeightKind::I8, isa, 4);
-            // Emulate: symmetric per-feature weight scale, per-row activation scale, exact integer sums.
-            std::vector<float> ws(s.n);
+            // Emulate: symmetric scales per block, exact integer sums per block, the float sum over blocks in increasing k.
+            std::vector<float> ws(s.n * blocks);
             std::vector<std::int8_t> wq(s.n * s.k);
             for (std::size_t j = 0; j < s.n; ++j) {
-                float amax = 0;
-                for (std::size_t i = 0; i < s.k; ++i) amax = std::max(amax, std::fabs(w[j * s.k + i]));
-                ws[j] = amax > 0 ? amax / 127.0f : 1.0f;
-                for (std::size_t i = 0; i < s.k; ++i)
-                    wq[j * s.k + i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(w[j * s.k + i] * (1.0f / ws[j])), -127.0f, 127.0f));
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    const std::size_t lo = b * block, hi = std::min(s.k, lo + block);
+                    float amax = 0;
+                    for (std::size_t i = lo; i < hi; ++i) amax = std::max(amax, std::fabs(w[j * s.k + i]));
+                    ws[j * blocks + b] = amax > 0 ? amax / 127.0f : 1.0f;
+                    for (std::size_t i = lo; i < hi; ++i)
+                        wq[j * s.k + i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(w[j * s.k + i] * (1.0f / ws[j * blocks + b])), -127.0f, 127.0f));
+                }
             }
             double worst = 0;
             for (std::size_t t = 0; t < s.rows; ++t) {
-                float amax = 0;
-                for (std::size_t i = 0; i < s.k; ++i) amax = std::max(amax, std::fabs(x[t * s.k + i]));
-                const float xs = amax > 0 ? amax / 127.0f : 1.0f;
+                std::vector<float> xs(blocks);
                 std::vector<std::int8_t> xq(s.k);
-                for (std::size_t i = 0; i < s.k; ++i)
-                    xq[i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(x[t * s.k + i] * (1.0f / xs)), -127.0f, 127.0f));
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    const std::size_t lo = b * block, hi = std::min(s.k, lo + block);
+                    float amax = 0;
+                    for (std::size_t i = lo; i < hi; ++i) amax = std::max(amax, std::fabs(x[t * s.k + i]));
+                    xs[b] = amax > 0 ? amax / 127.0f : 1.0f;
+                    for (std::size_t i = lo; i < hi; ++i)
+                        xq[i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(x[t * s.k + i] * (1.0f / xs[b])), -127.0f, 127.0f));
+                }
                 for (std::size_t j = 0; j < s.n; ++j) {
-                    std::int64_t acc = 0;
-                    for (std::size_t i = 0; i < s.k; ++i) acc += static_cast<std::int64_t>(xq[i]) * wq[j * s.k + i];
-                    const double expect = static_cast<double>(static_cast<float>(acc) * ws[j] * xs);
+                    float expect = 0;
+                    for (std::size_t b = 0; b < blocks; ++b) {
+                        std::int64_t acc = 0;
+                        for (std::size_t i = b * block; i < std::min(s.k, (b + 1) * block); ++i) acc += static_cast<std::int64_t>(xq[i]) * wq[j * s.k + i];
+                        const float scale = ws[j * blocks + b] * xs[b];
+                        expect = b == 0 ? static_cast<float>(acc) * scale : std::fma(static_cast<float>(acc), scale, expect);   // the kernel's float chain over blocks
+                    }
                     worst = std::max(worst, std::fabs(y[t * s.n + j] - expect) / (std::fabs(expect) + 1e-3));
                 }
             }

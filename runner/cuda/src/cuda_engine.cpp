@@ -1619,6 +1619,13 @@ CudaEngine::CudaEngine(const LoadedModel& model, const EngineOptions& options)
 CudaEngine::CudaEngine(const ModelConfig& config, const Weights<float>& weights, const EngineOptions& options)
     : impl_(std::make_unique<Impl>(config, source_of(weights), options)) {}
 
+CudaEngine::CudaEngine(const ModelConfig& config, const TensorFetch& fetch, const EngineOptions& options)
+    : impl_(std::make_unique<Impl>(config, TensorSource([&fetch](const std::string& name) {
+                                       const BasicTensor<float>& t = fetch(name);
+                                       return HostTensor{t.data(), DType::F32, t.size()};
+                                   }),
+                                   options)) {}
+
 CudaEngine::~CudaEngine() = default;
 
 std::vector<EngineRowResult> CudaEngine::run(std::span<const EngineRow> rows) { return impl_->run(rows); }

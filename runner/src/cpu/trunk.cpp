@@ -92,6 +92,18 @@ struct RequestState {
     std::vector<std::unique_ptr<KvCache>> kv;     // per attention layer
 };
 
+}  // namespace
+
+std::uint64_t PrefixState::bytes() const {
+    std::uint64_t b = hidden.size() * 4ull;
+    for (const auto& s : dn_state) b += s.size() * 4ull;
+    for (const auto& s : conv_tail) b += s.size() * 4ull;
+    for (const auto& k : kv) b += k->bytes();
+    return b;
+}
+
+namespace {
+
 struct Segment {
     std::size_t request;
     std::size_t position;  // first position of the chunk
@@ -163,7 +175,7 @@ struct CpuTrunk::Impl {
         return WeightKind::F32;
     }
 
-    void build(const Weights<float>& w);
+    void build(const WeightSource& source);
     void run_step(std::span<const std::span<const std::uint32_t>> requests, std::vector<RequestState>& states,
                   const std::vector<Segment>& segs, std::size_t rows, std::vector<std::vector<float>>& hidden,
                   const LayerObserver* observer);
@@ -175,7 +187,7 @@ struct CpuTrunk::Impl {
     std::uint64_t state_bytes(std::size_t tokens) const;
 };
 
-void CpuTrunk::Impl::build(const Weights<float>& w) {
+void CpuTrunk::Impl::build(const WeightSource& source) {
     require_valid(cfg);
     H = dimension(cfg.hidden_size);
     I = dimension(cfg.intermediate_size);
@@ -200,7 +212,8 @@ void CpuTrunk::Impl::build(const Weights<float>& w) {
     if (hd > 1024) throw std::invalid_argument("attention head dim above 1024 is not supported");
     qz_width = std::max(conv_dim + value_dim, 2 * heads * hd + 2 * kv_heads * hd);
 
-    const WeightKind k_mlp = kind_for(opt.q8.mlp);
+    const WeightKind k_gate_up = kind_for(opt.q8.mlp || opt.q8.gate_up);
+    const WeightKind k_down = kind_for(opt.q8.mlp || opt.q8.down);
     const WeightKind k_attn = kind_for(opt.q8.attention);
     const WeightKind k_dn_in = kind_for(opt.q8.deltanet_in);
     const WeightKind k_16 = opt.profile == Profile::F32 ? WeightKind::F32 : WeightKind::BF16;
@@ -209,12 +222,12 @@ void CpuTrunk::Impl::build(const Weights<float>& w) {
     for (std::size_t i = 0; i < layers.size(); ++i) {
         Layer& L = layers[i];
         L.attention = cfg.is_full_attention(i);
-        const Weights<float> lw = w.scope("layers." + std::to_string(i));
+        const Weights<float> lw = source("layers." + std::to_string(i));
         L.input_norm1 = one_plus(lw["input_layernorm.weight"]);
         L.post_norm1 = one_plus(lw["post_attention_layernorm.weight"]);
         const Weights<float> mlp_w = lw.scope("mlp");
-        L.gate_up = pack_weight_swiglu(mlp_w["gate_proj.weight"].data(), mlp_w["up_proj.weight"].data(), H, I, H, k_mlp, isa, pool);
-        L.down = pack_weight(mlp_w["down_proj.weight"].data(), I, H, I, k_mlp, isa, pool);
+        L.gate_up = pack_weight_swiglu(mlp_w["gate_proj.weight"].data(), mlp_w["up_proj.weight"].data(), H, I, H, k_gate_up, isa, pool);
+        L.down = pack_weight(mlp_w["down_proj.weight"].data(), I, H, I, k_down, isa, pool);
         weight_bytes += L.gate_up.bytes() + L.down.bytes();
         if (L.attention) {
             const Weights<float> a = lw.scope("self_attn");
@@ -244,7 +257,7 @@ void CpuTrunk::Impl::build(const Weights<float>& w) {
             ++n_dn;
         }
     }
-    final_norm1 = one_plus(w["norm.weight"]);
+    final_norm1 = one_plus(source("norm")["weight"]);
 
     const std::size_t S = opt.step_tokens;
     x.resize(S * H);
@@ -492,7 +505,12 @@ void CpuTrunk::Impl::run_step(std::span<const std::span<const std::uint32_t>> re
 
 CpuTrunk::CpuTrunk(const ModelConfig& config, const Weights<float>& weights, EmbeddingFn embed, const TrunkOptions& options)
     : impl_(std::make_unique<Impl>(config, options, std::move(embed))) {
-    impl_->build(weights);
+    impl_->build([&weights](const std::string& scope) { return weights.scope(scope); });
+}
+
+CpuTrunk::CpuTrunk(const ModelConfig& config, const WeightSource& source, EmbeddingFn embed, const TrunkOptions& options)
+    : impl_(std::make_unique<Impl>(config, options, std::move(embed))) {
+    impl_->build(source);
 }
 
 CpuTrunk::~CpuTrunk() = default;
@@ -506,7 +524,7 @@ std::uint64_t CpuTrunk::weight_bytes() const { return impl_->weight_bytes; }
 const TrunkTimes& CpuTrunk::last_times() const { return impl_->times; }
 
 void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests, std::vector<std::vector<float>>& hidden,
-                       const LayerObserver* observer) {
+                       const LayerObserver* observer, const std::vector<Resume>* resume) {
     Impl& m = *impl_;
     for (const auto& r : requests) {
         if (r.empty()) throw std::invalid_argument("a request needs at least one token");
@@ -540,6 +558,18 @@ void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests,
                 rs.kv.push_back(std::make_unique<KvCache>(m.kv_heads, m.hd, requests[next_admit].size(), m.isa));
             }
             hidden[next_admit].assign(requests[next_admit].size() * m.H, 0.0f);
+            if (resume != nullptr && (*resume)[next_admit].from != nullptr) {
+                const PrefixState& from = *(*resume)[next_admit].from;
+                if (from.tokens >= requests[next_admit].size() || from.dn_state.size() != m.n_dn || from.kv.size() != m.n_attn)
+                    throw std::invalid_argument("forward: a prefix state does not fit its request");
+                for (std::size_t i = 0; i < m.n_dn; ++i) {
+                    std::memcpy(rs.dn_state[i].data(), from.dn_state[i].data(), from.dn_state[i].size() * sizeof(float));
+                    std::memcpy(rs.conv_tail[i].data(), from.conv_tail[i].data(), from.conv_tail[i].size() * sizeof(float));
+                }
+                for (std::size_t i = 0; i < m.n_attn; ++i) rs.kv[i]->copy_prefix_from(*from.kv[i], from.tokens);
+                std::memcpy(hidden[next_admit].data(), from.hidden.data(), from.hidden.size() * sizeof(float));
+                done[next_admit] = from.tokens;
+            }
             used += need;
             active.push_back(next_admit++);
         }
@@ -561,6 +591,14 @@ void CpuTrunk::forward(std::span<const std::span<const std::uint32_t>> requests,
             const std::size_t r = active[i];
             if (done[r] == requests[r].size()) {
                 used -= m.state_bytes(requests[r].size());
+                if (resume != nullptr && (*resume)[r].capture != nullptr) {
+                    PrefixState& out = *(*resume)[r].capture;
+                    out.tokens = requests[r].size();
+                    out.dn_state = std::move(states[r].dn_state);
+                    out.conv_tail = std::move(states[r].conv_tail);
+                    out.kv = std::move(states[r].kv);
+                    out.hidden = hidden[r];
+                }
                 states[r] = RequestState{};
                 active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
             } else {

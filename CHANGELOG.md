@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### 2026-11-01: `sepal serve`, int8 blocks, CPU prefix states
+
+- `sepal serve MODEL` (`sepal_runner/cli.py`): fetch, hardware plan, serve; `/v1/models`, `/healthz`, `/readyz`; `examples/client.py`; `docker/Dockerfile.cpu`
+  (built and run here under Docker Desktop: the engine compiles with GCC on Linux, the container answers with an API key) and `docker/Dockerfile.cuda`
+  (written, not built or run).
+- cpu-q8 AVX-512 kernel: scales per block of 128 values for weights and activations, in a separate non-inlined block function (MSVC spilled otherwise).
+  4B, SEC-dev against the PyTorch reference: max |dp| 0.49 -> 0.14 over 300 records (p99 0.034, 1 flip of 432); TOOL (60 records) 0.017; LONG-LOG
+  (12 records) 0.23, 2 flips of 162. Still over the 0.05 gate, so opt-in. 1.55x the speed of cpu-bf16 at 4 and 6 cores; committed memory 5.7 GiB for 4B (bf16 8.2),
+  so 4B loads under an 8 GB cap.
+- CPU prefix states (`prefix_cache_mib`): a request that shares its leading tokens with an earlier one resumes from the state after them.
+  Same 4k log with 8 question sets, cpu-bf16, 6 threads: 27.5 s -> 6.9 s per request from the third on.
+
+### 2026-11-01: 4B on small machines
+
+Measured on the owner's PC (Ryzen 5 7600X 6 cores / 12 threads, 64 GB, RTX 3060 12 GB, Windows 11, MSVC 19.44, CUDA 13.1 from the pinned wheels) with
+Sepal-4B (F15-s0, LoRA r64 + Clef head on Qwen3.5-4B 851bf6e). Limits are simulated with CPU affinity and a Job Object memory cap; memory speed and
+clocks are those of this faster PC. Results: Sepal `runs/box-results/full15-4b/runner/`.
+
+- Loading no longer holds the whole model in float32. `TrainedModel::merged_scope` / `merged_tensor` merge the LoRA one layer (CPU) or one tensor
+  (GPU) at a time; `CpuTrunk` and `CudaEngine` take a fetch callback beside the old whole-model constructors (which are unchanged). Peak committed
+  memory at load, cpu-bf16 4B: 23.2 GiB -> 7.8 GiB (a 16 GB machine could not load it before); gpu 4B: 25.7 GiB -> 11.8 GiB. Same weights, same speed.
+- New profile `gpu-q8w` (int8 weights, binary16 activations, all four multiply groups; the engine option was there, the profile was not). 4B weights
+  4.6 GiB on the device against 8.0 GiB for `gpu-f16`.
+- The GPU engine gives a spent chain snapshot's state slot back as soon as the next segment has consumed it, so a long request cut into small calls
+  no longer needs one slot per segment. Measured: gpu-f16 on a 12 GB card with `max_call_tokens` 2048 stopped on the first long TOOL request with "0 of 8 state slots free"; after the change the 150-record TOOL sample scores to the end.
+- Test `trained.streamed_merge_equals_whole_merge` (bit-equal to the whole merge).
+
 ### 2026-10-17: split from Sepal
 
 - The runner left the Sepal repository (main at f846e8d) with the git history of its files: `runner/` (C++ engine, CPU and CUDA), the Python
