@@ -24,6 +24,8 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
     if (const auto it = o.extra.find("q8"); it != o.extra.end()) {
         const std::string& s = it->second.as_string();
         opt.q8.mlp = s.find("mlp") != std::string::npos;
+        opt.q8.gate_up = s.find("gate_up") != std::string::npos;
+        opt.q8.down = s.find("down") != std::string::npos;
         opt.q8.attention = s.find("attn") != std::string::npos;
         opt.q8.deltanet_in = s.find("dn_in") != std::string::npos;
     }

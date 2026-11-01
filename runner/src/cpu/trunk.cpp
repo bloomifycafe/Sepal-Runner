@@ -200,7 +200,8 @@ void CpuTrunk::Impl::build(const WeightSource& source) {
     if (hd > 1024) throw std::invalid_argument("attention head dim above 1024 is not supported");
     qz_width = std::max(conv_dim + value_dim, 2 * heads * hd + 2 * kv_heads * hd);
 
-    const WeightKind k_mlp = kind_for(opt.q8.mlp);
+    const WeightKind k_gate_up = kind_for(opt.q8.mlp || opt.q8.gate_up);
+    const WeightKind k_down = kind_for(opt.q8.mlp || opt.q8.down);
     const WeightKind k_attn = kind_for(opt.q8.attention);
     const WeightKind k_dn_in = kind_for(opt.q8.deltanet_in);
     const WeightKind k_16 = opt.profile == Profile::F32 ? WeightKind::F32 : WeightKind::BF16;
@@ -213,8 +214,8 @@ void CpuTrunk::Impl::build(const WeightSource& source) {
         L.input_norm1 = one_plus(lw["input_layernorm.weight"]);
         L.post_norm1 = one_plus(lw["post_attention_layernorm.weight"]);
         const Weights<float> mlp_w = lw.scope("mlp");
-        L.gate_up = pack_weight_swiglu(mlp_w["gate_proj.weight"].data(), mlp_w["up_proj.weight"].data(), H, I, H, k_mlp, isa, pool);
-        L.down = pack_weight(mlp_w["down_proj.weight"].data(), I, H, I, k_mlp, isa, pool);
+        L.gate_up = pack_weight_swiglu(mlp_w["gate_proj.weight"].data(), mlp_w["up_proj.weight"].data(), H, I, H, k_gate_up, isa, pool);
+        L.down = pack_weight(mlp_w["down_proj.weight"].data(), I, H, I, k_down, isa, pool);
         weight_bytes += L.gate_up.bytes() + L.down.bytes();
         if (L.attention) {
             const Weights<float> a = lw.scope("self_attn");

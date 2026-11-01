@@ -70,6 +70,8 @@ std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
 
 bool is_i8(Variant v) { return v == Variant::I8_Z || v == Variant::I8_Y; }
 
+std::size_t kblocks_of(Variant v, std::size_t k) { return v == Variant::I8_Z ? ceil_div(k, kBlockValues) : 1; }
+
 std::int8_t quantise(float x, float inverse_scale) {
     const float q = std::nearbyint(x * inverse_scale);
     return static_cast<std::int8_t>(std::clamp(q, -127.0f, 127.0f));
@@ -99,27 +101,33 @@ struct PanelPacker {
                     for (std::size_t kk = 0; kk < k; ++kk) d[((kk / g) * nr + jj) * g + kk % g] = float_to_bf16(row[kk]);
                 }
             } else {
-                float amax = 0.0f;
-                if (row != nullptr) {
-                    for (std::size_t kk = 0; kk < k; ++kk) amax = std::max(amax, std::fabs(row[kk]));
-                }
-                const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
-                scale[jj] = s;
-                corr[jj] = 0;
-                if (row == nullptr) continue;
-                const float inverse = 1.0f / s;
-                std::int32_t sum = 0;
-                for (std::size_t kk = 0; kk < k; ++kk) {
-                    const std::int8_t q = quantise(row[kk], inverse);
-                    sum += q;
-                    const std::size_t at = ((kk / g) * nr + jj) * g + kk % g;
-                    if (variant == Variant::I8_Z) {
-                        reinterpret_cast<std::int8_t*>(dst)[at] = q;
-                    } else {
-                        reinterpret_cast<std::int16_t*>(dst)[at] = q;
+                // I8_Z: one scale per (feature, block of kBlockValues); I8_Y: one per feature (a single block spanning k)
+                const std::size_t block = variant == Variant::I8_Z ? kBlockValues : k;
+                const std::size_t blocks = kblocks_of(variant, k);
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    const std::size_t lo = b * block, hi = std::min(k, lo + block);
+                    float amax = 0.0f;
+                    if (row != nullptr) {
+                        for (std::size_t kk = lo; kk < hi; ++kk) amax = std::max(amax, std::fabs(row[kk]));
                     }
+                    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+                    scale[b * nr + jj] = s;
+                    corr[b * nr + jj] = 0;
+                    if (row == nullptr) continue;
+                    const float inverse = 1.0f / s;
+                    std::int32_t sum = 0;
+                    for (std::size_t kk = lo; kk < hi; ++kk) {
+                        const std::int8_t q = quantise(row[kk], inverse);
+                        sum += q;
+                        const std::size_t at = ((kk / g) * nr + jj) * g + kk % g;
+                        if (variant == Variant::I8_Z) {
+                            reinterpret_cast<std::int8_t*>(dst)[at] = q;
+                        } else {
+                            reinterpret_cast<std::int16_t*>(dst)[at] = q;
+                        }
+                    }
+                    if (variant == Variant::I8_Z) corr[b * nr + jj] = 128 * sum;
                 }
-                if (variant == Variant::I8_Z) corr[jj] = 128 * sum;
             }
         }
     }
@@ -143,8 +151,9 @@ PackedWeight pack_weight(const float* w, std::size_t ldw, std::size_t n, std::si
     pw.data_.resize(pw.panels_ * pw.panel_bytes_);
     pw.data_.zero();
     if (is_i8(pw.variant_)) {
-        pw.scale_.resize(pw.panels_ * static_cast<std::size_t>(vi.nr));
-        pw.corr_.resize(pw.panels_ * static_cast<std::size_t>(vi.nr));
+        pw.kblocks_ = kblocks_of(pw.variant_, k);
+        pw.scale_.resize(pw.panels_ * pw.kblocks_ * static_cast<std::size_t>(vi.nr));
+        pw.corr_.resize(pw.panels_ * pw.kblocks_ * static_cast<std::size_t>(vi.nr));
     }
     const PanelPacker packer{pw.variant_, vi, k, pw.kgroups_, pw.panel_bytes_};
     pool.parallel_for(pw.panels_, [&](std::size_t p, unsigned) {
@@ -153,8 +162,8 @@ PackedWeight pack_weight(const float* w, std::size_t ldw, std::size_t n, std::si
             const std::size_t col = p * static_cast<std::size_t>(vi.nr) + static_cast<std::size_t>(jj);
             rows[jj] = col < n ? w + col * ldw : nullptr;
         }
-        float* scale = is_i8(pw.variant_) ? pw.scale_.data() + p * static_cast<std::size_t>(vi.nr) : nullptr;
-        std::int32_t* corr = is_i8(pw.variant_) ? pw.corr_.data() + p * static_cast<std::size_t>(vi.nr) : nullptr;
+        float* scale = is_i8(pw.variant_) ? pw.scale_.data() + p * pw.kblocks_ * static_cast<std::size_t>(vi.nr) : nullptr;
+        std::int32_t* corr = is_i8(pw.variant_) ? pw.corr_.data() + p * pw.kblocks_ * static_cast<std::size_t>(vi.nr) : nullptr;
         float dummy_scale[32];
         std::int32_t dummy_corr[32];
         packer.pack(pw.data_.data() + p * pw.panel_bytes_, rows, scale != nullptr ? scale : dummy_scale,
@@ -179,8 +188,9 @@ PackedWeight pack_weight_swiglu(const float* gate, const float* up, std::size_t 
     pw.data_.resize(pw.panels_ * pw.panel_bytes_);
     pw.data_.zero();
     if (is_i8(pw.variant_)) {
-        pw.scale_.resize(pw.panels_ * static_cast<std::size_t>(vi.nr));
-        pw.corr_.resize(pw.panels_ * static_cast<std::size_t>(vi.nr));
+        pw.kblocks_ = kblocks_of(pw.variant_, k);
+        pw.scale_.resize(pw.panels_ * pw.kblocks_ * static_cast<std::size_t>(vi.nr));
+        pw.corr_.resize(pw.panels_ * pw.kblocks_ * static_cast<std::size_t>(vi.nr));
     }
     const PanelPacker packer{pw.variant_, vi, k, pw.kgroups_, pw.panel_bytes_};
     pool.parallel_for(pw.panels_, [&](std::size_t p, unsigned) {
@@ -190,8 +200,8 @@ PackedWeight pack_weight_swiglu(const float* gate, const float* up, std::size_t 
             rows[jj] = idx < n ? gate + idx * ldw : nullptr;
             rows[half + jj] = idx < n ? up + idx * ldw : nullptr;
         }
-        float* scale = is_i8(pw.variant_) ? pw.scale_.data() + p * static_cast<std::size_t>(vi.nr) : nullptr;
-        std::int32_t* corr = is_i8(pw.variant_) ? pw.corr_.data() + p * static_cast<std::size_t>(vi.nr) : nullptr;
+        float* scale = is_i8(pw.variant_) ? pw.scale_.data() + p * pw.kblocks_ * static_cast<std::size_t>(vi.nr) : nullptr;
+        std::int32_t* corr = is_i8(pw.variant_) ? pw.corr_.data() + p * pw.kblocks_ * static_cast<std::size_t>(vi.nr) : nullptr;
         float dummy_scale[32];
         std::int32_t dummy_corr[32];
         packer.pack(pw.data_.data() + p * pw.panel_bytes_, rows, scale != nullptr ? scale : dummy_scale,
@@ -212,13 +222,15 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
     out.kgroups = ceil_div(k, g);
     out.block_bytes = out.kgroups * mr * g * vi.act_bytes;
     out.data.resize(out.blocks * out.block_bytes);
-    if (is_i8(variant)) out.row_scale.resize(out.blocks * mr);
+    out.kblocks = kblocks_of(variant, k);
+    if (is_i8(variant)) out.row_scale.resize(out.blocks * mr * out.kblocks);
     pool.parallel_for(out.blocks, [&](std::size_t mb, unsigned) {
         unsigned char* dst = out.data.data() + mb * out.block_bytes;
         std::memset(dst, 0, out.block_bytes);
         for (std::size_t r = 0; r < mr; ++r) {
             const std::size_t row = mb * mr + r;
-            if (is_i8(variant)) out.row_scale[mb * mr + r] = 0.0f;
+            if (is_i8(variant))
+                for (std::size_t b = 0; b < out.kblocks; ++b) out.row_scale[(mb * out.kblocks + b) * mr + r] = 0.0f;
             if (row >= rows) continue;
             const float* src = x + row * ldx;
             switch (variant) {
@@ -236,18 +248,22 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
             }
             case Variant::I8_Z:
             case Variant::I8_Y: {
-                float amax = 0.0f;
-                for (std::size_t kk = 0; kk < k; ++kk) amax = std::max(amax, std::fabs(src[kk]));
-                const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
-                out.row_scale[mb * mr + r] = s;
-                const float inverse = 1.0f / s;
-                for (std::size_t kk = 0; kk < k; ++kk) {
-                    const std::int8_t q = quantise(src[kk], inverse);
-                    const std::size_t at = ((kk / g) * mr + r) * g + kk % g;
-                    if (variant == Variant::I8_Z) {
-                        dst[at] = static_cast<unsigned char>(q + 128);
-                    } else {
-                        reinterpret_cast<std::int16_t*>(dst)[at] = q;
+                const std::size_t block = variant == Variant::I8_Z ? kBlockValues : k;
+                for (std::size_t b = 0; b < out.kblocks; ++b) {
+                    const std::size_t lo = b * block, hi = std::min(k, lo + block);
+                    float amax = 0.0f;
+                    for (std::size_t kk = lo; kk < hi; ++kk) amax = std::max(amax, std::fabs(src[kk]));
+                    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+                    out.row_scale[(mb * out.kblocks + b) * mr + r] = s;
+                    const float inverse = 1.0f / s;
+                    for (std::size_t kk = lo; kk < hi; ++kk) {
+                        const std::int8_t q = quantise(src[kk], inverse);
+                        const std::size_t at = ((kk / g) * mr + r) * g + kk % g;
+                        if (variant == Variant::I8_Z) {
+                            dst[at] = static_cast<unsigned char>(q + 128);
+                        } else {
+                            reinterpret_cast<std::int16_t*>(dst)[at] = q;
+                        }
                     }
                 }
                 break;
@@ -384,7 +400,7 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
         const std::size_t mb_end = std::min(x.blocks, (mt + 1) * mb_per_task);
         for (std::size_t mb = mt * mb_per_task; mb < mb_end; ++mb) {
             ka.a = x.data.data() + mb * x.block_bytes;
-            ka.xscale = x.row_scale.data() + mb * mr;
+            ka.xscale = x.row_scale.data() + mb * mr * x.kblocks;
             kernel(ka);
             const std::size_t rows_valid = std::min(mr, x.rows - mb * mr);
             finish_tile(tile, vi.nr, rows_valid, cols_valid, w.swiglu(), accumulate, y + mb * mr * ldy + col0, ldy);

@@ -32,8 +32,10 @@ const char* name_of(Profile p);
 /// in_proj_b are never int8 (RUNNER.md 11 keeps them at 16 bits).
 struct Q8Groups {
     bool mlp = true;          // gate, up, down
+    bool gate_up = false;     // gate and up alone (the option string "gate_up"); "down" likewise; "mlp" means all three
     bool attention = true;    // q, k, v, o
     bool deltanet_in = true;  // in_proj_qkv, in_proj_z
+    bool down = false;
 };
 
 struct TrunkOptions {

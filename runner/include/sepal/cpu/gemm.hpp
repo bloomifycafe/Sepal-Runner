@@ -57,19 +57,26 @@ public:
     std::size_t panels() const { return panels_; }
     std::size_t bytes() const { return data_.size() + (scale_.size() + corr_.size()) * 4; }
     const unsigned char* panel(std::size_t p) const { return data_.data() + p * panel_bytes_; }
-    const float* scale(std::size_t p) const { return scale_.data() + p * static_cast<std::size_t>(info(variant_).nr); }
-    const std::int32_t* corr(std::size_t p) const { return corr_.data() + p * static_cast<std::size_t>(info(variant_).nr); }
+    /// I8_Z has one scale (and offset correction) per output feature and block of `kBlockValues` input values, laid out [kblock][nr] per panel;
+    /// I8_Y has one per output feature (kblocks() == 1).
+    std::size_t kblocks() const { return kblocks_; }
+    const float* scale(std::size_t p) const { return scale_.data() + p * kblocks_ * static_cast<std::size_t>(info(variant_).nr); }
+    const std::int32_t* corr(std::size_t p) const { return corr_.data() + p * kblocks_ * static_cast<std::size_t>(info(variant_).nr); }
 
 private:
     friend PackedWeight pack_weight(const float*, std::size_t, std::size_t, std::size_t, WeightKind, Isa, ThreadPool&);
     friend PackedWeight pack_weight_swiglu(const float*, const float*, std::size_t, std::size_t, std::size_t, WeightKind, Isa, ThreadPool&);
     Variant variant_ = Variant::F32_Y;
-    std::size_t n_ = 0, k_ = 0, panels_ = 0, panel_bytes_ = 0, kgroups_ = 0;
+    std::size_t n_ = 0, k_ = 0, panels_ = 0, panel_bytes_ = 0, kgroups_ = 0, kblocks_ = 1;
     bool swiglu_ = false;
     AlignedBuffer<unsigned char> data_;
     AlignedBuffer<float> scale_;        // I8: per padded output feature
     AlignedBuffer<std::int32_t> corr_;  // I8_Z: 128 * sum of the feature's quantised weights (u8 offset correction)
 };
+
+/// Input values per quantisation block of the AVX-512 int8 kernel (weights and activations each get one scale per block, so one outlier
+/// only costs the precision of its own 128 values, not of the whole row).
+constexpr std::size_t kBlockValues = 128;
 
 /// Packs `w` [n, k] with row stride `ldw` (floats). BF16 rounds each weight to nearest even; I8 quantises each
 /// output feature symmetrically with scale max|w| / 127.
@@ -84,9 +91,9 @@ PackedWeight pack_weight_swiglu(const float* gate, const float* up, std::size_t 
 /// Activations X [rows, k] packed for one variant (row blocks of `mr`).
 struct PackedActs {
     Variant variant = Variant::F32_Y;
-    std::size_t rows = 0, k = 0, blocks = 0, block_bytes = 0, kgroups = 0;
+    std::size_t rows = 0, k = 0, blocks = 0, block_bytes = 0, kgroups = 0, kblocks = 1;
     AlignedBuffer<unsigned char> data;
-    AlignedBuffer<float> row_scale; // I8: activation scale per (padded) row
+    AlignedBuffer<float> row_scale; // I8: activation scale per (padded) row; I8_Z: per row block [mr-block][kblock][mr]
 };
 
 /// (Re)packs `x` [rows, k] with row stride `ldx` into `out`, reusing its buffers.
