@@ -5,7 +5,11 @@
 ### 2026-11-05: tuned AVX2 kernel set (x86-64-v3), thread placement, Broadwell
 
 Measured on a Xeon E5-2698 v4 (Broadwell-EP, AVX2 + FMA, no AVX-512) in a vast.ai container with a 9.6-CPU quota; results and
-logs: Sepal `runs/box-results/broadwell/`.
+logs: Sepal `runs/box-results/broadwell/`. 4B `cpu-bf16` on 10 cores: short alerts 71.1 -> 86.0 tok/s (12.9 -> 10.7 s each),
+16k-token logs 62.2 -> 73.6 tok/s, TOOL requests 66.2 -> 79.1; 1 to 9 cores +17 to +24%; the container's default thread count
+43.7 -> 90.5. Parity of `avx2-tuned` against the PyTorch rows: SEC-dev 300 max |dp| 0.023, p99 0.009, 0 flips (passes);
+LONG-LOG 20 max 0.049, p99 0.030, 1 flip in 262, the same as the original AVX2 code to 1.4e-5 (this panel was already over
+the gate with the original code and with AVX-512, 0.052 / 0.049 on 12 records).
 
 - New CPU kernel set `avx2-tuned`, chosen automatically on AVX2 CPUs without AVX-512 after a cpuid check of the whole x86-64-v3
   level (`SEPAL_CPU_ISA`, open option `cpu_isa`, `sepal serve --cpu-isa`; a set the CPU lacks is refused with the missing features

@@ -351,8 +351,10 @@ transparent huge pages on Linux (`SEPAL_HUGEPAGES=0` turns that off).
 
 Threads: one per physical core of the CPUs the process may use (affinity mask, then the `cpus` list or `SEPAL_CPU_SET`),
 capped by a cgroup CPU quota, so a container limited to 10 CPUs of an 80-thread host runs 10 threads, not 40. When the
-pool owns its CPUs (no smaller quota, or an explicit list) each thread is pinned to its own physical core, filling one
-socket before the next (`SEPAL_CPU_PIN=auto|on|off`). Hyper-threads add nothing: the kernels are bound by the two FMA
+pool owns its CPUs (no smaller quota, or an explicit list) each worker is pinned to its own physical core, filling one
+socket before the next, and the calling thread is kept on the pool's CPUs without being tied to one of them (tied to a
+CPU that interrupts or a neighbour also use, loading 4B took 109 s instead of 35 s) (`SEPAL_CPU_PIN=auto|on|off`).
+Hyper-threads add nothing: the kernels are bound by the two FMA
 ports of a core. Idle workers spin for a few microseconds after a parallel step and then sleep, so an idle engine takes
 no CPU from a neighbour. `sepal serve` and `sepal-cpu-bench` print the kernel set, blocking and thread layout.
 
@@ -395,6 +397,20 @@ shapes (0.18 requests/s at 1.3k x 8 questions), 238 tok/s at 4k, 170 tok/s at 16
 f32 166 tok/s (1k), 131 at 16k, 105 at 32k (attention is quadratic); bf16 179. Peak RSS 6.5 GB (f32) / 5.6 GB (bf16),
 mostly the transient fp32 merge at load. llama.cpp b11514 on the same box (12 threads), base f16/bf16/f32 GGUF prefill
 pp512: 36.5 / 36.4 / 36.7 tok/s, q8_0 48.9 tok/s: cpu-bf16 is about 5-6x faster. Raw lines: runs/runner-bench/cpu/.
+
+Speed, Xeon E5-2698 v4 (Broadwell-EP, AVX2, no AVX-512; the first n physical cores of one socket in a vast.ai container
+with a 9.6-CPU quota, other tenants on the host; 2026-11-05; raw lines: Sepal runs/box-results/broadwell/): 4B `cpu-bf16`
+on ~950-token alerts, the original code (generic AVX2 kernels) against `avx2-tuned`, tokens/s: 1 core 10.7 -> 12.5,
+2 cores 19.8 -> 23.8, 4 cores 36.0 -> 43.8, 5 cores 43.1 -> 53.5, 9 cores 68.0 -> 83.4, 10 cores 71.1 -> 86.0 (12.9 s ->
+10.7 s per alert). The fp32 FMA peak of these cores falls from 106 GFLOP/s on one core to 78 per core on ten (the AVX
+clock drops from about 3.4 to 2.45 GHz as cores wake up); the GEMM runs at 84-85% of it (73% before), the whole trunk at
+78-84% (65-72% before). The container's default before the change, 40 threads under the 9.6-CPU quota, ran at 43.7;
+now 10 threads, 90.5. On 10 cores: a 16k-token log 62.2 -> 73.6 tok/s (258 s -> 216 s), TOOL requests (mean 4k tokens)
+66.2 -> 79.1, a 4k log asked 8 times with the prefix cache 191 tok/s (12 s per repeat request, 49 s without the cache);
+0.8B 412 -> 505 tok/s on short alerts, 310 -> 372 at 16k. Share of the time, short alerts: GEMM 89 -> 93%, DeltaNet
+8.0 -> 3.6%; 16k log: GEMM 79 -> 80%, attention 13 -> 14.5%, DeltaNet 5.7 -> 3.0%. Next to a memory-bandwidth neighbour
+(2 threads streaming 22 GB/s) on the same socket the runner loses 15%; on the other socket nothing. `cpu-q8` (vpmaddwd)
+stays slower than `cpu-bf16` on AVX2 (69.5 against 86.0 tok/s).
 
 ## Provenance
 
