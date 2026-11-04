@@ -26,5 +26,18 @@ using KernelFn = void (*)(const KernelArgs&);
 
 KernelFn kernel_avx2(Variant v);    // nullptr when `v` is not an AVX2 variant
 KernelFn kernel_avx512(Variant v);  // nullptr when `v` is not an AVX-512 variant
+KernelFn kernel_avx2_v3(Variant v); // nullptr when `v` is not a tuned AVX2 (x86-64-v3) variant
+
+/// The kernel of any variant (nullptr for BF16_Y, which `gemm_packed` runs as F32_Y on widened slices).
+inline KernelFn kernel_for(Variant v) {
+    switch (v) {
+    case Variant::F32_Z:
+    case Variant::BF16_Z:
+    case Variant::I8_Z: return kernel_avx512(v);
+    case Variant::F32_Y3:
+    case Variant::BF16_Y3: return kernel_avx2_v3(v);
+    default: return kernel_avx2(v);
+    }
+}
 
 } // namespace sepal::cpu

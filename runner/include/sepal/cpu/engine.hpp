@@ -28,6 +28,7 @@ struct CpuEngineOptions {
     std::size_t prefix_min_gain = 256;       // a new, longer state is only made when it adds at least this many tokens to the best hit
     bool force_isa = false;
     Isa isa = Isa::Avx2;
+    std::string cpus;                        // CPU list of the thread pool, e.g. "0-11" (Linux); empty: every allowed CPU
 };
 
 /// Parses "cpu-f32" / "cpu-bf16" / "cpu-q8"; throws std::invalid_argument for anything else.

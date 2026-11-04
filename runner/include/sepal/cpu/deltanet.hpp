@@ -13,6 +13,9 @@
 //     D = U - W S_0,   out_t = scale (Gam_t q_t . S_0 + sum_{i<=t} E_ti (q_t . k_i) D_i),
 //     S_C = Gam_C S_0 + sum_i E_Ci k_i (x) D_i.
 //
+// The chunked scan runs with subnormal floats flushed to zero (FTZ/DAZ, per task, restored afterwards): decays of
+// fast-forgetting heads fall below 1.2e-38 and would otherwise take a microcode assist on every operation.
+//
 // Both write the output rows directly and update the segment's state in place. Parallelism is over (segment, value
 // head, column slice of the value dimension): the columns of S evolve independently, so a thread count changes no sum.
 #pragma once

@@ -3,8 +3,10 @@
 // Weights are packed once at load into panels of `nr` output features; activations are packed per call (or once
 // for several weights that read the same input) into blocks of `mr` rows. Three weight kinds:
 //   F32   float32 weights, float32 activations, FMA.
-//   BF16  bfloat16 weights, activations rounded to bfloat16 (round to nearest even), float32 accumulation
-//         (vdpbf16ps on AVX-512 BF16; an exact-product FMA emulation on AVX2).
+//   BF16  bfloat16 weights, float32 accumulation; AVX-512 BF16 rounds the activations to bfloat16 (round to nearest
+//         even) and uses vdpbf16ps; the AVX2 sets keep float32 activations and widen the weights exactly (the generic
+//         set into a float panel slice per task, the tuned set inside the micro-kernel).
+//         Both AVX2 sets give bit-identical results.
 //   I8    int8 weights with one scale per output feature, int8 activations quantised dynamically with one scale per
 //         row, int32 accumulation (vpdpbusd on AVX-512 VNNI with the u8 x s8 offset trick; vpmaddwd on AVX2).
 //         Integer sums are exact, so any order gives the same result.
@@ -27,8 +29,8 @@ namespace sepal::cpu {
 enum class WeightKind { F32, BF16, I8 };
 const char* name_of(WeightKind kind);
 
-/// One kernel: the weight kind on one instruction-set family. Z = AVX-512, Y = AVX2.
-enum class Variant { F32_Z, F32_Y, BF16_Z, BF16_Y, I8_Z, I8_Y };
+/// One kernel: the weight kind on one instruction-set family. Z = AVX-512, Y = AVX2, Y3 = AVX2 tuned for x86-64-v3.
+enum class Variant { F32_Z, F32_Y, BF16_Z, BF16_Y, I8_Z, I8_Y, F32_Y3, BF16_Y3 };
 
 struct VariantInfo {
     WeightKind kind;
@@ -103,6 +105,17 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
 /// y [rows, n] (row stride ldy) = (accumulate ? y : 0) + x w^T. For SwiGLU weights n is the intermediate size and
 /// the result is silu(gate) * up (accumulate must be false). The variants of `w` and `x` and their k must agree.
 void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size_t ldy, bool accumulate, ThreadPool& pool);
+
+/// Blocking of the float kinds' k-blocked schedule: k values per slice, activation rows and output columns per task.
+struct GemmBlocking {
+    std::size_t kc = 256, rows = 96, cols = 64;
+    bool column_major = false;  // tasks ordered by output columns first: the threads share weight panels (L3) instead of activation slabs
+};
+/// The blocking `gemm_packed` uses for `v`: fixed for the generic and AVX-512 sets; for the tuned AVX2 set derived from the
+/// cache sizes (the weight and activation micro-panels of one k slice in half the L1D, the activation slab of a task in half
+/// the L2, tasks in column-major order). SEPAL_GEMM_KC / SEPAL_GEMM_ROWS / SEPAL_GEMM_COLS / SEPAL_GEMM_ROW_MAJOR=1 override it
+/// (tuning experiments). The blocking never changes a result: each output is one chain over k in increasing order.
+GemmBlocking gemm_blocking(Variant v);
 
 /// Floating-point operations of one product (2 m n k).
 inline double gemm_flops(std::size_t rows, std::size_t n, std::size_t k) {

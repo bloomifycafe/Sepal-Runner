@@ -20,7 +20,7 @@ constexpr std::size_t BK = attention_key_tile;
 
 std::size_t round_up(std::size_t a, std::size_t b) { return (a + b - 1) / b * b; }
 
-Variant f32_variant(Isa isa) { return isa == Isa::Avx512 ? Variant::F32_Z : Variant::F32_Y; }
+Variant f32_variant(Isa isa) { return pick_variant(WeightKind::F32, isa); }
 
 } // namespace
 
@@ -76,7 +76,7 @@ void run_task(const AttentionGeometry& geo, Isa isa, const AttentionSegment& seg
     const VariantInfo vi = info(variant);
     const std::size_t mr = static_cast<std::size_t>(vi.mr);
     const std::size_t nr = static_cast<std::size_t>(vi.nr);
-    const KernelFn kernel = isa == Isa::Avx512 ? kernel_avx512(variant) : kernel_avx2(variant);
+    const KernelFn kernel = kernel_for(variant);
     const std::size_t hd = geo.head_dim;
     const std::size_t group = geo.heads / geo.kv_heads;
     const std::size_t qn = std::min(bq, seg.rows - q0);

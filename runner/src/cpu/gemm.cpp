@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,8 @@ VariantInfo info(Variant v) {
     case Variant::BF16_Y: return {WeightKind::BF16, Isa::Avx2, 6, 16, 1, 2, 4}; // bf16 weights widened to a float panel, float activations
     case Variant::I8_Z: return {WeightKind::I8, Isa::Avx512, 12, 32, 4, 1, 1};
     case Variant::I8_Y: return {WeightKind::I8, Isa::Avx2, 4, 16, 2, 2, 2};
+    case Variant::F32_Y3: return {WeightKind::F32, Isa::Avx2Tuned, 6, 16, 1, 4, 4};
+    case Variant::BF16_Y3: return {WeightKind::BF16, Isa::Avx2Tuned, 6, 16, 1, 2, 4}; // bf16 panel, columns permuted for vpunpck*wd
     }
     throw std::logic_error("unknown GEMM variant");
 }
@@ -43,11 +46,20 @@ const char* name_of(Variant v) {
     case Variant::BF16_Y: return "bf16/avx2";
     case Variant::I8_Z: return "i8/avx512-vnni";
     case Variant::I8_Y: return "i8/avx2";
+    case Variant::F32_Y3: return "f32/avx2-tuned";
+    case Variant::BF16_Y3: return "bf16/avx2-tuned";
     }
     return "?";
 }
 
 Variant pick_variant(WeightKind kind, Isa isa) {
+    if (isa == Isa::Avx2Tuned) {
+        switch (kind) {
+        case WeightKind::F32: return Variant::F32_Y3;
+        case WeightKind::BF16: return Variant::BF16_Y3;
+        case WeightKind::I8: return Variant::I8_Y;
+        }
+    }
     const bool z = isa == Isa::Avx512;
     switch (kind) {
     case WeightKind::F32: return z ? Variant::F32_Z : Variant::F32_Y;
@@ -70,6 +82,9 @@ std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
 
 bool is_i8(Variant v) { return v == Variant::I8_Z || v == Variant::I8_Y; }
 
+// BF16_Y3 stores the 16 columns of a k step in the order [0..3, 8..11, 4..7, 12..15]: the slot of column jj.
+std::size_t y3_slot(std::size_t jj) { return jj < 4 || jj >= 12 ? jj : jj < 8 ? jj + 4 : jj - 4; }
+
 std::size_t kblocks_of(Variant v, std::size_t k) { return v == Variant::I8_Z ? ceil_div(k, kBlockValues) : 1; }
 
 std::int8_t quantise(float x, float inverse_scale) {
@@ -90,7 +105,7 @@ struct PanelPacker {
         const std::size_t g = static_cast<std::size_t>(vi.group);
         for (std::size_t jj = 0; jj < nr; ++jj) {
             const float* row = rows[jj];
-            if (variant == Variant::F32_Z || variant == Variant::F32_Y) {
+            if (variant == Variant::F32_Z || variant == Variant::F32_Y || variant == Variant::F32_Y3) {
                 float* d = reinterpret_cast<float*>(dst);
                 if (row != nullptr) {
                     for (std::size_t kk = 0; kk < k; ++kk) d[kk * nr + jj] = row[kk];
@@ -99,6 +114,12 @@ struct PanelPacker {
                 std::uint16_t* d = reinterpret_cast<std::uint16_t*>(dst);
                 if (row != nullptr) {
                     for (std::size_t kk = 0; kk < k; ++kk) d[((kk / g) * nr + jj) * g + kk % g] = float_to_bf16(row[kk]);
+                }
+            } else if (variant == Variant::BF16_Y3) {
+                std::uint16_t* d = reinterpret_cast<std::uint16_t*>(dst);
+                const std::size_t slot = y3_slot(jj);
+                if (row != nullptr) {
+                    for (std::size_t kk = 0; kk < k; ++kk) d[kk * nr + slot] = float_to_bf16(row[kk]);
                 }
             } else {
                 // I8_Z: one scale per (feature, block of kBlockValues); I8_Y: one per feature (a single block spanning k)
@@ -236,7 +257,9 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
             switch (variant) {
             case Variant::F32_Z:
             case Variant::BF16_Y: // AVX2 bf16 keeps float activations (the weights are widened exactly)
-            case Variant::F32_Y: {
+            case Variant::F32_Y:
+            case Variant::F32_Y3:
+            case Variant::BF16_Y3: {
                 float* d = reinterpret_cast<float*>(dst);
                 for (std::size_t kk = 0; kk < k; ++kk) d[kk * mr + r] = src[kk];
                 break;
@@ -271,6 +294,59 @@ void pack_acts(PackedActs& out, const float* x, std::size_t ldx, std::size_t row
             }
         }
     });
+}
+
+namespace {
+
+std::size_t env_size(const char* name) {
+#if defined(_MSC_VER)
+    char* env = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&env, &length, name) != 0 || env == nullptr) return 0;
+    const std::size_t value = std::strtoull(env, nullptr, 10);
+    std::free(env);
+    return value;
+#else
+    const char* env = std::getenv(name);
+    return env != nullptr ? std::strtoull(env, nullptr, 10) : 0;
+#endif
+}
+
+GemmBlocking tuned_blocking(Variant v) {
+    const VariantInfo vi = info(v);
+    const CacheSizes& cs = cache_sizes();
+    const std::size_t l1 = cs.l1d != 0 ? cs.l1d : 32 * 1024;
+    const std::size_t l2 = cs.l2 != 0 ? cs.l2 : 256 * 1024;
+    const std::size_t mr = static_cast<std::size_t>(vi.mr), nr = static_cast<std::size_t>(vi.nr);
+    GemmBlocking b;
+    // One k slice of the weight micro-panel (reused over the task's row blocks) and of one activation micro-panel in half the L1D.
+    const std::size_t per_k = nr * vi.weight_bytes + mr * vi.act_bytes;
+    b.kc = std::clamp<std::size_t>((l1 / 2) / per_k / 64 * 64, 64, 1024);
+    // The task's activation slab (rows x kc floats) in half the L2.
+    b.rows = std::clamp<std::size_t>((l2 / 2) / (b.kc * vi.act_bytes) / mr * mr, 4 * mr, 40 * mr);
+    b.cols = 4 * nr;
+    // Column-major task order: the threads work on the same weight panels at once (shared through L3, read from memory about
+    // once per product) instead of the same activation slab; 2% faster end to end on Broadwell, and less exposed to a
+    // neighbour that loads the memory controller.
+    b.column_major = true;
+    return b;
+}
+
+} // namespace
+
+GemmBlocking gemm_blocking(Variant v) {
+    GemmBlocking b;
+    if (info(v).isa == Isa::Avx2Tuned) {
+        static const GemmBlocking bf16 = tuned_blocking(Variant::BF16_Y3), f32 = tuned_blocking(Variant::F32_Y3);
+        b = v == Variant::BF16_Y3 ? bf16 : f32;
+        static const std::size_t kc = env_size("SEPAL_GEMM_KC"), rows = env_size("SEPAL_GEMM_ROWS"), cols = env_size("SEPAL_GEMM_COLS");
+        static const std::size_t row_major = env_size("SEPAL_GEMM_ROW_MAJOR");
+        if (row_major != 0) b.column_major = false;
+        if (kc != 0) b.kc = kc;
+        if (rows != 0) b.rows = rows;
+        if (cols != 0) b.cols = cols;
+    }
+    return b;
 }
 
 namespace {
@@ -317,7 +393,7 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
     if (x.rows == 0) return;
     const VariantInfo vi = info(w.variant());
     const bool widen = w.variant() == Variant::BF16_Y; // bf16 weight slices are widened to floats, then the F32 kernel runs
-    const KernelFn kernel = vi.isa == Isa::Avx512 ? kernel_avx512(w.variant()) : kernel_avx2(widen ? Variant::F32_Y : w.variant());
+    const KernelFn kernel = kernel_for(widen ? Variant::F32_Y : w.variant());
     if (kernel == nullptr) throw std::logic_error("gemm_packed: no kernel for the variant");
 
     const std::size_t mr = static_cast<std::size_t>(vi.mr);
@@ -327,20 +403,22 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
     const std::size_t group = static_cast<std::size_t>(vi.group);
 
     if (!i8) {
-        // k-blocked schedule (BLIS style): a task owns a block of ~96 rows and ~64 output columns, sweeps k in slices of
+        // k-blocked schedule (BLIS style): a task owns a block of rows and output columns (gemm_blocking: 96 x 64 for the generic
+        // and AVX-512 sets, from the cache sizes for the tuned AVX2 set), sweeps k in slices of
         // `kc` values, and keeps every micro tile of the block in `tiles` between slices, so the A slice (rows x kc)
         // and the B slices (columns x kc) stay in the L2 cache and every B panel slice is reused over all row blocks.
         // The accumulation order of one element is still increasing k in one fp32 chain: the result does not change.
-        constexpr std::size_t kc_values = 256, rows_per_task = 96, cols_per_task = 64;
-        const std::size_t kcg = std::max<std::size_t>(1, kc_values / group);
-        const std::size_t mbn = std::max<std::size_t>(1, rows_per_task / mr);
-        const std::size_t pn = std::max<std::size_t>(1, cols_per_task / nr);
+        const GemmBlocking blk = gemm_blocking(w.variant());
+        const std::size_t kcg = std::max<std::size_t>(1, blk.kc / group);
+        const std::size_t mbn = std::max<std::size_t>(1, blk.rows / mr);
+        const std::size_t pn = std::max<std::size_t>(1, blk.cols / nr);
         const std::size_t m_tasks = ceil_div(x.blocks, mbn);
         const std::size_t n_tasks = ceil_div(w.panels(), pn);
         const std::size_t tile_floats = mr * nr;
         const std::size_t a_block_stride = x.block_bytes;
         pool.parallel_for(m_tasks * n_tasks, [&](std::size_t task, unsigned) {
-            const std::size_t mt = task / n_tasks, nt = task % n_tasks;
+            const std::size_t mt = blk.column_major ? task % m_tasks : task / n_tasks;
+            const std::size_t nt = blk.column_major ? task / m_tasks : task % n_tasks;
             const std::size_t mb0 = mt * mbn, mb1 = std::min(x.blocks, mb0 + mbn);
             const std::size_t p0 = nt * pn, p1 = std::min(w.panels(), p0 + pn);
             thread_local AlignedBuffer<float> tiles, widened;

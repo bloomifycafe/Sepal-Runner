@@ -70,6 +70,9 @@ public:
     /// Hidden size of the trunk, for sepal_info (0: not reported).
     virtual std::uint64_t hidden_size() const { return 0; }
 
+    /// One line on how the engine runs (CPU: kernel set, blocking, threads and their placement), for sepal_info; empty: not reported.
+    virtual std::string runtime() const { return {}; }
+
     /// Times of the last `score` call.
     virtual ScoreTimes last_times() const { return {}; }
 };

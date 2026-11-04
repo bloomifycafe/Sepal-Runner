@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,6 +41,7 @@ std::vector<float> random_matrix(std::size_t rows, std::size_t cols, std::uint64
 
 std::vector<Isa> isas() {
     std::vector<Isa> out = {Isa::Avx2};
+    if (isa_supported(Isa::Avx2Tuned)) out.push_back(Isa::Avx2Tuned);
     if (isa_supported(Isa::Avx512)) out.push_back(Isa::Avx512);
     return out;
 }
@@ -141,8 +143,8 @@ SEPAL_TEST(cpu_gemm, bf16_matches_reference_on_rounded_inputs) {
             auto x = random_matrix(s.rows, s.k, 3);
             auto w = random_matrix(s.n, s.k, 4);
             const auto y = run_gemm(x, w, s.rows, s.n, s.k, WeightKind::BF16, isa, 2);
-            // The AVX2 variant keeps float activations (only the weights are bf16); AVX-512 BF16 rounds both.
-            if (pick_variant(WeightKind::BF16, isa) != Variant::BF16_Y)
+            // The AVX2 variants keep float activations (only the weights are bf16); AVX-512 BF16 rounds both.
+            if (pick_variant(WeightKind::BF16, isa) == Variant::BF16_Z)
                 for (float& v : x) v = round_bf16(v);
             for (float& v : w) v = round_bf16(v);
             std::vector<double> ref, bound;
@@ -284,6 +286,110 @@ SEPAL_TEST(cpu_gemm, swiglu_pair) {
         }
         CHECK(worst < 1e-5);
     }
+}
+
+SEPAL_TEST(cpu_gemm, tuned_avx2_is_bit_identical_to_generic_avx2) {
+    if (!isa_supported(Isa::Avx2Tuned)) return;
+    // Same products, same order of the sums: the tuned kernels (in-kernel bf16 widening, 4x unrolled assembly, cache-derived
+    // blocking) must give every bit of the generic AVX2 path, for both float kinds, odd shapes, k blocking and thread counts.
+    const Shape extra[] = {{7, 300, 1000}, {97, 129, 2600}, {200, 48, 513}};
+    for (const WeightKind kind : {WeightKind::F32, WeightKind::BF16}) {
+        for (int set = 0; set < 2; ++set) {
+            for (std::size_t i = 0; i < (set == 0 ? std::size(shapes) : std::size(extra)); ++i) {
+                const Shape s = set == 0 ? shapes[i] : extra[i];
+                const auto x = random_matrix(s.rows, s.k, 31);
+                const auto w = random_matrix(s.n, s.k, 32);
+                const auto generic = run_gemm(x, w, s.rows, s.n, s.k, kind, Isa::Avx2, 3);
+                for (const unsigned threads : {1u, 4u}) {
+                    const auto tuned = run_gemm(x, w, s.rows, s.n, s.k, kind, Isa::Avx2Tuned, threads);
+                    CHECK(std::memcmp(generic.data(), tuned.data(), generic.size() * sizeof(float)) == 0);
+                }
+            }
+        }
+    }
+    // SwiGLU pairs and accumulation as well.
+    const std::size_t rows = 37, n = 70, k = 777;
+    const auto x = random_matrix(rows, k, 41);
+    const auto g = random_matrix(n, k, 42), u = random_matrix(n, k, 43);
+    for (const WeightKind kind : {WeightKind::F32, WeightKind::BF16}) {
+        std::vector<float> out[2];
+        int i = 0;
+        for (const Isa isa : {Isa::Avx2, Isa::Avx2Tuned}) {
+            ThreadPool pool(2);
+            const PackedWeight pw = pack_weight_swiglu(g.data(), u.data(), k, n, k, kind, isa, pool);
+            PackedActs pa;
+            pack_acts(pa, x.data(), k, rows, k, pw.variant(), pool);
+            out[i].assign(rows * n, 0.0f);
+            gemm_packed(pw, pa, out[i].data(), n, false, pool);
+            const PackedWeight plain = pack_weight(g.data(), k, n, k, kind, isa, pool);
+            PackedActs pb;
+            pack_acts(pb, x.data(), k, rows, k, plain.variant(), pool);
+            gemm_packed(plain, pb, out[i].data(), n, true, pool);
+            ++i;
+        }
+        CHECK(std::memcmp(out[0].data(), out[1].data(), out[0].size() * sizeof(float)) == 0);
+    }
+}
+
+SEPAL_TEST(cpu_gemm, kernel_sets_names_features_and_refusal) {
+    CHECK(parse_isa("avx2") == Isa::Avx2);
+    CHECK(parse_isa("avx2-tuned") == Isa::Avx2Tuned);
+    CHECK(parse_isa("x86-64-v3") == Isa::Avx2Tuned);
+    CHECK(parse_isa("avx512") == Isa::Avx512);
+    CHECK_THROWS(parse_isa("sse2"), std::invalid_argument);
+    CHECK(std::string(name_of(Isa::Avx2Tuned)) == "avx2-tuned");
+    CHECK(missing_features(Isa::Avx2).empty());
+    // A set the CPU lacks is refused with the missing features named, never run.
+    for (const Isa isa : {Isa::Avx2Tuned, Isa::Avx512}) {
+        if (isa_supported(isa)) {
+            set_isa_override(isa);
+            CHECK(best_isa() == isa);
+            clear_isa_override();
+            continue;
+        }
+        bool named = false;
+        try {
+            require_isa(isa);
+        } catch (const std::runtime_error& e) {
+            named = std::string(e.what()).find(missing_features(isa)) != std::string::npos;
+        }
+        CHECK(named);
+        CHECK_THROWS(set_isa_override(isa), std::runtime_error);
+    }
+    if (isa_supported(Isa::Avx2Tuned) && !isa_supported(Isa::Avx512)) CHECK(best_isa() == Isa::Avx2Tuned || best_isa() == Isa::Avx2);
+    // The tuned blocking fits the caches it was derived from.
+    const GemmBlocking b = gemm_blocking(Variant::BF16_Y3);
+    CHECK(b.kc >= 64 && b.kc <= 1024 && b.rows % 6 == 0 && b.cols % 16 == 0);
+    if (cache_sizes().l1d != 0) CHECK(b.kc * (16 * 2 + 6 * 4) <= cache_sizes().l1d);
+}
+
+SEPAL_TEST(cpu_gemm, cpu_lists_and_pinned_pools) {
+    const std::vector<CpuSlot> all = cpu_slots();
+    CHECK_THROWS(cpu_slots(std::string("x-3")), std::invalid_argument);
+    CHECK_THROWS(cpu_slots(std::string("5-2")), std::invalid_argument);
+    if (all.empty()) return;  // no topology here (not Linux)
+    CHECK(physical_cores(all) >= 1);
+    // First threads of every core come first, then hyper-threads.
+    bool seen_sibling = false, order_ok = true;
+    for (const CpuSlot& s : all) {
+        if (!s.first_thread) seen_sibling = true;
+        else if (seen_sibling) order_ok = false;
+    }
+    CHECK(order_ok);
+    const std::string one = std::to_string(all[0].cpu);
+    const std::vector<CpuSlot> single = cpu_slots(one);
+    CHECK_EQ(single.size(), std::size_t{1});
+    CHECK_THROWS(cpu_slots(std::string("100000")), std::invalid_argument);
+    // A pool on an explicit list runs every task exactly once and reports its layout.
+    const std::string two = all.size() >= 2 ? one + "," + std::to_string(all[1].cpu) : one;
+    ThreadPool pool(0, two);
+    CHECK(pool.size() >= 1);
+    std::vector<std::atomic<int>> hits(500);
+    pool.parallel_for(500, [&](std::size_t i, unsigned) { hits[i].fetch_add(1); });
+    bool all_once = true;
+    for (auto& h : hits) all_once = all_once && h.load() == 1;
+    CHECK(all_once);
+    CHECK(!pool.layout().empty());
 }
 
 SEPAL_TEST(cpu_gemm, provider_interface) {

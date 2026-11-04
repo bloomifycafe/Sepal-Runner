@@ -336,9 +336,42 @@ Two things to know when reading planner output:
 GEMM (k-blocked, 96 x 64 tasks, fp32 chain per output so the result does not depend on threads or batch), chunked
 Gated DeltaNet, flash-style GQA attention, chunked-prefill trunk, and the Clef head. `sepal_runner_cpu` registers
 `cpu-f32`, `cpu-bf16` and `cpu-q8` next to the reference engines; extra open options: `chunk_tokens`, `step_tokens`,
-`delta_chunk`, `group_tokens`, and `q8` (a string with any of `mlp`, `attn`, `dn_in`). On AVX2, `cpu-bf16` keeps bf16
-weights (half the memory) and widens them to fp32 per cache block, so it runs the fp32 kernel with float activations.
-`cpu-q8` is opt-in only: it fails its gate (below).
+`delta_chunk`, `group_tokens`, `cpus`, `cpu_isa`, and `q8` (a string with any of `mlp`, `attn`, `dn_in`). On AVX2,
+`cpu-bf16` keeps bf16 weights (half the memory) and float activations, and widens the weights exactly to fp32, so it runs
+at the fp32 FMA rate. `cpu-q8` is opt-in only: it fails its gate (below).
+
+Kernel sets (`SEPAL_CPU_ISA`, the open option `cpu_isa`, or `sepal serve --cpu-isa`): `avx512` (AVX-512 BF16/VNNI),
+`avx2-tuned` (x86-64-v3: AVX2, FMA, F16C, BMI1/2, LZCNT, MOVBE; Haswell, Broadwell, Skylake client, Zen 1-3) and `avx2`
+(the generic fallback). The best set the CPU has is chosen automatically; a forced set the CPU lacks is refused at open
+with the missing features named, never run into an illegal instruction. `avx2-tuned` keeps the twelve accumulators of a
+6x16 tile in registers with the k loop unrolled four times in assembly (intrinsics under MSVC), widens bf16 inside the
+kernel with `vpunpck*wd` (port 5, otherwise idle), and derives its blocking from the cache sizes read with cpuid; its
+results are bit-identical to `avx2` (same products, same order of the sums). Buffers of 8 MiB and more are advised for
+transparent huge pages on Linux (`SEPAL_HUGEPAGES=0` turns that off).
+
+Threads: one per physical core of the CPUs the process may use (affinity mask, then the `cpus` list or `SEPAL_CPU_SET`),
+capped by a cgroup CPU quota, so a container limited to 10 CPUs of an 80-thread host runs 10 threads, not 40. When the
+pool owns its CPUs (no smaller quota, or an explicit list) each thread is pinned to its own physical core, filling one
+socket before the next (`SEPAL_CPU_PIN=auto|on|off`). Hyper-threads add nothing: the kernels are bound by the two FMA
+ports of a core. Idle workers spin for a few microseconds after a parallel step and then sleep, so an idle engine takes
+no CPU from a neighbour. `sepal serve` and `sepal-cpu-bench` print the kernel set, blocking and thread layout.
+
+### Running next to another engine (for example Strata on the same server)
+
+Give the runner its own physical cores, and on a two-socket server its own socket, so the two engines share neither FMA
+units nor (if possible) the L3 and memory controller:
+
+```sh
+lscpu -e=CPU,NODE,SOCKET,CORE          # which logical CPUs are which cores and sockets
+sepal serve BlossomsAI/Sepal-4B --cpus 8-19              # one socket of 20 cores: the other engine holds cores 0-7
+numactl --cpunodebind=1 --membind=1 sepal serve ... --cpus 20-39   # two sockets: the whole second socket, its own memory
+```
+
+`--cpus` (or `SEPAL_CPU_SET=8-19`) pins one thread per physical core of the list and lets the weights be first touched
+there; list only one hyper-thread per core, or let the runner skip the siblings (it uses one per core). Do not give the
+runner the other engine's cores: two compute-bound pools on one core run slower than either alone. Keep the runner on one
+socket unless it needs more cores than a socket has: a pool spread over two sockets reads half its weights over the
+inter-socket link.
 
 Tools: `sepal-cpu-eval` (parity against the golden set, per profile, T = 1 and calibrated, q8 against its bf16 twin),
 `sepal-cpu-bench` (tokens/s, requests/s, per-call latency, peak RSS on an encoded workload; `--phases` splits the trunk

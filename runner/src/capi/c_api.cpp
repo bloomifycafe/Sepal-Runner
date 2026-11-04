@@ -181,7 +181,7 @@ SEPAL_API int32_t sepal_info(sepal_engine* engine, char* buffer, uint64_t capaci
             const std::lock_guard<std::mutex> lock(engine->mutex);
             text = "{\"profile\": \"" + escaped(engine->engine->profile()) + "\", \"max_tokens\": " + std::to_string(engine->engine->max_tokens()) +
                    ", \"hidden_size\": " + std::to_string(engine->engine->hidden_size()) + ", \"backend\": \"" + escaped(engine->backend) +
-                   "\", \"api_version\": " + std::to_string(SEPAL_C_API_VERSION) + "}";
+                   "\", \"api_version\": " + std::to_string(SEPAL_C_API_VERSION) + ", \"runtime\": \"" + escaped(engine->engine->runtime()) + "\"}";
         }
         *needed = text.size() + 1;
         if (buffer == nullptr && capacity == 0) return 0; // size query

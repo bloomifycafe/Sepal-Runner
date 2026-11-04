@@ -23,7 +23,10 @@ python examples/client.py                 # one alert, two questions
 gated, so accept their terms on the Hub first, or point it at a directory you already have), looks at the CPU, RAM, GPU and free VRAM, and picks:
 
 - `gpu-f16` on a CUDA card with 12 GB and up, with `max_call_tokens`, `trunk_budget_mib`, `prefix_cache` and the context window computed from the free
-  VRAM; otherwise `cpu-bf16` with one thread per physical core and a prefix-state cache sized from the spare RAM.
+  VRAM; otherwise `cpu-bf16` with one thread per physical core of the CPUs it may use (capped by a container's CPU quota) and a
+  prefix-state cache sized from the spare RAM. Next to another engine on the same server, give it its own cores with `--cpus 8-19`
+  (one thread per physical core, pinned; see [runner/README.md](runner/README.md#running-next-to-another-engine-for-example-strata-on-the-same-server));
+  `--cpu-isa` forces a kernel set (`avx2-tuned` is chosen automatically on AVX2 CPUs without AVX-512, and a set the CPU lacks is refused).
 - `gpu-q8w` and `cpu-q8` (int8) only with `--allow-q8`, with a printed warning: on this model they exceed the q8 parity gate (see below).
 - A model that fits neither is refused before anything is loaded, with the numbers and what would fit.
 
