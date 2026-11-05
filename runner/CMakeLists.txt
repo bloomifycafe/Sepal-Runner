@@ -61,6 +61,7 @@ add_library(sepal_cpu STATIC
   src/cpu/clef_head.cpp
   src/cpu/engine.cpp
   src/cpu/gemm_kernels_avx2.cpp
+  src/cpu/gemm_kernels_avx2_v3.cpp
   src/cpu/gemm_kernels_avx512.cpp
   src/cpu/provider.cpp
 )
@@ -73,6 +74,9 @@ if(NOT MSVC)
   target_compile_options(sepal_cpu PRIVATE -mavx2 -mfma)
   set_source_files_properties(src/cpu/gemm_kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS
     "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512bf16")
+  # The tuned AVX2 set may use the whole x86-64-v3 level; best_isa() checks every feature with cpuid before choosing it.
+  set_source_files_properties(src/cpu/gemm_kernels_avx2_v3.cpp PROPERTIES COMPILE_OPTIONS
+    "-mavx2;-mfma;-mf16c;-mbmi;-mbmi2;-mlzcnt;-mmovbe;-mpopcnt")
 endif()
 
 add_executable(sepal-cpu-gemm-bench tools/sepal_cpu_gemm_bench.cpp)

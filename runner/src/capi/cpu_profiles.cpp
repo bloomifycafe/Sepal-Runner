@@ -1,7 +1,9 @@
 // The CPU library's profiles (sepal_runner_cpu): the C++ reference engines and the fast engines.
 //   cpu-f32, cpu-bf16, cpu-q8: packed-GEMM trunk + CPU Clef head (sepal/cpu/engine.hpp).
-// Extra option keys: "chunk_tokens", "step_tokens", "delta_chunk", "group_tokens" (numbers) and, for cpu-q8, "q8"
-// (a string naming the int8 groups: any of "mlp", "attn", "dn_in"; default all three).
+// Extra option keys: "chunk_tokens", "step_tokens", "delta_chunk", "group_tokens" (numbers), "cpus" (the CPU list of the
+// thread pool, e.g. "0-11"), "cpu_isa" (the kernel set: "auto", "avx2", "avx2-tuned", "avx512"; a set the CPU lacks is refused
+// with the missing features named) and, for cpu-q8, "q8" (a string naming the int8 groups: any of "mlp", "attn", "dn_in";
+// default all three).
 #include "sepal/cpu/engine.hpp"
 #include "sepal/engine.hpp"
 
@@ -23,6 +25,12 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
     number("group_tokens", opt.group_tokens);
     number("prefix_cache_mib", opt.prefix_cache_mib);
     number("prefix_min_tokens", opt.prefix_min_tokens);
+    if (const auto it = o.extra.find("cpus"); it != o.extra.end()) opt.cpus = it->second.as_string();
+    if (const auto it = o.extra.find("cpu_isa"); it != o.extra.end() && it->second.as_string() != "auto") {
+        opt.isa = cpu::parse_isa(it->second.as_string());
+        cpu::require_isa(opt.isa);
+        opt.force_isa = true;
+    }
     if (const auto it = o.extra.find("q8"); it != o.extra.end()) {
         const std::string& s = it->second.as_string();
         opt.q8.mlp = s.find("mlp") != std::string::npos;
@@ -38,7 +46,8 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
 
 void register_backend_profiles() {
     register_ref_profiles();
-    const std::vector<std::string> keys = {"chunk_tokens", "step_tokens", "delta_chunk", "group_tokens", "prefix_cache_mib", "prefix_min_tokens"};
+    const std::vector<std::string> keys = {"chunk_tokens", "step_tokens", "delta_chunk", "group_tokens", "prefix_cache_mib", "prefix_min_tokens",
+                                           "cpus", "cpu_isa"};
     for (const char* name : {"cpu-f32", "cpu-bf16"}) {
         const std::string profile = name;
         register_profile({profile, "cpu", keys, [profile](const EngineOptions& o) { return make_fast(profile, o); }});

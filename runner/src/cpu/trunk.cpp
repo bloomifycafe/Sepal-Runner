@@ -164,7 +164,7 @@ struct CpuTrunk::Impl {
     ActsCache acts_h, acts_c;
 
     Impl(const ModelConfig& c, const TrunkOptions& o, EmbeddingFn e)
-        : cfg(c), opt(o), isa(o.force_isa ? o.isa : best_isa()), pool(o.threads), embed(std::move(e)) {}
+        : cfg(c), opt(o), isa(o.force_isa ? (require_isa(o.isa), o.isa) : best_isa()), pool(o.threads, o.cpus), embed(std::move(e)) {}
 
     WeightKind kind_for(bool int8_group) const {
         switch (opt.profile) {

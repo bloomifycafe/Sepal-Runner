@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### 2026-11-05: LONG-LOG parity traced to the reference's bf16 error
+
+The LONG-LOG failure of the `cpu-bf16` gate (every CPU path, `cpu-f32` too) comes from the reference rows, not from the runner. An fp32 PyTorch
+forward (no autocast, same adapter, head, tokens and 24,576 window) on 6 of the 20 sample records, 89 questions: `cpu-f32` matches it to 2.9e-5
+in p (gate 1e-4), `cpu-bf16` to 0.032 (p99 0.016), the bf16 rows only to 0.048 (p99 0.026); the one flip in the sample is the bf16 row's. Nothing in
+the runner changed and the gates are unchanged. New `tools/runner_fp32_reference.py` (export a sample, score it with the fp32 oracle on a torch box,
+compare runner logits with both references) and `docs/PARITY-LONGLOG.md`.
+
+### 2026-11-05: tuned AVX2 kernel set (x86-64-v3), thread placement, Broadwell
+
+Measured on a Xeon E5-2698 v4 (Broadwell-EP, AVX2 + FMA, no AVX-512) in a vast.ai container with a 9.6-CPU quota; results and
+logs: Sepal `runs/box-results/broadwell/`. 4B `cpu-bf16` on 10 cores: short alerts 71.1 -> 86.0 tok/s (12.9 -> 10.7 s each),
+16k-token logs 62.2 -> 73.6 tok/s, TOOL requests 66.2 -> 79.1; 1 to 9 cores +17 to +24%; the container's default thread count
+43.7 -> 90.5. Parity of `avx2-tuned` against the PyTorch rows: SEC-dev 300 max |dp| 0.023, p99 0.009, 0 flips (passes);
+TOOL 60 max 0.0096, p99 0.0003, 0 flips (passes);
+LONG-LOG 20 max 0.049, p99 0.030, 1 flip in 262, the same as the original AVX2 code to 1.4e-5 (this panel was already over
+the gate with the original code and with AVX-512, 0.052 / 0.049 on 12 records).
+
+- New CPU kernel set `avx2-tuned`, chosen automatically on AVX2 CPUs without AVX-512 after a cpuid check of the whole x86-64-v3
+  level (`SEPAL_CPU_ISA`, open option `cpu_isa`, `sepal serve --cpu-isa`; a set the CPU lacks is refused with the missing features
+  named). 6x16 micro-kernels with all twelve accumulators in registers, the k loop unrolled four times in GCC/Clang assembly
+  (intrinsics under MSVC), bf16 weights widened inside the kernel (`vpunpck*wd` on port 5) instead of a separate pass, blocking
+  derived from the cache sizes read with cpuid. Bit-identical to the generic `avx2` set (test
+  `cpu_gemm.tuned_avx2_is_bit_identical_to_generic_avx2`).
+- Thread count: physical cores of the allowed CPUs capped by a cgroup CPU quota (a 10-CPU container on an 80-thread host ran 40
+  spinning threads before); threads pinned one per physical core, one socket first, when the pool owns its CPUs; `cpus` option,
+  `SEPAL_CPU_SET` and `sepal serve --cpus` to keep the runner off another engine's cores; `SEPAL_CPU_PIN=auto|on|off`.
+  `sepal serve` no longer passes psutil's host core count; it prints the kernel set and thread layout (`sepal_info` field `runtime`).
+- Buffers of 8 MiB and more advised for transparent huge pages on Linux (`SEPAL_HUGEPAGES=0` turns it off).
+- DeltaNet: its micro-GEMM keeps the accumulators in named registers (GCC kept the `__m256 acc[R][NV]` array in memory and
+  stored all of it on every k step), row blocks of 6; chunk preparation as small register-tiled products (q.k and k.k, the
+  blocked forward substitution, the intra-chunk output); the units buffer is kept between layers; subnormal floats are flushed
+  to zero inside the scan's tasks (MXCSR FTZ/DAZ, restored after each task): fast-forgetting heads produce decays below
+  1.2e-38, and every operation on them took a microcode assist. 4B, 10 Broadwell cores, three ~860-token requests: DeltaNet
+  2.90 s -> 1.08 s. Results change only through the one-chain sums of q.k and k.k and the flushed subnormals (parity below).
+  A one-task-per-head variant (units kept in L2) was faster on synthetic data but 2x slower on the real model (a few heads
+  dominate) and is not kept.
+- `AlignedBuffer` move now carries the capacity (a moved-from buffer could be resized into a null pointer).
+- `sepal-cpu-gemm-bench --shapes 4b|0.8b --isa avx2-tuned --peak-core GFLOPS`; `sepal-cpu-bench --cpus --cpu-isa --prefix-cache-mib`.
+
 ### 2026-11-01: `sepal serve`, int8 blocks, CPU prefix states
 
 - `sepal serve MODEL` (`sepal_runner/cli.py`): fetch, hardware plan, serve; `/v1/models`, `/healthz`, `/readyz`; `examples/client.py`; `docker/Dockerfile.cpu`

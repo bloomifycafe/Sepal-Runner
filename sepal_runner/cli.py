@@ -271,6 +271,17 @@ class Plan:
     need: str = ""
 
 
+def _cpu_options(args) -> dict:
+    options: dict = {}
+    if getattr(args, "threads", 0):
+        options["threads"] = args.threads
+    if getattr(args, "cpus", None):
+        options["cpus"] = args.cpus
+    if getattr(args, "cpu_isa", "auto") not in (None, "auto"):
+        options["cpu_isa"] = args.cpu_isa
+    return options
+
+
 def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     notes: list[str] = []
     cpu_lib, gpu_lib = find_library("cpu", args.lib), find_library("cuda", args.lib)
@@ -323,7 +334,9 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
                 if cpu_profile == "cpu-q8":
                     notes.append("WARNING: cpu-q8 serves int8 weights and activations; on this model it exceeds the documented q8 gate (max |dp| 0.14 on 300 SEC-dev "
                                  "records, p99 0.034, 1 flip in 432). Answers near 0.5 can move by 0.1. It is about 1.5x faster than cpu-bf16 and needs 5.7 GiB for 4B.")
-                options = {"threads": hw.cores}
+                # Threads: one per physical core of the CPUs this process may use (affinity, --cpus), capped by a cgroup CPU quota;
+                # the engine counts them itself, so a container limited to 10 CPUs of an 80-thread host runs 10, not 40.
+                options = _cpu_options(args)
                 spare_mib = int((budget - need) * 0.4) // MIB
                 if spare_mib >= 512:       # states of shared log prefixes: the same log asked with other questions only runs its tail
                     options["prefix_cache_mib"] = min(2048, spare_mib)
@@ -366,6 +379,9 @@ def serve(args) -> int:
         return 0
     options = {"workers": args.workers, "cache_size": args.cache_size, "max_pending": args.max_pending, "request_timeout_s": args.request_timeout}
     service, engine = server.load_service(str(final), str(base), plan.lib, plan.profile, name, window=plan.window, engine_options=plan.engine_options, **options)
+    runtime = getattr(engine, "info", {}).get("runtime") if hasattr(engine, "info") else None
+    if runtime:
+        print(f"runtime : {runtime}")
     info = {"profile": plan.profile, "window": plan.window, "base": meta["base"]["id"]}
     httpd = server.serve(service, name, host, args.port, args.api_key, info)
     print(f"serving : http://{host}:{args.port}/v1/systemone   (also /v1/models /healthz /readyz /metrics)"
@@ -399,6 +415,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cache-size", type=int, default=4096)
     p.add_argument("--max-pending", type=int, default=512)
     p.add_argument("--request-timeout", type=float, default=600.0)
+    p.add_argument("--threads", type=int, default=0,
+                   help="CPU engine threads (default: one per physical core of the allowed CPUs, capped by a cgroup CPU quota)")
+    p.add_argument("--cpus", default=os.environ.get("SEPAL_CPU_SET"),
+                   help="CPU list for the CPU engine, e.g. 0-11 (Linux): its threads are pinned there, one per physical core, "
+                        "so it stays off the cores of another engine on the same machine")
+    p.add_argument("--cpu-isa", default=os.environ.get("SEPAL_CPU_ISA", "auto"), choices=["auto", "avx2", "avx2-tuned", "x86-64-v3", "avx512"],
+                   help="CPU kernel set (default: the best one the CPU has; a set it lacks is refused with the missing features named)")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     args = parser.parse_args(argv)
     return serve(args)

@@ -205,7 +205,7 @@ SEPAL_TEST(cpu_attention, matches_a_double_precision_softmax) {
     struct Shape {
         std::size_t heads, kv, hd;
     };
-    for (const Isa isa : {Isa::Avx2, Isa::Avx512}) {
+    for (const Isa isa : {Isa::Avx2, Isa::Avx2Tuned, Isa::Avx512}) {
         if (!isa_supported(isa)) continue;
         for (const Shape sh : {Shape{4, 2, 32}, Shape{8, 2, 64}, Shape{2, 2, 32}}) {
             const std::size_t total = 330, start = 100;

@@ -27,7 +27,14 @@ def hw(ram=32, gpu=None):
 
 def test_cpu_only_gets_cpu_bf16():
     plan = cli.make_plan(FOUR_B, hw(32), 24576, args())
-    assert plan.profile == "cpu-bf16" and plan.window == 24576 and plan.engine_options["threads"] == 6
+    # The engine counts its threads (physical cores of the allowed CPUs, capped by a cgroup quota): the plan does not guess them.
+    assert plan.profile == "cpu-bf16" and plan.window == 24576 and "threads" not in plan.engine_options
+
+
+def test_cpu_threads_cpus_and_kernel_set_pass_through():
+    plan = cli.make_plan(FOUR_B, hw(32), 24576, args(threads=12, cpus="8-19", cpu_isa="avx2-tuned"))
+    assert plan.engine_options["threads"] == 12 and plan.engine_options["cpus"] == "8-19" and plan.engine_options["cpu_isa"] == "avx2-tuned"
+    assert "cpu_isa" not in cli.make_plan(FOUR_B, hw(32), 24576, args(cpu_isa="auto")).engine_options
 
 
 def test_12gb_card_gets_gpu_f16_with_a_window_that_fits():

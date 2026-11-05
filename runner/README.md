@@ -336,9 +336,44 @@ Two things to know when reading planner output:
 GEMM (k-blocked, 96 x 64 tasks, fp32 chain per output so the result does not depend on threads or batch), chunked
 Gated DeltaNet, flash-style GQA attention, chunked-prefill trunk, and the Clef head. `sepal_runner_cpu` registers
 `cpu-f32`, `cpu-bf16` and `cpu-q8` next to the reference engines; extra open options: `chunk_tokens`, `step_tokens`,
-`delta_chunk`, `group_tokens`, and `q8` (a string with any of `mlp`, `attn`, `dn_in`). On AVX2, `cpu-bf16` keeps bf16
-weights (half the memory) and widens them to fp32 per cache block, so it runs the fp32 kernel with float activations.
-`cpu-q8` is opt-in only: it fails its gate (below).
+`delta_chunk`, `group_tokens`, `cpus`, `cpu_isa`, and `q8` (a string with any of `mlp`, `attn`, `dn_in`). On AVX2,
+`cpu-bf16` keeps bf16 weights (half the memory) and float activations, and widens the weights exactly to fp32, so it runs
+at the fp32 FMA rate. `cpu-q8` is opt-in only: it fails its gate (below).
+
+Kernel sets (`SEPAL_CPU_ISA`, the open option `cpu_isa`, or `sepal serve --cpu-isa`): `avx512` (AVX-512 BF16/VNNI),
+`avx2-tuned` (x86-64-v3: AVX2, FMA, F16C, BMI1/2, LZCNT, MOVBE; Haswell, Broadwell, Skylake client, Zen 1-3) and `avx2`
+(the generic fallback). The best set the CPU has is chosen automatically; a forced set the CPU lacks is refused at open
+with the missing features named, never run into an illegal instruction. `avx2-tuned` keeps the twelve accumulators of a
+6x16 tile in registers with the k loop unrolled four times in assembly (intrinsics under MSVC), widens bf16 inside the
+kernel with `vpunpck*wd` (port 5, otherwise idle), and derives its blocking from the cache sizes read with cpuid; its
+results are bit-identical to `avx2` (same products, same order of the sums). Buffers of 8 MiB and more are advised for
+transparent huge pages on Linux (`SEPAL_HUGEPAGES=0` turns that off).
+
+Threads: one per physical core of the CPUs the process may use (affinity mask, then the `cpus` list or `SEPAL_CPU_SET`),
+capped by a cgroup CPU quota, so a container limited to 10 CPUs of an 80-thread host runs 10 threads, not 40. When the
+pool owns its CPUs (no smaller quota, or an explicit list) each worker is pinned to its own physical core, filling one
+socket before the next, and the calling thread is kept on the pool's CPUs without being tied to one of them (tied to a
+CPU that interrupts or a neighbour also use, loading 4B took 109 s instead of 35 s) (`SEPAL_CPU_PIN=auto|on|off`).
+Hyper-threads add nothing: the kernels are bound by the two FMA
+ports of a core. Idle workers spin for a few microseconds after a parallel step and then sleep, so an idle engine takes
+no CPU from a neighbour. `sepal serve` and `sepal-cpu-bench` print the kernel set, blocking and thread layout.
+
+### Running next to another engine (for example Strata on the same server)
+
+Give the runner its own physical cores, and on a two-socket server its own socket, so the two engines share neither FMA
+units nor (if possible) the L3 and memory controller:
+
+```sh
+lscpu -e=CPU,NODE,SOCKET,CORE          # which logical CPUs are which cores and sockets
+sepal serve BlossomsAI/Sepal-4B --cpus 8-19              # one socket of 20 cores: the other engine holds cores 0-7
+numactl --cpunodebind=1 --membind=1 sepal serve ... --cpus 20-39   # two sockets: the whole second socket, its own memory
+```
+
+`--cpus` (or `SEPAL_CPU_SET=8-19`) pins one thread per physical core of the list and lets the weights be first touched
+there; list only one hyper-thread per core, or let the runner skip the siblings (it uses one per core). Do not give the
+runner the other engine's cores: two compute-bound pools on one core run slower than either alone. Keep the runner on one
+socket unless it needs more cores than a socket has: a pool spread over two sockets reads half its weights over the
+inter-socket link.
 
 Tools: `sepal-cpu-eval` (parity against the golden set, per profile, T = 1 and calibrated, q8 against its bf16 twin),
 `sepal-cpu-bench` (tokens/s, requests/s, per-call latency, peak RSS on an encoded workload; `--phases` splits the trunk
@@ -351,6 +386,11 @@ cpu-q8 (int8 x int8, MLP + attention + DeltaNet input) vs its bf16 twin: max |dp
 (gate 0.05 / 1%); each weight group alone is still above 0.03. On AVX2 it is also slower than fp32 and stores 16-bit
 pairs, so there is no gain. Keep it off.
 
+LONG-LOG against the Unsloth bf16 rows fails the cpu-bf16 gate on every CPU path (max |dp| 0.049-0.052, p99 0.030-0.049, 1 flip in 262), cpu-f32
+included, because the rows are bf16: against a PyTorch fp32 forward on the same tokens (6 records, 89 questions) cpu-f32 is within 2.9e-5 in p and
+2.5e-4 in logits, cpu-bf16 within 0.032 (p99 0.016) while the bf16 rows are 0.048 (p99 0.026) away. No runner arithmetic is at fault; see
+docs/PARITY-LONGLOG.md and `tools/runner_fp32_reference.py`.
+
 The default thread count is the physical cores (`default_thread_count()`): on the 5600X 12 threads (SMT) ran 20-25%
 slower than 6 (bf16, t1k_q8: 3 / 6 / 9 / 12 threads = 143 / 233 / 181 / 181 tok/s).
 
@@ -362,6 +402,20 @@ shapes (0.18 requests/s at 1.3k x 8 questions), 238 tok/s at 4k, 170 tok/s at 16
 f32 166 tok/s (1k), 131 at 16k, 105 at 32k (attention is quadratic); bf16 179. Peak RSS 6.5 GB (f32) / 5.6 GB (bf16),
 mostly the transient fp32 merge at load. llama.cpp b11514 on the same box (12 threads), base f16/bf16/f32 GGUF prefill
 pp512: 36.5 / 36.4 / 36.7 tok/s, q8_0 48.9 tok/s: cpu-bf16 is about 5-6x faster. Raw lines: runs/runner-bench/cpu/.
+
+Speed, Xeon E5-2698 v4 (Broadwell-EP, AVX2, no AVX-512; the first n physical cores of one socket in a vast.ai container
+with a 9.6-CPU quota, other tenants on the host; 2026-11-05; raw lines: Sepal runs/box-results/broadwell/): 4B `cpu-bf16`
+on ~950-token alerts, the original code (generic AVX2 kernels) against `avx2-tuned`, tokens/s: 1 core 10.7 -> 12.5,
+2 cores 19.8 -> 23.8, 4 cores 36.0 -> 43.8, 5 cores 43.1 -> 53.5, 9 cores 68.0 -> 83.4, 10 cores 71.1 -> 86.0 (12.9 s ->
+10.7 s per alert). The fp32 FMA peak of these cores falls from 106 GFLOP/s on one core to 78 per core on ten (the AVX
+clock drops from about 3.4 to 2.45 GHz as cores wake up); the GEMM runs at 84-85% of it (73% before), the whole trunk at
+78-84% (65-72% before). The container's default before the change, 40 threads under the 9.6-CPU quota, ran at 43.7;
+now 10 threads, 90.5. On 10 cores: a 16k-token log 62.2 -> 73.6 tok/s (258 s -> 216 s), TOOL requests (mean 4k tokens)
+66.2 -> 79.1, a 4k log asked 8 times with the prefix cache 191 tok/s (12 s per repeat request, 49 s without the cache);
+0.8B 412 -> 505 tok/s on short alerts, 310 -> 372 at 16k. Share of the time, short alerts: GEMM 89 -> 93%, DeltaNet
+8.0 -> 3.6%; 16k log: GEMM 79 -> 80%, attention 13 -> 14.5%, DeltaNet 5.7 -> 3.0%. Next to a memory-bandwidth neighbour
+(2 threads streaming 22 GB/s) on the same socket the runner loses 15%; on the other socket nothing. `cpu-q8` (vpmaddwd)
+stays slower than `cpu-bf16` on AVX2 (69.5 against 86.0 tok/s).
 
 ## Provenance
 

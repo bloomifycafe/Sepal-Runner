@@ -34,17 +34,6 @@ void check(const DeltaGeometry& g) {
 
 // ---- small vector kernels ---------------------------------------------------------------------------------------
 
-float dot(const float* a, const float* b, std::size_t n) {
-    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-    std::size_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
-    }
-    for (; i + 8 <= n; i += 8) s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-    return hsum_ps(_mm256_add_ps(s0, s1));
-}
-
 // y += a * x
 void axpy(std::size_t n, float a, const float* x, float* y) {
     const __m256 av = _mm256_set1_ps(a);
@@ -54,23 +43,42 @@ void axpy(std::size_t n, float a, const float* x, float* y) {
 }
 
 // C[R x 8*NV] += (NEG ? -1 : 1) * A[R x K] B[K x 8*NV]; A element (r, p) is a[r * ars + p * acs]; rows of B at stride ldb.
+// The accumulators are named variables, not an array: GCC kept an `__m256 acc[R][NV]` array in memory as well and stored
+// all twelve accumulators to the stack on every k step (store-port bound, under half the FMA rate).
+#define SEPAL_NN_ACC(r)                                                                                      \
+    [[maybe_unused]] __m256 c##r##0 = _mm256_setzero_ps(), c##r##1 = _mm256_setzero_ps();                     \
+    if constexpr (R > r) {                                                                                    \
+        c##r##0 = _mm256_loadu_ps(c + (r) * ldc);                                                             \
+        if constexpr (NV > 1) c##r##1 = _mm256_loadu_ps(c + (r) * ldc + 8);                                   \
+    }
+#define SEPAL_NN_STEP(r)                                                                                      \
+    if constexpr (R > r) {                                                                                    \
+        const __m256 av = _mm256_broadcast_ss(ap + (r) * ars);                                                \
+        c##r##0 = NEG ? _mm256_fnmadd_ps(av, b0, c##r##0) : _mm256_fmadd_ps(av, b0, c##r##0);                 \
+        if constexpr (NV > 1) c##r##1 = NEG ? _mm256_fnmadd_ps(av, b1, c##r##1) : _mm256_fmadd_ps(av, b1, c##r##1); \
+    }
+#define SEPAL_NN_STORE(r)                                                                                     \
+    if constexpr (R > r) {                                                                                    \
+        _mm256_storeu_ps(c + (r) * ldc, c##r##0);                                                             \
+        if constexpr (NV > 1) _mm256_storeu_ps(c + (r) * ldc + 8, c##r##1);                                   \
+    }
 template <int R, int NV, bool NEG>
 void micro_nn(float* c, std::size_t ldc, const float* a, std::size_t ars, std::size_t acs, const float* b, std::size_t ldb,
               std::size_t k) {
-    __m256 acc[static_cast<std::size_t>(R)][static_cast<std::size_t>(NV)];
-    for (int r = 0; r < R; ++r)
-        for (int v = 0; v < NV; ++v) acc[r][v] = _mm256_loadu_ps(c + static_cast<std::size_t>(r) * ldc + 8 * static_cast<std::size_t>(v));
-    for (std::size_t p = 0; p < k; ++p) {
-        __m256 bv[static_cast<std::size_t>(NV)];
-        for (int v = 0; v < NV; ++v) bv[v] = _mm256_loadu_ps(b + p * ldb + 8 * static_cast<std::size_t>(v));
-        for (int r = 0; r < R; ++r) {
-            const __m256 av = _mm256_broadcast_ss(a + static_cast<std::size_t>(r) * ars + p * acs);
-            for (int v = 0; v < NV; ++v) acc[r][v] = NEG ? _mm256_fnmadd_ps(av, bv[v], acc[r][v]) : _mm256_fmadd_ps(av, bv[v], acc[r][v]);
-        }
+    static_assert(R >= 1 && R <= 6 && (NV == 1 || NV == 2), "micro_nn: up to 6 rows and 2 vectors");
+    SEPAL_NN_ACC(0) SEPAL_NN_ACC(1) SEPAL_NN_ACC(2) SEPAL_NN_ACC(3) SEPAL_NN_ACC(4) SEPAL_NN_ACC(5)
+    const float* ap = a;
+    const float* bp = b;
+    for (std::size_t p = 0; p < k; ++p, ap += acs, bp += ldb) {
+        const __m256 b0 = _mm256_loadu_ps(bp);
+        [[maybe_unused]] const __m256 b1 = NV > 1 ? _mm256_loadu_ps(bp + 8) : b0;
+        SEPAL_NN_STEP(0) SEPAL_NN_STEP(1) SEPAL_NN_STEP(2) SEPAL_NN_STEP(3) SEPAL_NN_STEP(4) SEPAL_NN_STEP(5)
     }
-    for (int r = 0; r < R; ++r)
-        for (int v = 0; v < NV; ++v) _mm256_storeu_ps(c + static_cast<std::size_t>(r) * ldc + 8 * static_cast<std::size_t>(v), acc[r][v]);
+    SEPAL_NN_STORE(0) SEPAL_NN_STORE(1) SEPAL_NN_STORE(2) SEPAL_NN_STORE(3) SEPAL_NN_STORE(4) SEPAL_NN_STORE(5)
 }
+#undef SEPAL_NN_ACC
+#undef SEPAL_NN_STEP
+#undef SEPAL_NN_STORE
 
 template <int R, bool NEG>
 void row_block_nn(float* c, std::size_t ldc, const float* a, std::size_t ars, std::size_t acs, const float* b, std::size_t ldb,
@@ -80,13 +88,17 @@ void row_block_nn(float* c, std::size_t ldc, const float* a, std::size_t ars, st
     if (n0 + 8 <= n) micro_nn<R, 1, NEG>(c + n0, ldc, a, ars, acs, b + n0, ldb, k);
 }
 
-// C[M x N] += (NEG ? -1 : 1) A[M x K] B[K x N], N a multiple of 8, with the k loop in increasing order.
+// C[M x N] += (NEG ? -1 : 1) A[M x K] B[K x N], N a multiple of 8, with the k loop in increasing order. Row blocks of 6 keep
+// 12 independent accumulators in flight (an FMA latency of 4 to 5 cycles on two ports needs 8 to 10); every element is
+// still one chain over k in increasing order, so the blocking does not change any result.
 template <bool NEG>
 void gemm_nn(float* c, std::size_t ldc, const float* a, std::size_t ars, std::size_t acs, const float* b, std::size_t ldb,
              std::size_t m, std::size_t n, std::size_t k) {
     std::size_t r = 0;
-    for (; r + 4 <= m; r += 4) row_block_nn<4, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k);
+    for (; r + 6 <= m; r += 6) row_block_nn<6, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k);
     switch (m - r) {
+    case 5: row_block_nn<5, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k); break;
+    case 4: row_block_nn<4, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k); break;
     case 3: row_block_nn<3, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k); break;
     case 2: row_block_nn<2, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k); break;
     case 1: row_block_nn<1, NEG>(c + r * ldc, ldc, a + r * ars, ars, acs, b, ldb, n, k); break;
@@ -142,9 +154,23 @@ void sequential_slice(const DeltaGeometry& geo, const DeltaSegment& s, std::size
 
 // ---- chunked recurrence -----------------------------------------------------------------------------------------
 
+// Subnormal floats flushed to zero (MXCSR FTZ and DAZ) for the length of one task, then the caller's mode is restored. Heads
+// that forget fast push the decays exp(G_t - G_i) and their products below 1.2e-38, and every operation on such a value
+// takes a microcode assist on Intel cores: on Broadwell the scan of one 4B layer ran 15x slower with strong decay (227 ms
+// against 15 ms), and the real model's scan 2.1x slower. Their contribution to any output is below 1e-38 of it.
+struct FlushSubnormals {
+    unsigned saved = _mm_getcsr();
+    FlushSubnormals() { _mm_setcsr(saved | 0x8040u); }
+    ~FlushSubnormals() { _mm_setcsr(saved); }
+    FlushSubnormals(const FlushSubnormals&) = delete;
+    FlushSubnormals& operator=(const FlushSubnormals&) = delete;
+};
+
 struct Scratch {
-    AlignedBuffer<float> a, p, erow, gc, gam;
-    Scratch() : a(max_chunk * max_chunk), p(max_chunk * max_chunk), erow(max_chunk + 8), gc(max_chunk + 8), gam(max_chunk + 8) {}
+    AlignedBuffer<float> a, p, erow, gc, gam, kt, sq, sk;
+    Scratch()
+        : a(max_chunk * max_chunk), p(max_chunk * max_chunk), erow(max_chunk + 8), gc(max_chunk + 8), gam(max_chunk + 8),
+          sq(max_chunk * max_chunk), sk(max_chunk * max_chunk) {}
 };
 
 // A unit holds the state-independent results of one (segment, head, chunk).
@@ -194,6 +220,19 @@ void prepare_chunk(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t 
     for (std::size_t i = c; i < max_chunk + 8; ++i) gc[i] = 0.0f;
     *u.gamma = gam[c - 1];
 
+    // q_t . k_i and k_t . k_i of the chunk as two small products against K^T (columns padded to a multiple of 8 with zeros):
+    // register-tiled FMAs instead of one horizontal reduction per pair.
+    const std::size_t cp = (c + 7) / 8 * 8;
+    w.kt.resize(dk * max_chunk);
+    float* const KT = w.kt.data();
+    for (std::size_t i = 0; i < cp; ++i)
+        for (std::size_t d = 0; d < dk; ++d) KT[d * cp + i] = i < c ? K[i * ld_in + d] : 0.0f;
+    float* const SQ = w.sq.data();
+    float* const SK = w.sk.data();
+    std::memset(SQ, 0, c * cp * sizeof(float));
+    std::memset(SK, 0, c * cp * sizeof(float));
+    gemm_nn<false>(SQ, cp, Q, ld_in, 1, KT, cp, c, cp, dk);
+    gemm_nn<false>(SK, cp, K, ld_in, 1, KT, cp, c, cp, dk);
     for (std::size_t t = 0; t < c; ++t) {
         const __m256 gt = _mm256_set1_ps(gc[t]);
         for (std::size_t i0 = 0; i0 <= t; i0 += 8) {
@@ -201,35 +240,48 @@ void prepare_chunk(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t 
         }
         const float beta_t = bp[t * hv];
         for (std::size_t i = 0; i <= t; ++i) {
-            P[t * max_chunk + i] = erow[i] * dot(Q + t * ld_in, K + i * ld_in, dk);
-            if (i < t) A[t * max_chunk + i] = beta_t * erow[i] * dot(K + t * ld_in, K + i * ld_in, dk);
+            P[t * max_chunk + i] = erow[i] * SQ[t * cp + i];
+            A[t * max_chunk + i] = i < t ? beta_t * erow[i] * SK[t * cp + i] : 0.0f;
         }
+        for (std::size_t i = t + 1; i < cp; ++i) P[t * max_chunk + i] = A[t * max_chunk + i] = 0.0f;
     }
 
-    // (I + A) [U | W] = [beta V | beta Gam K], forward substitution row by row.
-    for (std::size_t t = 0; t < c; ++t) {
-        float* row = u.uw + t * ldx;
-        const float beta_t = bp[t * hv];
-        const __m256 bv = _mm256_set1_ps(beta_t);
-        const __m256 bg = _mm256_set1_ps(beta_t * gam[t]);
-        for (std::size_t j = 0; j < dv; j += 8) _mm256_storeu_ps(row + j, _mm256_mul_ps(bv, _mm256_loadu_ps(V + t * ld_in + j)));
-        for (std::size_t j = 0; j < dk; j += 8) _mm256_storeu_ps(row + dv + j, _mm256_mul_ps(bg, _mm256_loadu_ps(K + t * ld_in + j)));
-        for (std::size_t i = 0; i < t; ++i) axpy(ldx, -A[t * max_chunk + i], u.uw + i * ldx, row);
+    // (I + A) [U | W] = [beta V | beta Gam K], forward substitution in blocks of 8 rows: the rows of a block first take the
+    // finished rows above it as one product, then each other within the block. Every element still subtracts A_ti x_i in
+    // increasing i in one chain, exactly as row-by-row substitution.
+    for (std::size_t tb = 0; tb < c; tb += 8) {
+        const std::size_t te = std::min(c, tb + 8);
+        for (std::size_t t = tb; t < te; ++t) {
+            float* row = u.uw + t * ldx;
+            const float beta_t = bp[t * hv];
+            const __m256 bv = _mm256_set1_ps(beta_t);
+            const __m256 bg = _mm256_set1_ps(beta_t * gam[t]);
+            for (std::size_t j = 0; j < dv; j += 8) _mm256_storeu_ps(row + j, _mm256_mul_ps(bv, _mm256_loadu_ps(V + t * ld_in + j)));
+            for (std::size_t j = 0; j < dk; j += 8) _mm256_storeu_ps(row + dv + j, _mm256_mul_ps(bg, _mm256_loadu_ps(K + t * ld_in + j)));
+        }
+        if (tb > 0) gemm_nn<true>(u.uw + tb * ldx, ldx, A + tb * max_chunk, max_chunk, 1, u.uw, ldx, te - tb, ldx, tb);
+        for (std::size_t t = tb + 1; t < te; ++t)
+            for (std::size_t i = tb; i < t; ++i) axpy(ldx, -A[t * max_chunk + i], u.uw + i * ldx, u.uw + t * ldx);
     }
 
-    // Qe_t = scale (Gam_t q_t - sum_{i<=t} P_ti W_i);  out_t = scale sum_{i<=t} P_ti U_i.
-    const __m256 sc = _mm256_set1_ps(scale);
+    // Qe_t = scale (Gam_t q_t - sum_{i<=t} P_ti W_i);  out_t = scale sum_{i<=t} P_ti U_i, as two products with the lower
+    // triangle of P (the zeros above the diagonal add nothing; each element is one chain in increasing i, as before).
     for (std::size_t t = 0; t < c; ++t) {
         float* qe = u.qe + t * dk;
         const __m256 gt = _mm256_set1_ps(gam[t]);
         for (std::size_t j = 0; j < dk; j += 8) _mm256_storeu_ps(qe + j, _mm256_mul_ps(gt, _mm256_loadu_ps(Q + t * ld_in + j)));
         float* o = s.out + (t0 + t) * ld_out + h * dv;
         for (std::size_t j = 0; j < dv; j += 8) _mm256_storeu_ps(o + j, _mm256_setzero_ps());
-        for (std::size_t i = 0; i <= t; ++i) {
-            const float p = P[t * max_chunk + i];
-            axpy(dk, -p, u.uw + i * ldx + dv, qe);
-            axpy(dv, scale * p, u.uw + i * ldx, o);
-        }
+    }
+    gemm_nn<true>(u.qe, dk, P, max_chunk, 1, u.uw + dv, ldx, c, dk, c);
+    for (std::size_t t = 0; t < c; ++t)
+        for (std::size_t i = 0; i <= t; ++i) A[t * max_chunk + i] = scale * P[t * max_chunk + i];  // A is spent: scale * P
+    for (std::size_t t = 0; t < c; ++t)
+        for (std::size_t i = t + 1; i < c; ++i) A[t * max_chunk + i] = 0.0f;
+    gemm_nn<false>(s.out + t0 * ld_out + h * dv, ld_out, A, max_chunk, 1, u.uw, ldx, c, dv, c);
+    const __m256 sc = _mm256_set1_ps(scale);
+    for (std::size_t t = 0; t < c; ++t) {
+        float* qe = u.qe + t * dk;
         for (std::size_t j = 0; j < dk; j += 8) _mm256_storeu_ps(qe + j, _mm256_mul_ps(sc, _mm256_loadu_ps(qe + j)));
     }
 
@@ -240,28 +292,34 @@ void prepare_chunk(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t 
     }
 }
 
-// Phase 2 for one (segment, head, column slice) over the chunks of a pass, in order.
-void apply_chunks(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t h, std::size_t j0, std::size_t sw,
-                  std::size_t ld_out, std::size_t chunk, std::size_t first_chunk, std::size_t count, const float* units,
-                  std::size_t unit_size, std::size_t unit_base, std::size_t hv) {
+// Phase 2 for one chunk of one (segment, head, column slice).
+void apply_chunk(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t h, std::size_t j0, std::size_t sw,
+                 std::size_t ld_out, std::size_t t0, std::size_t c, const Unit& u) {
     const std::size_t dk = geo.dk, dv = geo.dv;
     const std::size_t ldx = dv + dk;
     alignas(32) float D[max_chunk * 32];
     float* const S = s.state + h * dk * dv + j0;
+    for (std::size_t t = 0; t < c; ++t) std::memcpy(D + t * sw, u.uw + t * ldx + j0, sw * sizeof(float));
+    gemm_nn<true>(D, sw, u.uw + dv, ldx, 1, S, dv, c, sw, dk);                     // D = U - W S
+    gemm_nn<false>(s.out + t0 * ld_out + h * dv + j0, ld_out, u.qe, dk, 1, S, dv, c, sw, dk); // out += Qe S
+    const __m256 gamma = _mm256_set1_ps(*u.gamma);
+    for (std::size_t i = 0; i < dk; ++i) {
+        for (std::size_t j = 0; j < sw; j += 8) {
+            _mm256_storeu_ps(S + i * dv + j, _mm256_mul_ps(gamma, _mm256_loadu_ps(S + i * dv + j)));
+        }
+    }
+    gemm_nn<false>(S, dv, u.kt, 1, dk, D, sw, dk, sw, c);                           // S += Kt^T D
+}
+
+// Phase 2 for one (segment, head, column slice) over the chunks of a pass, in order.
+void apply_chunks(const DeltaGeometry& geo, const DeltaSegment& s, std::size_t h, std::size_t j0, std::size_t sw,
+                  std::size_t ld_out, std::size_t chunk, std::size_t first_chunk, std::size_t count, const float* units,
+                  std::size_t unit_size, std::size_t unit_base, std::size_t hv) {
     for (std::size_t ci = 0; ci < count; ++ci) {
         const std::size_t t0 = (first_chunk + ci) * chunk;
         const std::size_t c = std::min(chunk, s.rows - t0);
         const Unit u = unit_at(const_cast<float*>(units) + (unit_base + ci * hv + h) * unit_size, geo, chunk);
-        for (std::size_t t = 0; t < c; ++t) std::memcpy(D + t * sw, u.uw + t * ldx + j0, sw * sizeof(float));
-        gemm_nn<true>(D, sw, u.uw + dv, ldx, 1, S, dv, c, sw, dk);                     // D = U - W S
-        gemm_nn<false>(s.out + t0 * ld_out + h * dv + j0, ld_out, u.qe, dk, 1, S, dv, c, sw, dk); // out += Qe S
-        const __m256 gamma = _mm256_set1_ps(*u.gamma);
-        for (std::size_t i = 0; i < dk; ++i) {
-            for (std::size_t j = 0; j < sw; j += 8) {
-                _mm256_storeu_ps(S + i * dv + j, _mm256_mul_ps(gamma, _mm256_loadu_ps(S + i * dv + j)));
-            }
-        }
-        gemm_nn<false>(S, dv, u.kt, 1, dk, D, sw, dk, sw, c);                           // S += Kt^T D
+        apply_chunk(geo, s, h, j0, sw, ld_out, t0, c, u);
     }
 }
 
@@ -302,8 +360,15 @@ void delta_scan_chunked(const DeltaGeometry& geo, std::span<const DeltaSegment> 
         n_chunks[i] = ceil_div(segments[i].rows, chunk);
         passes = std::max(passes, ceil_div(n_chunks[i], per_pass));
     }
-    std::vector<Scratch> scratch(pool.size());
-    AlignedBuffer<float> units;
+    // Kept between calls (one set per calling thread): the units of a pass are tens of MB, and a fresh buffer every layer would
+    // be mapped and faulted in again each time. The tasks below run on the pool's threads, so they use these references, never
+    // the thread_local names (which would name each worker's own, empty, instance).
+    thread_local std::vector<Scratch> scratch_of_caller;
+    thread_local AlignedBuffer<float> units_of_caller;
+    std::vector<Scratch>& scratch = scratch_of_caller;
+    AlignedBuffer<float>& units = units_of_caller;
+    if (scratch.size() < pool.size()) scratch.resize(pool.size());
+
 
     struct PrepareTask {
         std::size_t seg, head, t0, c, unit;
@@ -329,11 +394,13 @@ void delta_scan_chunked(const DeltaGeometry& geo, std::span<const DeltaSegment> 
         }
         units.resize(total_units * unit_size);
         pool.parallel_for(prepare.size(), [&](std::size_t i, unsigned worker) {
+            const FlushSubnormals flush;
             const PrepareTask& t = prepare[i];
             prepare_chunk(geo, segments[t.seg], t.head, t.t0, t.c, ld_in, ld_out, scale, chunk,
                           units.data() + t.unit * unit_size, scratch[worker]);
         });
         pool.parallel_for(active.size() * hv * slices, [&](std::size_t task, unsigned) {
+            const FlushSubnormals flush;
             const SegmentPass& a = active[task / (hv * slices)];
             const std::size_t h = task / slices % hv;
             const std::size_t j0 = task % slices * sw;

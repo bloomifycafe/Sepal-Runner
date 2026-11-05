@@ -50,6 +50,7 @@ struct TrunkOptions {
     std::size_t state_budget_bytes = 8ull << 30; // request state (K/V caches, DeltaNet states) alive at once
     bool force_isa = false;                  // use `isa` instead of the best one
     Isa isa = Isa::Avx2;
+    std::string cpus;                        // CPU list for the thread pool ("0-11"); empty: all allowed (or SEPAL_CPU_SET)
 };
 
 /// Wall-clock milliseconds of the last `forward`, by kind of work.

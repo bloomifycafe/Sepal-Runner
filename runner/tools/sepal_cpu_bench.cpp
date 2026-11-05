@@ -2,6 +2,7 @@
 //
 //   sepal-cpu-bench --final DIR --base DIR --input encoded.jsonl [--profile cpu-bf16] [--threads N] [--batch N]
 //                   [--limit N] [--repeats N] [--warmup] [--max-tokens N] [--label text] [--q8 mlp,attn,dn_in]
+//                   [--prefix-cache-mib N] [--cpus 0-11] [--cpu-isa avx2|avx2-tuned|avx512] [--phases]
 //
 // One JSON line on stdout per repeat: {"label", "profile", "threads", "isa", "batch", "requests", "tokens", "wall_s",
 // "tokens_per_s", "requests_per_s", "call_ms_p50", "call_ms_max", "trunk_ms", "head_ms", "peak_rss_mb", "load_s"}.
@@ -68,7 +69,8 @@ EncodedRequest parse(const std::string& line) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string final_dir, base_dir, input, profile = "cpu-bf16", label, q8 = "mlp,attn,dn_in";
+    std::string final_dir, base_dir, input, profile = "cpu-bf16", label, q8 = "mlp,attn,dn_in", cpus, cpu_isa;
+    std::size_t prefix_cache_mib = 0;
     unsigned threads = 0;
     std::size_t batch = 1, limit = 0, repeats = 1;
     std::uint64_t max_tokens = 65536;
@@ -92,6 +94,9 @@ int main(int argc, char** argv) {
         else if (a == "--q8") q8 = value();
         else if (a == "--warmup") warmup = true;
         else if (a == "--phases") phases = true;
+        else if (a == "--prefix-cache-mib") prefix_cache_mib = std::stoul(value());
+        else if (a == "--cpus") cpus = value();
+        else if (a == "--cpu-isa") cpu_isa = value();
         else throw std::invalid_argument("unknown argument " + a);
     }
     if (final_dir.empty() || base_dir.empty() || input.empty() || batch == 0) {
@@ -115,6 +120,12 @@ int main(int argc, char** argv) {
     opt.q8.mlp = q8.find("mlp") != std::string::npos;
     opt.q8.attention = q8.find("attn") != std::string::npos;
     opt.q8.deltanet_in = q8.find("dn_in") != std::string::npos;
+    opt.prefix_cache_mib = prefix_cache_mib;
+    opt.cpus = cpus;
+    if (!cpu_isa.empty() && cpu_isa != "auto") {
+        opt.isa = cpu::parse_isa(cpu_isa);
+        opt.force_isa = true;
+    }
     if (phases) {
         // Trunk only, with the time split by kind of work (gemm / DeltaNet / attention / other).
         const TrainedModel model = TrainedModel::open(final_dir, base_dir);
@@ -123,6 +134,9 @@ int main(int argc, char** argv) {
         t.profile = cpu::parse_profile(profile);
         t.q8 = opt.q8;
         t.threads = threads;
+        t.cpus = opt.cpus;
+        t.force_isa = opt.force_isa;
+        t.isa = opt.isa;
         cpu::CpuTrunk trunk(model.config(), merged, [&model](std::uint32_t tok, float* out) { model.embedding_row(tok, out); }, t);
         cpu::TrunkTimes sum;
         for (const EncodedRequest& r : requests) {
@@ -143,6 +157,7 @@ int main(int argc, char** argv) {
     const auto engine = cpu::make_cpu_engine(final_dir, base_dir, opt);
     const double load_s = std::chrono::duration<double>(Clock::now() - load_start).count();
     const unsigned used = threads != 0 ? threads : cpu::default_thread_count();
+    std::fprintf(stderr, "runtime: %s\n", engine->runtime().c_str());
 
     if (warmup) engine->score({requests.data(), std::min<std::size_t>(batch, requests.size())});
     for (std::size_t rep = 0; rep < repeats; ++rep) {
