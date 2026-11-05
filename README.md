@@ -49,8 +49,65 @@ Long log: about 15.9k tokens, 32 questions. Source: `runs/box-results/full15-4b/
 | GPU 12 GB + 4 threads | gpu-f16 | 0.23 / 0.24 s (4.2 alerts/s at p95 <= 1 s) | 4.8 s | VRAM +11.1 GB |
 | GPU 8 GB | gpu-q8w (`--allow-q8`) | 0.36 s | not for states over about 7k tokens | VRAM +7.7 GB |
 
-Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass;
-`cpu-q8` and `gpu-q8w` fail the max |dp| gate on near-tie questions (0.12 to 0.14 against 0.05).
+Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass on
+SEC-dev and TOOL; on the LONG-LOG sample every CPU path, `cpu-f32` included, is above the max and p99 gates (max |dp| about 0.05, 1 flip in 262
+questions), which is still being traced (the reference rows are themselves bf16). `cpu-q8` and `gpu-q8w` fail the max |dp| gate on near-tie
+questions (0.12 to 0.14 against 0.05).
+
+### Running on an older Xeon without AVX-512 (for example the E5-2698 v4)
+
+Haswell and Broadwell Xeons (E5 v3 / v4), Skylake client and AMD Zen 1-3 have AVX2 and FMA but no AVX-512. On these the runner uses its
+`avx2-tuned` kernel set (x86-64-v3). It is picked automatically. The fastest build of it is on Linux with GCC or Clang, where the GEMM inner loop is
+hand-written assembly; an MSVC build on Windows uses an intrinsics version of the same loop that is about 8% slower end to end.
+
+1. Check the CPU has the instruction set. `avx2`, `fma`, `f16c` and `bmi2` must all be listed; `avx512f` should not be, or the runner picks its
+   AVX-512 kernels instead:
+
+   ```sh
+   grep -o -w 'avx2\|fma\|f16c\|bmi2\|avx512f' /proc/cpuinfo | sort -u
+   ```
+
+2. Build the CPU engine with GCC 11+ or Clang 14+, then install the front end:
+
+   ```sh
+   cd runner && cmake --preset release && cmake --build --preset release && ctest --preset release && cd ..
+   pip install -e ".[serve]"
+   ```
+
+3. Find the cores to use. Use physical cores only (hyper-threads add nothing), and keep away from the cores another engine already uses:
+
+   ```sh
+   lscpu -e=CPU,NODE,SOCKET,CORE            # logical CPU -> core and socket
+   taskset -cp <pid of the other engine>    # which CPUs it is pinned to, if it is pinned
+   ```
+
+4. Start it on those cores. On a one-socket 20-core E5-2698 v4 where another engine holds cores 0-7, give the runner cores 8-19. On a two-socket
+   server, give it the whole socket the other engine does not use, with that socket's memory:
+
+   ```sh
+   export HF_TOKEN=...                                    # the Sepal repositories are gated: accept their terms on the Hub first
+   sepal serve BlossomsAI/Sepal-4B --cpus 8-19            # one socket, cores 8-19
+   numactl --cpunodebind=1 --membind=1 sepal serve BlossomsAI/Sepal-4B --cpus 20-39   # two sockets: socket 1 and its memory
+   ```
+
+   At start it prints the kernel set and the thread layout; check that the kernel set is `avx2-tuned` and that there is one thread per core you
+   gave it. Add `--dry-run` to see the plan without loading. To force the set (for example to compare), use `--cpu-isa avx2-tuned`,
+   `--cpu-isa avx2` (the older generic kernels) or `SEPAL_CPU_ISA=...`. A set the CPU lacks is refused with the missing features named.
+
+5. Send a request: `python examples/client.py`.
+
+What to expect, Sepal-4B `cpu-bf16`, measured on an E5-2698 v4 in a cloud container (one socket, other tenants on the host, 2026-11-05):
+
+| Cores | Short alert (~950 tokens) | 16k-token log | Before this kernel set |
+|---|---|---|---|
+| 4 | 43.8 tok/s (about 22 s) | | 36.0 tok/s |
+| 10 | 86.0 tok/s (about 11 s) | 73.6 tok/s (about 216 s) | 71.1 / 62.2 tok/s |
+| 12 | about 105 tok/s (about 9 s), estimated from the 10-core run, not measured | | 87 tok/s on a user's server |
+
+Sepal-0.8B is about 6x faster (505 tok/s on short alerts at 10 cores). If the same log is checked against several sets of questions, the prefix
+cache, on by default when RAM allows, makes the repeats about 4x faster (49 s to 12 s per request for a 4k log on 10 cores). Another engine that
+streams memory on the same socket slows the runner by about 15%; on the other socket it costs nothing. `cpu-q8` (`--allow-q8`) is slower than
+`cpu-bf16` on these CPUs and fails its parity gate, so leave it off. More detail: [runner/README.md](runner/README.md#the-cpu-engine-rt-cpu).
 
 ## What is in it
 
