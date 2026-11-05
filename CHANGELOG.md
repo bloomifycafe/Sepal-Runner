@@ -8,6 +8,7 @@ Measured on a Xeon E5-2698 v4 (Broadwell-EP, AVX2 + FMA, no AVX-512) in a vast.a
 logs: Sepal `runs/box-results/broadwell/`. 4B `cpu-bf16` on 10 cores: short alerts 71.1 -> 86.0 tok/s (12.9 -> 10.7 s each),
 16k-token logs 62.2 -> 73.6 tok/s, TOOL requests 66.2 -> 79.1; 1 to 9 cores +17 to +24%; the container's default thread count
 43.7 -> 90.5. Parity of `avx2-tuned` against the PyTorch rows: SEC-dev 300 max |dp| 0.023, p99 0.009, 0 flips (passes);
+TOOL 60 max 0.0096, p99 0.0003, 0 flips (passes);
 LONG-LOG 20 max 0.049, p99 0.030, 1 flip in 262, the same as the original AVX2 code to 1.4e-5 (this panel was already over
 the gate with the original code and with AVX-512, 0.052 / 0.049 on 12 records).
 
