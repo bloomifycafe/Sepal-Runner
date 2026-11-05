@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### 2026-11-05: LONG-LOG parity traced to the reference's bf16 error
+
+The LONG-LOG failure of the `cpu-bf16` gate (every CPU path, `cpu-f32` too) comes from the reference rows, not from the runner. An fp32 PyTorch
+forward (no autocast, same adapter, head, tokens and 24,576 window) on 6 of the 20 sample records, 89 questions: `cpu-f32` matches it to 2.9e-5
+in p (gate 1e-4), `cpu-bf16` to 0.032 (p99 0.016), the bf16 rows only to 0.048 (p99 0.026); the one flip in the sample is the bf16 row's. Nothing in
+the runner changed and the gates are unchanged. New `tools/runner_fp32_reference.py` (export a sample, score it with the fp32 oracle on a torch box,
+compare runner logits with both references) and `docs/PARITY-LONGLOG.md`.
+
 ### 2026-11-05: tuned AVX2 kernel set (x86-64-v3), thread placement, Broadwell
 
 Measured on a Xeon E5-2698 v4 (Broadwell-EP, AVX2 + FMA, no AVX-512) in a vast.ai container with a 9.6-CPU quota; results and

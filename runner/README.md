@@ -386,6 +386,11 @@ cpu-q8 (int8 x int8, MLP + attention + DeltaNet input) vs its bf16 twin: max |dp
 (gate 0.05 / 1%); each weight group alone is still above 0.03. On AVX2 it is also slower than fp32 and stores 16-bit
 pairs, so there is no gain. Keep it off.
 
+LONG-LOG against the Unsloth bf16 rows fails the cpu-bf16 gate on every CPU path (max |dp| 0.049-0.052, p99 0.030-0.049, 1 flip in 262), cpu-f32
+included, because the rows are bf16: against a PyTorch fp32 forward on the same tokens (6 records, 89 questions) cpu-f32 is within 2.9e-5 in p and
+2.5e-4 in logits, cpu-bf16 within 0.032 (p99 0.016) while the bf16 rows are 0.048 (p99 0.026) away. No runner arithmetic is at fault; see
+docs/PARITY-LONGLOG.md and `tools/runner_fp32_reference.py`.
+
 The default thread count is the physical cores (`default_thread_count()`): on the 5600X 12 threads (SMT) ran 20-25%
 slower than 6 (bf16, t1k_q8: 3 / 6 / 9 / 12 threads = 143 / 233 / 181 / 181 tok/s).
 

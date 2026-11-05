@@ -50,9 +50,11 @@ Long log: about 15.9k tokens, 32 questions. Source: `runs/box-results/full15-4b/
 | GPU 8 GB | gpu-q8w (`--allow-q8`) | 0.36 s | not for states over about 7k tokens | VRAM +7.7 GB |
 
 Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass on
-SEC-dev and TOOL; on the LONG-LOG sample every CPU path, `cpu-f32` included, is above the max and p99 gates (max |dp| about 0.05, 1 flip in 262
-questions), which is still being traced (the reference rows are themselves bf16). `cpu-q8` and `gpu-q8w` fail the max |dp| gate on near-tie
-questions (0.12 to 0.14 against 0.05).
+SEC-dev and TOOL. On the LONG-LOG sample every CPU path, `cpu-f32` included, is above the max and p99 gates against the reference rows (max |dp|
+about 0.05, 1 flip in 262 questions), and the traced cause is the reference: those rows are Unsloth's bf16 autocast forward. Against a PyTorch
+fp32 forward on the same tokens the runner's `cpu-f32` agrees to 2.9e-5 in p (gate 1e-4) and `cpu-bf16` is 1.5 to 4.5 times closer to it than
+the bf16 reference is (docs/PARITY-LONGLOG.md; `tools/runner_fp32_reference.py` builds fp32 references). The gates are unchanged.
+`cpu-q8` and `gpu-q8w` fail the max |dp| gate on near-tie questions (0.12 to 0.14 against 0.05).
 
 ### Running on an older Xeon without AVX-512 (for example the E5-2698 v4)
 
