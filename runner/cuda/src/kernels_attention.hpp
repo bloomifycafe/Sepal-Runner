@@ -41,8 +41,8 @@
 // takes 64 rows of (token, head of one KV group) of one row and walks the keys 32 at a time with an online
 // softmax. It needs head_dim 16, 64, 128 or 256 and a group size heads / kv_heads of 1, 2, 4, 8 or 16 (sm_80 and up).
 // `TiledF32` is the same walk in float32 on the ordinary cores (the Pascal profiles): 64 query rows of one KV group per
-// block, each held in registers by head_dim / 64 threads, keys 16 at a time, head_dim 16, 32, 64, 128 or 256; it takes F32
-// keys and values only.
+// block, two rows per thread over 32 head dimensions held in registers, keys 16 at a time, head_dim 16, 32, 64, 128 or 256;
+// it takes F32 keys and values only.
 // Alignment the tiled kernel relies on (cp.async, 16 bytes): segment pointers and the q buffer are 16-byte
 // aligned and the q row stride is a multiple of 8 elements.
 #pragma once
