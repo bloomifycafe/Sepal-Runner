@@ -173,6 +173,10 @@ enum class MultiplyPath {
 /// (src/kernels_deltanet_chunked.cu) cut a row into chunks of 64 tokens and use the tensor cores: a long row gets several times faster on a big
 /// card, but they cost more per token than the scan when the card is already full of rows, and their numbers are not bit-exact (binary16
 /// operands, float32 accumulation; a row continued from a snapshot is not the uncut row bit for bit). Float16 path, natural mode only.
+/// On the float32 path (natural mode) `Chunked` runs the float32 chunked kernels instead (src/kernels_deltanet_chunked_f32.cu: the
+/// same WY form on the ordinary cores, proofs/GpuTrack/GpuTrack/DeltaRule.lean; within 1e-6 of the scan's rms); `Auto` keeps the
+/// scan there, which was quicker on the 28-SM cards measured (RTX 3060: scan 21 ms, chunked 25 ms per layer for one row of 16384
+/// tokens; runner/cuda/README.md, "Pascal").
 enum class DeltaNetMode {
     Scan,    ///< always the scan kernel
     Auto,    ///< per wave of a call: the chunked kernels when a cost model says they are quicker, else the scan
@@ -219,7 +223,7 @@ struct EngineOptions {
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;
-    /// Float16 path, natural mode (gemm_rows 0) only; strict mode and the float32 path always scan. See DeltaNetMode.
+    /// Natural mode (gemm_rows 0) only; strict mode always scans, and the float32 path scans unless this is Chunked. See DeltaNetMode.
     DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Float16 path only: keep the per-channel statistics of the activations of the four multiply groups while calls run
     /// (CudaEngine::activation_stats). Calibration for Int8Smoothing; slows a call down. Off by default.

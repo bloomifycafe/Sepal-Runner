@@ -174,6 +174,40 @@ SEPAL_TEST(engine_simt, fuzz_against_reference) {
     }
 }
 
+SEPAL_TEST(engine_simt, chunked_deltanet_against_reference) {
+    // DeltaNetMode::Chunked on the float32 path: the float32 chunked kernels (WY form) instead of the scan.
+    const ModelConfig cfg = simt_config();
+    const std::size_t hidden = ref::dim(cfg.hidden_size);
+    const Weights<float>& original = weights_of(320);
+    const Weights<float> held = stored_weights(cfg, original, WeightStorage::BF16);
+    EngineOptions o = simt_options(WeightStorage::BF16);
+    o.deltanet = sepal::cuda::DeltaNetMode::Chunked;
+    CudaEngine chunked(cfg, original, o);
+    CudaEngine scan(cfg, original, simt_options(WeightStorage::BF16));
+    std::vector<Stored> stored;
+    Rng rng(3200);
+    double worst = 0.0, worst_scan = 0.0;
+    for (std::size_t call = 0; call < 20; ++call) {
+        FuzzOptions fo;
+        fo.vocab = cfg.vocab_size;
+        fo.allow_store = false;
+        const Request request = make_request(rng, stored, fo);
+        const auto want = run_reference(cfg, held, request.reference);
+        const auto got = run(chunked, request.engine);
+        const auto base = run(scan, request.engine);
+        for (std::size_t r = 0; r < got.size(); ++r) {
+            const std::size_t count = request.engine[r].readout_offsets.size() * hidden;
+            CHECK_EQ(got[r].hidden.size(), count);
+            if (got[r].hidden.size() != count) continue;
+            worst = std::max(worst, max_abs_diff(got[r].hidden.data(), want[r].hidden.data(), count));
+            worst_scan = std::max(worst_scan, max_abs_diff(got[r].hidden.data(), base[r].hidden.data(), count));
+        }
+    }
+    std::printf("  [measured] chunked float32 DeltaNet: largest |engine - reference| %.3e, |chunked - scan| %.3e\n", worst, worst_scan);
+    CHECK(worst < 1e-4);
+    CHECK(worst_scan < 1e-4);
+}
+
 SEPAL_TEST(engine_simt, rows_are_bit_invariant) {
     const ModelConfig cfg = simt_config();
     for (const WeightStorage storage : {WeightStorage::BF16, WeightStorage::Int8Group}) {

@@ -167,10 +167,10 @@ set_tests_properties(cuda_parity_real PROPERTIES TIMEOUT 900)
 # ---- Gated DeltaNet kernels: tests and benchmark ----
 # Every arithmetic step in kernels_deltanet.cu is an explicit intrinsic; --fmad=false additionally stops nvcc from
 # contracting anything that is not (determinism rule, src/device.hpp).
-set_source_files_properties(src/kernels_deltanet.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+set_source_files_properties(src/kernels_deltanet.cu src/kernels_deltanet_chunked_f32.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
 # A library of its own, so that the kernels build and test without the cuBLAS provider.
-add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu src/kernels_deltanet_chunked.cu)
+add_library(sepal_cuda_deltanet_kernels STATIC src/kernels_deltanet.cu src/kernels_deltanet_chunked.cu src/kernels_deltanet_chunked_f32.cu)
 target_include_directories(sepal_cuda_deltanet_kernels PUBLIC src)
 target_include_directories(sepal_cuda_deltanet_kernels SYSTEM PUBLIC "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_deltanet_kernels PRIVATE sepal_cuda_flags)
@@ -266,6 +266,9 @@ target_link_libraries(sepal-gpu-parity PRIVATE sepal_cuda_gpu_decision sepal_cor
 
 add_executable(sepal-cuda-engine-bench tools/sepal_cuda_engine_bench.cpp)
 target_link_libraries(sepal-cuda-engine-bench PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
+
+add_executable(sepal-cuda-simt-profile tools/simt_engine_profile.cpp)
+target_link_libraries(sepal-cuda-simt-profile PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
 
 add_executable(sepal-cuda-engine-ab tools/engine_ab.cpp)
 target_link_libraries(sepal-cuda-engine-ab PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
@@ -365,6 +368,10 @@ target_link_libraries(sepal-gpu-bench PRIVATE sepal_cuda_gpu_decision sepal_core
 add_executable(sepal-cuda-chunk-check tools/chunk_check.cpp)
 target_link_libraries(sepal-cuda-chunk-check PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
 
+# The float32 SIMT chunked kernel (src/kernels_deltanet_chunked_f32.cu: no tensor cores, every architecture) against the scan kernel.
+add_executable(sepal-cuda-chunk-check-f32 tools/chunk_check_f32.cpp)
+target_link_libraries(sepal-cuda-chunk-check-f32 PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
+
 # The chunked DeltaNet kernels against the scan kernel (random data, rows of 7 to 4096 tokens; exit status 1 when a difference is over 5% of the rms).
 if(SEPAL_CUDA_TENSOR_CORES)
 add_test(NAME cuda_deltanet_chunked_float COMMAND sepal-cuda-chunk-check)
@@ -376,6 +383,18 @@ foreach(t float half_input half_state no_state)
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
 endif()
+
+# The float32 chunked kernel needs no tensor cores: its tests are registered for every architecture. They compare outputs and
+# outgoing states with the scan kernel (rows of 1 to 4096 tokens at three geometries, exit status 1 when a relative rms
+# difference is over 1e-4) and check the bit-identity rules (two runs; reversed layout; every row alone), with padded row strides,
+# rows without an outgoing slot and rows continued in place.
+add_test(NAME cuda_deltanet_chunked_f32_float COMMAND sepal-cuda-chunk-check-f32 --pad on)
+add_test(NAME cuda_deltanet_chunked_f32_half_state COMMAND sepal-cuda-chunk-check-f32 --half-state on --inplace on --seed 7)
+add_test(NAME cuda_deltanet_chunked_f32_no_state COMMAND sepal-cuda-chunk-check-f32 --state off --drop on --pad on --seed 9)
+foreach(t float half_state no_state)
+  set_tests_properties(cuda_deltanet_chunked_f32_${t} PROPERTIES TIMEOUT 900
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
+endforeach()
 
 # The trained model against the golden set, with the gates of docs/RUNNER.md 14. Skipped (exit 77) unless SEPAL_TRAINED_FINAL,
 # SEPAL_TRAINED_BASE and SEPAL_GOLDEN_DIR are set (the golden set: runs/runner-golden/full08b).

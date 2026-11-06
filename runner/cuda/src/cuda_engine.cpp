@@ -27,6 +27,7 @@
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
 #include "kernels_deltanet_chunked.hpp"
+#include "kernels_deltanet_chunked_f32.hpp"
 #include "kernels_elementwise.hpp"
 #include "snapshot_file.hpp"
 
@@ -287,6 +288,7 @@ struct CudaEngine::Impl {
     DeltaNetGeometry dn_geometry;
     AttentionShape attn_shape{};
     bool use_chunked = false;  // the chunked DeltaNet kernels may be used (see DeltaNetMode)
+    bool chunked_f32 = false;  // ... and they are the float32 ones (float32 path, DeltaNetMode::Chunked)
     int sm_count = 1;
     std::size_t chunk_cap = 0; // chunks the workspace holds
     char* dn_ws = nullptr;     // workspace of the chunked kernels (call buffers)
@@ -683,7 +685,8 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
     };
     if (use_chunked) {
         chunk_cap = cap_rows / kDeltaNetChunk + 64;
-        dn_ws_bytes = deltanet_chunked_workspace_bytes(dn_geometry, chunk_cap, cap_rows);
+        dn_ws_bytes = chunked_f32 ? deltanet_chunked_f32_workspace_bytes(dn_geometry, chunk_cap, cap_rows)
+                                  : deltanet_chunked_workspace_bytes(dn_geometry, chunk_cap, cap_rows);
         take(dn_ws_bytes, dn_ws);
     }
     take(cap_rows * H * 4, x);
@@ -858,6 +861,9 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     attn_shape = AttentionShape{u32(dim(config.attn_heads)), u32(dim(config.attn_kv_heads)), u32(dim(config.attn_head_dim)),
                                 u32(dim(config.attn_rotary_dims())), config.rope_theta, config.rms_norm_eps};
     use_chunked = options.deltanet != DeltaNetMode::Scan && half && options.gemm_rows == 0 && dn_layers != 0 && deltanet_chunked_supported(dn_geometry);
+    if (!half && options.deltanet == DeltaNetMode::Chunked && options.gemm_rows == 0 && dn_layers != 0 && deltanet_chunked_f32_supported(dn_geometry)) {
+        use_chunked = chunked_f32 = true;
+    }
     state_conv_floats = dn_geometry.conv_tail_floats();
     state_recurrent_floats = dn_geometry.recurrent_floats();
     state_elem = options.half_state ? 2 : 4;
@@ -1627,7 +1633,10 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                     const DeltaNetRows dn_rows{d_spans, d_in, d_out, d_waves + wave_start[wv], u32(wave_start[wv + 1] - wave_start[wv])};
                     if (wave_chunked[wv]) {
                         const DeltaNetChunkPlan chunk_plan{d_chunks + chunk_prefix_at[wv], chunk_total[wv]};
-                        if (dn_in_half) {
+                        if (chunked_f32) {
+                            launch_deltanet_chunked_f32(dn_geometry, w.deltanet, dn_inputs, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws, dn_ws_bytes,
+                                                        cap_rows, reinterpret_cast<float*>(a2), mix_width, stream);
+                        } else if (dn_in_half) {
                             launch_deltanet_chunked<__half>(dn_geometry, w.deltanet, dn_inputs_half, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws,
                                                             dn_ws_bytes, cap_rows, reinterpret_cast<__half*>(a2), mix_width, stream);
                         } else {
