@@ -508,3 +508,91 @@ Not done / open:
 - Not checked: Higham's Winograd constants, Flean's current status and toolchain match, LNSym source (Neon coverage, effort), Aeneas AVX2 modelling, CSLib `TimeM` signature, the plots in Reloaded Fig. 5/6 (no numbers extracted), the cause of the 85% figure.
 - Not measured: full Mathlib cache size, any Strassen speed on Broadwell, `vpmaddwd` bound by SAT.
 - Web search was used for prior art; search snippets are weaker evidence than source pages and are labelled [W].
+
+---
+
+## 10. Exact track proofs (2026-11-06)
+
+Lake project `proofs/ExactTrack/` (`lakefile.toml`, `lean-toolchain` = `leanprover/lean4:v4.36.0-rc2`, no Mathlib, no dependencies).
+Build (clean build 1.8 s, the first one with a few failed attempts 5 s): [T]
+
+```
+cd Sepal-Runner/proofs/ExactTrack
+set ELAN_HOME=E:\MYCOMPANY\BlumSOC\ref\lean\_elan        (bash: export ELAN_HOME=...)
+E:\MYCOMPANY\BlumSOC\ref\lean\_elan\bin\lake.exe build
+```
+
+No `sorry`, no `axiom`. `#print axioms` on the main theorems shows only `propext`, `Quot.sound`, `Classical.choice` (core). [T]
+
+### 10.1 `ExactTrack/GemmPartition.lean` (namespace `ExactTrack.Gemm`)
+
+Scalar type `α`, arbitrary `fma : α → α → α → α` and `zero`, no laws. `ref fma zero a b i j K` is the foldl over `List.range K`.
+- (a) `sliced_eq_ref`: the accumulator carried over the kc slices in increasing order equals `ref` (given `K ≤ S*kc`);
+  `kernel_elem_eq_ref` with `S = numSlices kc K = (K+kc-1)/kc` (needs `0 < kc`); helpers `flat_slices`, `slice_eq_range'`
+  (slice s is `[s*kc, min((s+1)*kc, K))`), `le_numSlices_mul`.
+- (b) A schedule is `List (List (Nat × Nat))` (any tile shape, any task order; a threaded run is an interleaving of the same writes).
+  `run_apply`: `run out val sched q = if q ∈ sched.flatten then val q else out q`.
+  `schedule_cell_eq_ref`: every covered cell equals `ref`, whatever the initial content of the output.
+  `schedule_correct`: a schedule covering a domain `D` gives `ref` on all of `D`.
+  `schedules_agree`: two schedules covering the same cells give identical output maps (also outside the domain).
+  Exactly-once coverage is not needed; covered at least once is enough because every write stores the same value.
+- Staging: `tileCells`, `scratch`, `staged`, `staged_eq`, `staged_write_eq`: computing a tile into a local scratch buffer and copying it
+  out writes the same values (identity on values).
+- Not modelled: tasks that write partial sums across kc slices into the output buffer and reload them (this is the same as carrying the
+  accumulator only if the store/load is exact, true for fp32 buffers); the model has the accumulator in the task, as the spec said.
+
+### 10.2 `ExactTrack/LastRow.lean` (namespace `ExactTrack.LastRow`)
+
+`Layer β` has row-wise `q`, `kv`, `post` (residual reads the layer input row) and causal `mix qs kvs t`, with the hypothesis
+`mix_causal`: row `t` depends on `qs t` and on `kvs s` for `s ≤ t` only.
+- `Layer.applyPruned_at`: with Q evaluated only at row `T`, K/V only at rows `≤ T` and post only at row `T` (junk `jq jk jo` elsewhere,
+  arbitrary), output row `T` equals `Layer.apply` row `T`. This is the statement "output row T is unchanged when the row-wise parts are
+  evaluated only at row T" (K/V still read for all rows `≤ T`).
+- `Layer.apply_causal`, `runFull_causal`: a stack of such layers is causal.
+- `stack_pruned`: earlier layers in full, last layer pruned: row `T` equals `runFull (ls ++ [last]) x T`.
+- `stack_pruned_junk_future`: same, and the input rows `> T` may be arbitrary junk.
+- Weakening note: `mix` is required to read Q only at row `t` (true for attention). A mixing that reads Q of earlier rows is not covered.
+
+### 10.3 `ExactTrack/OnlineSoftmax.lean` (namespace `ExactTrack.Softmax`)
+
+Class `ExpField α` (own axioms: `+ * - / 0 1`, `exp`, `max` with order axioms, `exp_add`, ...). Stated over scalars; vectors are per component.
+`softmax p ps` = `(Σ exp(s-M) v)/(Σ exp(s-M))`, `M = mxFrom p.1 ps`. Online: `Blk` (nonempty block), `initSt` from the first block (no `-∞`),
+`step`, `online b₀ bs` (`acc/l` after folding all blocks).
+- `online_eq_softmax`: `online b₀ bs = softmax b₀.hd (b₀.tl ++ bs.flatMap Blk.toList)`; invariant `Inv`, `inv_step`, `inv_foldl`,
+  rescale lemmas `wsum_rescale`, `wval_rescale`.
+- `online_split_indep`: any two splits of the same concatenated list into nonempty blocks give equal outputs.
+- Only the field laws listed in the class are used; division, `exp_zero`, `exp_ne_zero` and the order axioms are present but never used
+  (the two sides have identical numerator and denominator). Weakening: the order is not tied to `max` beyond `le_max_*`/`max_le`
+  and associativity; a real instance (e.g. `Real` with `exp`) would have to supply the laws, none were instantiated here.
+- These are exact (real-number) identities. The fp32 behaviour is NOT covered by the Lean file; see 10.4.
+
+### 10.4 fp32 error of online vs two-pass softmax (prose argument, NOT machine-checked)
+
+Notation: `u = 2^-24` (fp32 unit roundoff), `γ_k = k u/(1 - k u)` (Higham). Scores are inputs (the same in both algorithms). `n` terms, block size `b`,
+`B = n/b` blocks. Assume the fp32 `exp` returns a value with relative error `≤ c u` including the error from the rounded argument
+`s - m` (`c = 3` used below; the argument error `u|s-m|` is weighted by `e^{-|s-m|}`, so it contributes at most `u/e ≈ 0.37 u`).
+
+1. Two-pass, summation order as in the kernel (block partial sums of length `b`, then `B` blocks added): every term gets `c u` from exp, at most
+   `b-1` roundings in its block and `B-1` roundings combining blocks: relative error of `l̂` at most `γ_{b-1+B-1+c}` (all terms are positive, so
+   the bound is relative to `l`). A naive sequential sum would be `γ_{n-1+c}`.
+2. Online: the same terms, but a term of block `j` is multiplied `B - j` more times: `l ← l * α̂ + (block sum)`. Each rescale
+   `α̂ = fl(exp(m_old - m_new)) ≤ 1` costs `c u` (exp), `u` (the product) and the add `u` (already counted in step 1). Worst case term (first block):
+   `N = (b-1) + c + (B-1)(c+2)` roundings, so `|l̂ - l| ≤ γ_N l`. The extra cost over two-pass is `(B-1)(c+1)` units, i.e. a factor
+   `(1 + (c+1)u)^{B-1}` on the error, equivalently `(1 + c u)^B` on the rescale chain. When the max does not change `α = exp(0) = 1` exactly, so
+   this is the worst case, not the typical one.
+3. The numerator `acc` has one more rounding per term (the product `e_i v_i`): `|acc_hat - acc| ≤ γ_{N+1} Σ e_i |v_i|` (values of any sign).
+4. Output `acc/l`: with `V = Σ e_i|v_i| / Σ e_i ≤ max|v_i|`,
+   `|out_hat - out| ≤ (2 γ_{N+1}/(1 - γ_{N+1}) + u) · V`.
+
+Numbers for `n = 16384`, `b = 64`, `B = 256`, `c = 3`, `u = 5.96e-8` (hand arithmetic, not run in Lean):
+
+| algorithm | N | bound on `|out_hat - out| / V` |
+|---|---|---|
+| online (B-1 = 255 rescales, 5 units each) | 63 + 3 + 255*5 = 1341 | about 1.6e-4 (about 2690 u) |
+| two-pass, blocked sum like the kernel | 63 + 255 + 3 = 321 | about 3.8e-5 (about 645 u) |
+| two-pass, naive sequential sum | 16383 + 3 = 16386 | about 2.0e-3 (about 32800 u) |
+
+So the rescaling adds about `(B-1)(c+1) = 1020` units to `N` (the error bound grows about 4x versus the blocked two-pass, still 12x below
+a naive sequential sum). These are worst-case bounds; typical errors grow like `sqrt(N) u` (random rounding), about 1e-6 here. The bound is far
+below bf16 output resolution (`2^-8 = 3.9e-3`), but not below fp32 resolution; the online result is therefore NOT bit-identical to the two-pass one,
+only within this tolerance. This section is prose; the constants (`c`, counting of roundings per term) are not machine-checked.
