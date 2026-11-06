@@ -596,3 +596,20 @@ So the rescaling adds about `(B-1)(c+1) = 1020` units to `N` (the error bound gr
 a naive sequential sum). These are worst-case bounds; typical errors grow like `sqrt(N) u` (random rounding), about 1e-6 here. The bound is far
 below bf16 output resolution (`2^-8 = 3.9e-3`), but not below fp32 resolution; the online result is therefore NOT bit-identical to the two-pass one,
 only within this tolerance. This section is prose; the constants (`c`, counting of roundings per term) are not machine-checked.
+
+### 10.5 How the three files map to the runner (2026-11-06)
+
+- `GemmPartition` is the argument behind `GemmSchedule` (runner `src/cpu/gemm.cpp`): the tile, fused and fused-prefetch schedules write
+  the same `kval` cells in a different order, so `schedules_agree` applies. Two facts the model takes as given are checked by the C++
+  test `cpu_gemm.tuned_schedules_are_bit_identical` instead: the micro kernel's chain is `fma` from +0 in increasing k (the test compares
+  plain products with a scalar `std::fma` loop byte for byte), and the tile round trip between kc slices is exact (fp32 stored and
+  reloaded). The epilogues (`y += tile`, SwiGLU) are functions of the finished cell value, so they ride on the same statement.
+- `LastRow` has no runtime user. The CPU engine's readout is the Clef JointSchemaHead, which reads every final row (layer norm and
+  memory projection over all L rows, cross-attention to all of them, span means); only `sepal-run`'s reference path reads one row.
+  Pruning the last layer to one row would change the logits, so the runner does not do it.
+- `OnlineSoftmax` covers both attention kernels (`AttentionKernel::Tiled` and `Flash`): both are the online algorithm over the same
+  absolute 128-key tiles, so over the reals they equal the softmax. In fp32 they differ only in how `acc` is summed: Tiled computes a
+  fresh P V tile per key tile and adds it to `acc` (one extra rounding per tile), Flash continues one fma chain over all keys. Section 10.4
+  applies with `b = 128` (`B = 128` key tiles at 16k): N = 127 + 3 + 127*5 = 765 roundings for the worst-case term, bound about 9e-5 V
+  (prose, not machine-checked). Measured on random 16k inputs: both kernels within 2e-7 of a float64 softmax (Tiled 9.8e-8, Flash 1.8e-7 on 12 sampled
+  rows x 16 heads; sepal-cpu-attn-bench on the Broadwell box).

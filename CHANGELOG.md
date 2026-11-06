@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### 2026-11-06: exact track on Broadwell (GEMM tile writes, flash attention, Lean proofs)
+
+Measured on an E5-2673 v4 box (vast.ai, cores 0-11 of a shared host; every change run alternately against the one before;
+logs: Sepal `reports/runner-broadwell/exact-track/`).
+
+- GEMM, same bits. The tuned AVX2 GEMM kept all finished tiles of a task (up to 126 x 64 floats, rows ldy apart, mostly 4K-aliased
+  lines that miss and need ownership) and wrote them after its last k slice, serialised after the compute. It now writes each tile
+  right after its last micro-kernel call, with the tile's y lines prefetched for writing (`SEPAL_GEMM_SCHEDULE=fused-prefetch`,
+  default; `tile` the old schedule). Same kc, same fp32 FMA chain per output: byte-for-byte test over the six 4B products and odd
+  edges, plus a check against a scalar `std::fma` chain. Layer mix +2.1 to +2.4% at 12 cores, +2.7 to +3.2% at 10;
+  dn_in / attn_qkv +6 to +7%, dn_out / attn_o +4%, down +2%, gate_up unchanged (its SwiGLU output is half the size; it is now the
+  slowest product per FLOP). 16k log at 12 cores: matrix products 157 -> 146 s, +1.4% end to end; short alerts +2%.
+- Last-layer row pruning (keep only the final row in the last layer) is not done: the Clef head reads every final row (memory
+  projection and cross-attention over all positions, span means), so it would change the logits.
+- Attention: new `flash` kernel (default; `SEPAL_ATTENTION=tiled` keeps the old one). S, P and the output accumulator stay in the
+  micro-kernel tile layout (no copies), the micro kernel accumulates P V itself, K/V panels are the outer loop, the last key tile
+  is cut to the visible keys, and the softmax loops have no 64-bit division (one per 8 scores cost more than the exp: the softmax
+  was 25% of the attention time, now 12%). Same online softmax over the same absolute 128-key tiles, so rows stay independent of
+  batch, chunking and threads (new test). sepal-cpu-attn-bench, 16k prefill: +15 to +18% (12 and 10 cores), 1k +17 to +26%;
+  in the 4B 16k log attention 27.8 -> 23.9 s, +1.7 to +1.8% end to end. Parity against the tiled kernel (the current
+  runner output, itself bit-identical to the 0.4 box rows): LONG-LOG 20 records max |dp| 3.6e-5, p99 2.6e-5, 0/262 flips; TOOL 40
+  records (the 40 shortest of TOOL_n60) 1.9e-6, 0/67; the 6 LONG-LOG records with fp32 references 1.9e-5 vs tiled, and vs fp32
+  max |dp| 0.0317, 0/89 flips (unchanged).
+- Lean 4 proofs in `proofs/ExactTrack` (core Lean, no Mathlib, no sorry, `lake build` clean): GEMM bit-identity under any task /
+  tile / thread partition with fixed kc slices; last-row pruning of a causal layer stack (no runtime user, see above); online
+  softmax equals softmax over an abstract exp field. fp32 error bound of online vs two-pass softmax in `proofs/LEAN-NOTES.md`
+  section 10.4 (prose, not machine-checked).
+- Tools: `sepal-cpu-gemm-bench --schedule a,b --measure-peak 1`; new `sepal-cpu-attn-bench`.
+
 ### 2026-11-05: LONG-LOG parity traced to the reference's bf16 error
 
 The LONG-LOG failure of the `cpu-bf16` gate (every CPU path, `cpu-f32` too) comes from the reference rows, not from the runner. An fp32 PyTorch
