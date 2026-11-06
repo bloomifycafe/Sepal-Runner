@@ -547,21 +547,21 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
     // The float32 SIMT path: one matrix [rows, K] in the storage type, from tensors stacked row after row; `pack` interleaves
     // [gate; up] in blocks of 64 rows for the fused SwiGLU. Int8Group goes through a float32 copy in q8_scratch.
     const auto put_simt = [&](const std::vector<std::string>& names, std::size_t rows, std::size_t K, bool pack, SimtWeight type) {
-        SimtMatrix m;
-        m.type = type;
-        m.ld_w = K;
-        const bool q = type == SimtWeight::Int8Group;
+        SimtMatrix mat;
+        mat.type = type;
+        mat.ld_w = K;
+        const bool quant = type == SimtWeight::Int8Group;
         const DType target = type == SimtWeight::F32 ? DType::F32 : DType::BF16;
         char* dst = carve.take(rows * K * (type == SimtWeight::F32 ? 4 : type == SimtWeight::BF16 ? 2 : 1));
-        char* sc = q ? carve.take(rows * (K / kSimtGroup) * 4) : nullptr;
-        m.w = dst;
-        if (q) {
-            m.scales = reinterpret_cast<const float*>(sc);
-            m.ld_s = K / kSimtGroup;
+        char* sc = quant ? carve.take(rows * (K / kSimtGroup) * 4) : nullptr;
+        mat.w = dst;
+        if (quant) {
+            mat.scales = reinterpret_cast<const float*>(sc);
+            mat.ld_s = K / kSimtGroup;
         }
         // Where the values go before they are quantised (int8) or directly (float types).
-        char* land = q ? q8_scratch.data() : dst;
-        const DType land_type = q ? DType::F32 : target;
+        char* land = quant ? q8_scratch.data() : dst;
+        const DType land_type = quant ? DType::F32 : target;
         std::size_t at = 0;
         if (pack) {
             if (names.size() != 2 || rows % 128 != 0) throw std::logic_error("put_simt: packing needs [gate, up] with I a multiple of 64");
@@ -587,12 +587,12 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         }
         if (at != rows * K) throw std::invalid_argument("weights: tensors " + names.front() + " ... have " + std::to_string(at) + " elements, expected " +
                                                          std::to_string(rows * K));
-        if (q && !dry) {
+        if (quant && !dry) {
             launch_quantize_group_s8(reinterpret_cast<const float*>(q8_scratch.data()), K, reinterpret_cast<std::int8_t*>(dst), K,
                                      reinterpret_cast<float*>(sc), K / kSimtGroup, rows, K, stream);
             check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "weight quantisation");
         }
-        return m;
+        return mat;
     };
 
     if (options.host_embedding) {

@@ -22,7 +22,9 @@
 namespace sepal::cuda {
 namespace chunked {
 
-using namespace nvcuda;
+#if SEPAL_TENSOR_CORES
+using namespace nvcuda; // wmma exists only in the sm_70+ images
+#endif
 
 constexpr int kC = 64;          // tokens per chunk
 constexpr int kD = 128;         // key and value head dimension
