@@ -1,5 +1,0 @@
-name = "cgen"
-defaultTargets = ["mm"]
-[[lean_exe]]
-name = "mm"
-root = "Mm"

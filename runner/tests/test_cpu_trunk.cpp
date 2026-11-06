@@ -205,11 +205,10 @@ SEPAL_TEST(cpu_attention, matches_a_double_precision_softmax) {
     struct Shape {
         std::size_t heads, kv, hd;
     };
-    for (const AttentionKernel kernel : {AttentionKernel::Tiled, AttentionKernel::Flash})
     for (const Isa isa : {Isa::Avx2, Isa::Avx2Tuned, Isa::Avx512}) {
         if (!isa_supported(isa)) continue;
-        for (const Shape sh : {Shape{4, 2, 32}, Shape{8, 2, 64}, Shape{2, 2, 32}, Shape{16, 4, 256}}) {
-            const std::size_t total = sh.hd == 256 ? 300 : 330, start = sh.hd == 256 ? 157 : 100;
+        for (const Shape sh : {Shape{4, 2, 32}, Shape{8, 2, 64}, Shape{2, 2, 32}}) {
+            const std::size_t total = 330, start = 100;
             const std::size_t rows = total - start;
             Rng rng(5);
             std::vector<float> keys(total * sh.kv * sh.hd), vals(total * sh.kv * sh.hd);
@@ -230,9 +229,7 @@ SEPAL_TEST(cpu_attention, matches_a_double_precision_softmax) {
             seg.gate = gate.data() + sh.hd; // gate follows the query inside each head's pair
             seg.out = out.data();
             ThreadPool pool(4);
-            set_attention_kernel(kernel);
             attention_forward({sh.heads, sh.kv, sh.hd}, isa, {&seg, 1}, sh.heads * sh.hd, sh.heads * 2 * sh.hd, 2 * sh.hd, sh.heads * sh.hd, pool);
-            set_attention_kernel(AttentionKernel::Default);
             double worst = 0;
             const std::size_t group = sh.heads / sh.kv;
             for (std::size_t t = 0; t < rows; ++t) {
@@ -264,59 +261,6 @@ SEPAL_TEST(cpu_attention, matches_a_double_precision_softmax) {
             CHECK(worst < 2e-5);
         }
     }
-}
-
-SEPAL_TEST(cpu_attention, a_row_does_not_depend_on_the_split_or_the_threads) {
-    // Each kernel sees a row's keys in the same absolute key tiles whatever the segment it is in: cutting the queries into
-    // other segments (chunked prefill, a prefix-cache resume, a batch of several requests) or another thread count must give
-    // every bit of the one-segment run, for Tiled and for Flash.
-    const std::size_t heads = 8, kv = 2, hd = 64, total = 517;
-    Rng rng(11);
-    for (const Isa isa : {Isa::Avx2, Isa::Avx2Tuned, Isa::Avx512}) {
-        if (!isa_supported(isa)) continue;
-        KvCache cache(kv, hd, total, isa);
-        std::vector<float> kvals(kv * hd), vvals(kv * hd);
-        for (std::size_t p = 0; p < total; ++p) {
-            for (float& x : kvals) x = static_cast<float>(rng.next());
-            for (float& x : vvals) x = static_cast<float>(rng.next());
-            for (std::size_t g = 0; g < kv; ++g) cache.append(p, g, kvals.data() + g * hd, vvals.data() + g * hd);
-        }
-        const std::size_t qw = heads * hd;
-        std::vector<float> q(total * qw), gate(total * 2 * qw);
-        for (float& x : q) x = static_cast<float>(rng.next() * 3);
-        for (float& x : gate) x = static_cast<float>(rng.next());
-        for (const AttentionKernel kernel : {AttentionKernel::Tiled, AttentionKernel::Flash}) {
-            set_attention_kernel(kernel);
-            const auto run = [&](const std::vector<std::size_t>& cuts, unsigned threads) {
-                std::vector<float> out(total * qw, 0.0f);
-                std::vector<AttentionSegment> segs;
-                for (std::size_t i = 0; i + 1 < cuts.size(); ++i) {
-                    AttentionSegment s;
-                    s.cache = &cache;
-                    s.start = cuts[i];
-                    s.rows = cuts[i + 1] - cuts[i];
-                    s.q = q.data() + cuts[i] * qw;
-                    s.gate = gate.data() + cuts[i] * 2 * qw + hd;
-                    s.out = out.data() + cuts[i] * qw;
-                    segs.push_back(s);
-                }
-                ThreadPool pool(threads);
-                attention_forward({heads, kv, hd}, isa, segs, qw, 2 * qw, 2 * hd, qw, pool);
-                return out;
-            };
-            const auto whole = run({0, total}, 1);
-            for (const auto& cuts : {std::vector<std::size_t>{0, 1, 2, 129, 256, 300, total}, std::vector<std::size_t>{0, 200, 383, total},
-                                     std::vector<std::size_t>{0, 127, 128, 255, 256, 511, total}})
-                for (const unsigned threads : {1u, 3u, 8u}) {
-                    const auto got = run(cuts, threads);
-                    CHECK(std::memcmp(whole.data(), got.data(), whole.size() * sizeof(float)) == 0);
-                }
-            set_attention_kernel(AttentionKernel::Default);
-        }
-    }
-    CHECK(parse_attention_kernel("flash") == AttentionKernel::Flash);
-    CHECK(attention_kernel() != AttentionKernel::Default);
-    CHECK_THROWS(parse_attention_kernel("v3"), std::invalid_argument);
 }
 
 // ---- the whole trunk --------------------------------------------------------------------------------------------

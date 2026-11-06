@@ -346,17 +346,8 @@ Kernel sets (`SEPAL_CPU_ISA`, the open option `cpu_isa`, or `sepal serve --cpu-i
 with the missing features named, never run into an illegal instruction. `avx2-tuned` keeps the twelve accumulators of a
 6x16 tile in registers with the k loop unrolled four times in assembly (intrinsics under MSVC), widens bf16 inside the
 kernel with `vpunpck*wd` (port 5, otherwise idle), and derives its blocking from the cache sizes read with cpuid; its
-results are bit-identical to `avx2` (same products, same order of the sums). It writes each finished tile to the output
-right after the tile's last k slice, with the output lines prefetched for writing (`SEPAL_GEMM_SCHEDULE=fused-prefetch`, the
-default; `tile` is the older schedule that wrote a task's tiles all at once at its end; same bits either way, proved in
-`proofs/ExactTrack/GemmPartition.lean` and tested byte for byte). Buffers of 8 MiB and more are advised for
+results are bit-identical to `avx2` (same products, same order of the sums). Buffers of 8 MiB and more are advised for
 transparent huge pages on Linux (`SEPAL_HUGEPAGES=0` turns that off).
-
-Attention (`SEPAL_ATTENTION`): `flash` (default) keeps S, P and the output accumulator in the micro-kernel tile layout,
-lets the micro kernel accumulate P V itself, loops over K/V panels outermost and cuts the last key tile to the keys its rows
-can see; `tiled` is the older kernel. Both run the same online softmax over the same absolute 128-key tiles, so a row's
-result never depends on the batch, the chunking or the thread count; they differ in the last bits of the P V sums (held to
-the cpu-bf16 parity gates).
 
 Threads: one per physical core of the CPUs the process may use (affinity mask, then the `cpus` list or `SEPAL_CPU_SET`),
 capped by a cgroup CPU quota, so a container limited to 10 CPUs of an 80-thread host runs 10 threads, not 40. When the

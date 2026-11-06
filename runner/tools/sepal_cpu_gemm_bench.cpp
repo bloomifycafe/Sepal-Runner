@@ -2,7 +2,7 @@
 //
 //   sepal-cpu-gemm-bench [--kind f32|bf16|i8|all] [--isa avx2|avx2-tuned|avx512] [--threads 1,2,4,6,12] [--rows 2048]
 //                        [--n 3584] [--k 1024] [--reps 7] [--shapes custom|4b|0.8b] [--peak-core GFLOPS]
-//                        [--fma-latency 4] [--measure-peak 1] [--schedule tile,fused]
+//                        [--fma-latency 4]
 //
 // Prints, per shape, kind and thread count, the best and median of `reps` runs (the packed weights are built once;
 // the product is timed alone, and the packing of the activations separately) and the percentage of the peak. The peak
@@ -12,10 +12,6 @@
 // 64; int8 with vpdpbusd 128). The bf16 and int8 kernels of the AVX2 sets run at the fp32 FMA rate.
 // --shapes 4b / 0.8b run the trunk's products of Qwen3.5-4B / 0.8B (gate_up as one SwiGLU pair, down, DeltaNet in and
 // out, attention qkv and o) and print the FLOP-weighted total of one layer mix.
-// --measure-peak 1 measures the peak for each thread count instead: every pool thread runs independent FMA streams at once
-// (so the all-core clock is in it). --schedule runs the listed GEMM schedules of the tuned AVX2 set (sepal/cpu/gemm.hpp) on
-// the same packed operands, interleaved repeat by repeat in a rotating order, and prints each one's speedup over the first
-// and whether its output is byte-for-byte that of the first.
 #include <immintrin.h>
 
 #include <algorithm>
@@ -51,28 +47,6 @@ static double measure_ghz(double latency) {
     return latency * static_cast<double>(n) / best / 1e9;
 }
 
-// Aggregate fp32 FMA GFLOP/s of all pool threads at once: 12 independent 8-wide FMA chains per thread.
-static double measure_peak(ThreadPool& pool) {
-    const long long iters = 20'000'000;
-    double best = 1e30;
-    for (int rep = 0; rep < 3; ++rep) {
-        const double t0 = now_s();
-        pool.parallel_for(pool.size(), [&](std::size_t, unsigned) {
-            __m256 c[12];
-            for (int i = 0; i < 12; ++i) c[i] = _mm256_set1_ps(static_cast<float>(i));
-            const __m256 mul = _mm256_set1_ps(0.999999f), add = _mm256_set1_ps(1e-7f);
-            for (long long i = 0; i < iters; ++i)
-                for (int j = 0; j < 12; ++j) c[j] = _mm256_fmadd_ps(c[j], mul, add);
-            __m256 sum = c[0];
-            for (int i = 1; i < 12; ++i) sum = _mm256_add_ps(sum, c[i]);
-            volatile float sink = _mm256_cvtss_f32(sum);
-            (void)sink;
-        });
-        best = std::min(best, now_s() - t0);
-    }
-    return static_cast<double>(pool.size()) * static_cast<double>(iters) * 12.0 * 16.0 / best / 1e9;
-}
-
 struct Shape {
     const char* name;
     std::size_t n, k;
@@ -81,8 +55,7 @@ struct Shape {
 };
 
 int main(int argc, char** argv) {
-    std::string kind_arg = "all", threads_arg = "1,2,4,6,12", shapes_arg = "custom", schedule_arg = "default";
-    bool measured_peak = false;
+    std::string kind_arg = "all", threads_arg = "1,2,4,6,12", shapes_arg = "custom";
     Isa isa = best_isa();
     std::size_t rows = 2048, n = 3584, k = 1024;
     int reps = 7;
@@ -100,8 +73,6 @@ int main(int argc, char** argv) {
         else if (a == "--shapes") shapes_arg = v;
         else if (a == "--peak-core") peak_core = std::stod(v);
         else if (a == "--fma-latency") latency = std::stod(v);
-        else if (a == "--measure-peak") measured_peak = v != "0";
-        else if (a == "--schedule") schedule_arg = v;
     }
     require_isa(isa);
     std::vector<unsigned> thread_counts;
@@ -109,12 +80,6 @@ int main(int argc, char** argv) {
         std::stringstream ss(threads_arg);
         std::string tok;
         while (std::getline(ss, tok, ',')) thread_counts.push_back(static_cast<unsigned>(std::stoul(tok)));
-    }
-    std::vector<GemmSchedule> schedules;
-    {
-        std::stringstream ss(schedule_arg);
-        std::string tok;
-        while (std::getline(ss, tok, ',')) schedules.push_back(parse_gemm_schedule(tok));
     }
     std::vector<Shape> shapes;
     if (shapes_arg == "4b") {
@@ -144,12 +109,7 @@ int main(int argc, char** argv) {
         const double per_core_cycle = !avx512 || kind == WeightKind::F32 ? 32.0 : kind == WeightKind::BF16 ? 64.0 : 128.0;
         for (const unsigned threads : thread_counts) {
             ThreadPool pool(threads);
-            // Two threads on a core share its units: the peak counts physical cores (the caller pins one thread per core).
-            const double peak = measured_peak ? measure_peak(pool) : peak_core > 0.0 ? threads * peak_core : threads * per_core_cycle * ghz;
-            if (measured_peak) std::printf("PEAK threads %2u | measured %.1f GFLOP/s (independent FMA streams on every thread)\n", threads, peak);
-            const std::size_t nm = schedules.size();
-            std::vector<double> flops_total(nm, 0.0), time_total(nm, 0.0);
-            double pack_total = 0.0;
+            double flops_total = 0.0, time_total = 0.0, pack_total = 0.0;
             for (const Shape& s : shapes) {
                 const std::size_t wn = s.swiglu ? 2 * s.n : s.n;
                 std::vector<float> w(wn * s.k);
@@ -158,57 +118,38 @@ int main(int argc, char** argv) {
                                                  : pack_weight(w.data(), s.k, s.n, s.k, kind, isa, pool);
                 PackedActs pa;
                 pack_acts(pa, x.data(), s.k, rows, s.k, pw.variant(), pool);
-                std::vector<std::vector<float>> ys(nm, std::vector<float>(rows * s.n));
-                for (std::size_t m = 0; m < nm; ++m) { // warm up
-                    set_gemm_schedule(schedules[m]);
-                    gemm_packed(pw, pa, ys[m].data(), s.n, false, pool);
-                }
-                std::vector<std::vector<double>> times(nm);
-                std::vector<double> packs;
+                std::vector<float> y(rows * s.n);
+                gemm_packed(pw, pa, y.data(), s.n, false, pool); // warm up
+                std::vector<double> times, packs;
                 for (int r = 0; r < reps; ++r) {
                     const double t0 = now_s();
                     pack_acts(pa, x.data(), s.k, rows, s.k, pw.variant(), pool);
-                    packs.push_back(now_s() - t0);
-                    for (std::size_t i = 0; i < nm; ++i) {
-                        const std::size_t m = (i + static_cast<std::size_t>(r)) % nm; // rotate the order: no schedule always runs first
-                        set_gemm_schedule(schedules[m]);
-                        const double t1 = now_s();
-                        gemm_packed(pw, pa, ys[m].data(), s.n, false, pool);
-                        times[m].push_back(now_s() - t1);
-                    }
+                    const double t1 = now_s();
+                    gemm_packed(pw, pa, y.data(), s.n, false, pool);
+                    times.push_back(now_s() - t1);
+                    packs.push_back(t1 - t0);
                 }
-                set_gemm_schedule(GemmSchedule::Default);
+                std::sort(times.begin(), times.end());
                 std::sort(packs.begin(), packs.end());
                 const double flops = gemm_flops(rows, s.swiglu ? 2 * s.n : s.n, s.k);
-                double first_median = 0.0;
-                for (std::size_t m = 0; m < nm; ++m) {
-                    std::sort(times[m].begin(), times[m].end());
-                    const double med_t = times[m][times[m].size() / 2];
-                    const double best = flops / times[m].front() / 1e9;
-                    const double median = flops / med_t / 1e9;
-                    const double worst = flops / times[m].back() / 1e9;
-                    if (m == 0) first_median = med_t;
-                    std::printf("%-8s %-5s %-20s %-9s threads %2u | rows %zu n %zu k %zu | best %7.1f median %7.1f worst %7.1f GFLOP/s | peak %7.1f | "
-                                "median %5.1f%% of peak | %.2f ms, pack %.2f ms",
-                                s.name, name_of(kind), name_of(pw.variant()), name_of(schedules[m]), threads, rows, s.swiglu ? 2 * s.n : s.n, s.k,
-                                best, median, worst, peak, 100.0 * median / peak, med_t * 1e3, packs[packs.size() / 2] * 1e3);
-                    if (m > 0)
-                        std::printf(" | vs %s %+.1f%% | %s", name_of(schedules[0]), 100.0 * (first_median / med_t - 1.0),
-                                    std::memcmp(ys[m].data(), ys[0].data(), ys[0].size() * sizeof(float)) == 0 ? "bit-identical" : "DIFFERENT BITS");
-                    std::printf("\n");
-                    flops_total[m] += flops * s.per_layer;
-                    time_total[m] += med_t * s.per_layer;
-                }
+                const double best = flops / times.front() / 1e9;
+                const double median = flops / times[times.size() / 2] / 1e9;
+                const double worst = flops / times.back() / 1e9;
+                // Two threads on a core share its units: the peak counts physical cores (the caller pins one thread per core).
+                const double peak = peak_core > 0.0 ? threads * peak_core : threads * per_core_cycle * ghz;
+                std::printf("%-8s %-5s %-20s threads %2u | rows %zu n %zu k %zu | best %7.1f median %7.1f worst %7.1f GFLOP/s | peak %7.1f | "
+                            "median %5.1f%% of peak | %.2f ms, pack %.2f ms\n",
+                            s.name, name_of(kind), name_of(pw.variant()), threads, rows, s.swiglu ? 2 * s.n : s.n, s.k, best, median, worst, peak,
+                            100.0 * median / peak, times[times.size() / 2] * 1e3, packs[packs.size() / 2] * 1e3);
+                flops_total += flops * s.per_layer;
+                time_total += times[times.size() / 2] * s.per_layer;
                 pack_total += packs[packs.size() / 2] * s.per_layer;
             }
             if (shapes.size() > 1) {
-                for (std::size_t m = 0; m < nm; ++m) {
-                    std::printf("LAYERMIX %-5s %-9s threads %2u | %7.1f GFLOP/s, %5.1f%% of peak (median times, FLOP weighted); packing adds %.1f%% of the GEMM time",
-                                name_of(kind), name_of(schedules[m]), threads, flops_total[m] / time_total[m] / 1e9,
-                                100.0 * flops_total[m] / time_total[m] / 1e9 / peak, 100.0 * pack_total / time_total[m]);
-                    if (m > 0) std::printf(" | vs %s %+.1f%%", name_of(schedules[0]), 100.0 * (time_total[0] / time_total[m] - 1.0));
-                    std::printf("\n");
-                }
+                const double peak = peak_core > 0.0 ? threads * peak_core : threads * per_core_cycle * ghz;
+                std::printf("LAYERMIX %-5s threads %2u | %7.1f GFLOP/s, %5.1f%% of peak (median times, FLOP weighted); packing adds %.1f%% of the GEMM time\n",
+                            name_of(kind), threads, flops_total / time_total / 1e9, 100.0 * flops_total / time_total / 1e9 / peak,
+                            100.0 * pack_total / time_total);
             }
             std::fflush(stdout);
         }
