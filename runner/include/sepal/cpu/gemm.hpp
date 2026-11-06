@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "sepal/cpu/aligned.hpp"
@@ -116,6 +117,21 @@ struct GemmBlocking {
 /// the L2, tasks in column-major order). SEPAL_GEMM_KC / SEPAL_GEMM_ROWS / SEPAL_GEMM_COLS / SEPAL_GEMM_ROW_MAJOR=1 override it
 /// (tuning experiments). The blocking never changes a result: each output is one chain over k in increasing order.
 GemmBlocking gemm_blocking(Variant v);
+
+/// Output schedule of the float kinds' k-blocked GEMM (the tuned AVX2 set; the other sets always use Tile). Every schedule
+/// gives the same bits: it only changes when a finished micro tile is written to y.
+///   Tile:  a task writes all its finished tiles after its last k slice (the schedule up to 0.4).
+///   Fused: each tile is written right after its last k slice, while it is in L1 and between the micro-kernel calls.
+///   FusedPrefetch: Fused, and the y lines of the tile are prefetched for writing before its last micro-kernel call.
+///   Skip:  bench only, never writes y (the cost of the epilogue; wrong output).
+/// Default resolves to SEPAL_GEMM_SCHEDULE (tile|fused|fused-prefetch) or the built-in choice.
+enum class GemmSchedule { Default, Tile, Fused, FusedPrefetch, Skip };
+const char* name_of(GemmSchedule s);
+GemmSchedule parse_gemm_schedule(const std::string& name); // throws std::invalid_argument
+/// Process-wide override (bench and tests); Default restores the environment / built-in choice.
+void set_gemm_schedule(GemmSchedule s);
+/// The schedule gemm_packed uses now (never Default).
+GemmSchedule gemm_schedule();
 
 /// Floating-point operations of one product (2 m n k).
 inline double gemm_flops(std::size_t rows, std::size_t n, std::size_t k) {

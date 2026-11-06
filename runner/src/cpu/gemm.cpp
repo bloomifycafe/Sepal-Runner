@@ -3,6 +3,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -79,6 +80,18 @@ std::uint16_t float_to_bf16(float x) {
 namespace {
 
 std::size_t ceil_div(std::size_t a, std::size_t b) { return (a + b - 1) / b; }
+
+// Fused with the y lines prefetched for writing: the dn_in / attn_qkv products 6-9% faster on Broadwell, the same bits.
+constexpr GemmSchedule kBuiltinSchedule = GemmSchedule::FusedPrefetch;
+
+// Prefetch one line for writing (PREFETCHW: the line arrives exclusive, so the store that follows needs no ownership request).
+inline void prefetch_for_write(const void* p) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    _m_prefetchw(p);
+#else
+    __builtin_prefetch(p, 1, 3);
+#endif
+}
 
 bool is_i8(Variant v) { return v == Variant::I8_Z || v == Variant::I8_Y; }
 
@@ -349,6 +362,55 @@ GemmBlocking gemm_blocking(Variant v) {
     return b;
 }
 
+const char* name_of(GemmSchedule s) {
+    switch (s) {
+    case GemmSchedule::Default: return "default";
+    case GemmSchedule::Tile: return "tile";
+    case GemmSchedule::Fused: return "fused";
+    case GemmSchedule::FusedPrefetch: return "fused-prefetch";
+    case GemmSchedule::Skip: return "skip";
+    }
+    return "?";
+}
+
+GemmSchedule parse_gemm_schedule(const std::string& name) {
+    for (const GemmSchedule s : {GemmSchedule::Default, GemmSchedule::Tile, GemmSchedule::Fused, GemmSchedule::FusedPrefetch, GemmSchedule::Skip})
+        if (name == name_of(s)) return s;
+    throw std::invalid_argument("unknown GEMM schedule '" + name + "' (default, tile, fused, fused-prefetch, skip)");
+}
+
+namespace {
+
+std::atomic<GemmSchedule> g_schedule{GemmSchedule::Default};
+
+GemmSchedule env_schedule() {
+#if defined(_MSC_VER)
+    char* env = nullptr;
+    std::size_t length = 0;
+    std::string value;
+    if (_dupenv_s(&env, &length, "SEPAL_GEMM_SCHEDULE") == 0 && env != nullptr) {
+        value = env;
+        std::free(env);
+    }
+#else
+    const char* env = std::getenv("SEPAL_GEMM_SCHEDULE");
+    const std::string value = env != nullptr ? env : "";
+#endif
+    if (value.empty() || value == "default") return kBuiltinSchedule;
+    return parse_gemm_schedule(value);
+}
+
+} // namespace
+
+void set_gemm_schedule(GemmSchedule s) { g_schedule.store(s); }
+
+GemmSchedule gemm_schedule() {
+    const GemmSchedule s = g_schedule.load(std::memory_order_relaxed);
+    if (s != GemmSchedule::Default) return s;
+    static const GemmSchedule from_env = env_schedule();
+    return from_env;
+}
+
 namespace {
 
 // Writes the finished tile [mr][nr] of one micro tile into y.
@@ -408,7 +470,14 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
         // `kc` values, and keeps every micro tile of the block in `tiles` between slices, so the A slice (rows x kc)
         // and the B slices (columns x kc) stay in the L2 cache and every B panel slice is reused over all row blocks.
         // The accumulation order of one element is still increasing k in one fp32 chain: the result does not change.
+        // Output (GemmSchedule): Tile writes a task's finished tiles after its last k slice, all at once; Fused writes each
+        // tile right after its last micro-kernel call, and FusedPrefetch (the tuned set's default) also prefetches the tile's
+        // y lines for writing just before that call. The deferred writes (up to 126 x 64 floats, rows ldy apart, so mostly
+        // 4K-aliased lines that miss and need ownership) were serialised after the compute: 6-9% of dn_in / attn_qkv.
+        // The values written are the same in every schedule (proofs/ExactTrack/GemmPartition.lean, schedules_agree).
         const GemmBlocking blk = gemm_blocking(w.variant());
+        const GemmSchedule sched = vi.isa == Isa::Avx2Tuned ? gemm_schedule() : GemmSchedule::Tile;
+        const bool fused = sched == GemmSchedule::Fused || sched == GemmSchedule::FusedPrefetch;
         const std::size_t kcg = std::max<std::size_t>(1, blk.kc / group);
         const std::size_t mbn = std::max<std::size_t>(1, blk.rows / mr);
         const std::size_t pn = std::max<std::size_t>(1, blk.cols / nr);
@@ -439,13 +508,27 @@ void gemm_packed(const PackedWeight& w, const PackedActs& x, float* y, std::size
                         }
                         ka.b = widened.data();
                     }
+                    const bool last = kg0 + kcg >= x.kgroups;
+                    const std::size_t col0 = p * out_per_panel;
+                    const std::size_t cols_valid = std::min(out_per_panel, w.n() - col0);
                     for (std::size_t mb = mb0; mb < mb1; ++mb) {
                         ka.a = x.data.data() + mb * a_block_stride + kg0 * mr * group * vi.act_bytes;
                         ka.tile = tiles.data() + ((p - p0) * mbn + (mb - mb0)) * tile_floats;
+                        const std::size_t rows_valid = std::min(mr, x.rows - mb * mr);
+                        float* const yt = y + mb * mr * ldy + col0;
+                        if (last && sched == GemmSchedule::FusedPrefetch) {
+                            for (std::size_t r = 0; r < rows_valid; ++r) {
+                                const char* d = reinterpret_cast<const char*>(yt + r * ldy);
+                                prefetch_for_write(d);
+                                prefetch_for_write(d + cols_valid * sizeof(float) - 1);
+                            }
+                        }
                         kernel(ka);
+                        if (last && fused) finish_tile(ka.tile, vi.nr, rows_valid, cols_valid, w.swiglu(), accumulate, yt, ldy);
                     }
                 }
             }
+            if (sched != GemmSchedule::Tile) return;
             for (std::size_t p = p0; p < p1; ++p) {
                 const std::size_t col0 = p * out_per_panel;
                 const std::size_t cols_valid = std::min(out_per_panel, w.n() - col0);
