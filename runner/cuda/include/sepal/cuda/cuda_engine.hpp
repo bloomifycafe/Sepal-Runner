@@ -179,9 +179,25 @@ enum class DeltaNetMode {
     Chunked, ///< the chunked kernels for every wave they take (tests, measurements)
 };
 
+/// How the float32 path stores its matrix weights (the four multiply groups; norms, convolution and gates stay float32).
+///   Float32    float32; cuBLAS multiplies (the parity profile gpu-f32), or the engine's own float32 kernel when
+///              multiply_path is Invariant.
+///   BF16       bfloat16 (the float32 merge rounded once to nearest even), widened to float32 in the multiply kernel; the
+///              embedding table is bfloat16 too (profile gpu-bf16).
+///   Int8Group  int8 with one float32 scale per row and group of 128 values of the inner dimension (scale = max |w| / 127,
+///              round to nearest even), dequantised to float32 in the multiply kernel; the DeltaNet's in_proj_b / in_proj_a
+///              rows stay bfloat16, the embedding table is bfloat16 (profile gpu-w8g).
+/// BF16 and Int8Group multiply on the engine's own float32 SIMT kernel (src/gemm_simt_kernels.hpp): no tensor cores, so
+/// they run on every card from Pascal (sm_61) up; batch-invariant by construction (strict mode pads nothing); the MLP's
+/// SwiGLU and the residual additions after the output and down projections are fused into the multiplies. Activations,
+/// keys, values and states stay float32 (attention: AttentionPath::TiledF32). Precision::F32 only.
+enum class WeightStorage { Float32 = 0, BF16 = 1, Int8Group = 2 };
+
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
+    /// Float32 path only: see WeightStorage.
+    WeightStorage weight_storage = WeightStorage::Float32;
     /// Device memory the engine may take altogether, weights included. 0 sizes the pools for `pool_snapshots` snapshots (see
     /// there) within 85% of the memory free at creation.
     std::size_t memory_budget_bytes = 0;

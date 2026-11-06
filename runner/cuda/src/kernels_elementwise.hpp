@@ -32,7 +32,7 @@ using detail::Elem;
 
 /// Embedding gather: out[t, :] = float32(table[token_ids[t], :]) for t in [0, n).
 /// token_ids: device array of n ids. table: device matrix [vocab, hidden], dense (row stride hidden), stored as
-/// `table_type` (F32 or F16). out: float32 matrix [n, hidden] with row stride `out_stride`. An id outside the
+/// `table_type` (F32, F16 or BF16; widening is exact). out: float32 matrix [n, hidden] with row stride `out_stride`. An id outside the
 /// vocabulary writes a zero row (the host admits ids before a pass; the kernel only guarantees not to read out of
 /// the table).
 void launch_embed(const std::uint32_t* token_ids, std::size_t n, const void* table, Elem table_type,

@@ -21,7 +21,8 @@ if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
   endif()
 endif()
 
-# Ampere (RTX 30) and later by default. Use "75;86" to add Turing; CUDA 13 no longer targets anything older.
+# Ampere (RTX 30) and later by default. Use "75;86" to add Turing; CUDA 13 no longer targets anything older. Pascal (GTX 10xx,
+# Tesla P40: "61") needs a CUDA 12 toolkit, on Linux: the `pascal` preset (README.md, "Pascal").
 set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to generate code for")
 
 project(sepal_runner_cuda VERSION 0.1.0 LANGUAGES CXX CUDA)
@@ -41,8 +42,26 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(SEPAL_BUILD_TESTS OFF CACHE BOOL "Parent tests are built by the parent project" FORCE)
 add_subdirectory(.. sepal_core_build EXCLUDE_FROM_ALL)
 
+# ---- tensor cores ----
+# The tensor-core kernels (mma.sync, ldmatrix, cp.async: binary16 profiles, int8 multiplies, chunked DeltaNet, tiled binary16
+# attention) exist only in the images of architectures 80 and up (src/device.hpp, SEPAL_TENSOR_CORES); an older image keeps
+# traps in their place and the engine refuses those paths at run time. Their tests are registered only when such an image is built.
+set(SEPAL_CUDA_TENSOR_CORES OFF)
+foreach(arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX MATCH "^[0-9]+" arch_number "${arch}")
+  if(arch_number GREATER_EQUAL 80)
+    set(SEPAL_CUDA_TENSOR_CORES ON)
+  endif()
+endforeach()
+message(STATUS "sepal_runner_cuda: architectures ${CMAKE_CUDA_ARCHITECTURES}, tensor-core image: ${SEPAL_CUDA_TENSOR_CORES}")
+
 # ---- warnings as errors for this project's own code ----
 add_library(sepal_cuda_flags INTERFACE)
+if(SEPAL_CUDA_TENSOR_CORES)
+  target_compile_definitions(sepal_cuda_flags INTERFACE SEPAL_CUDA_TC_IMAGE=1)
+else()
+  target_compile_definitions(sepal_cuda_flags INTERFACE SEPAL_CUDA_TC_IMAGE=0)
+endif()
 if(MSVC)
   target_compile_options(sepal_cuda_flags INTERFACE
     $<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/permissive-;/utf-8;/fp:precise>
@@ -228,7 +247,8 @@ endforeach()
 set_tests_properties(cuda_head_golden PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
 
 # ---- the GPU engine: weights, call buffers, snapshots and the layer loop over all the kernels above ----
-add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu)
+add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp src/activation_stats.cpp src/engine_kernels.cu src/gemm_kernels.cu src/gemm_s8_kernels.cu
+  src/gemm_simt_kernels.cu)
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
@@ -258,18 +278,36 @@ add_executable(sepal_cuda_kernel_gemm_tests tests/test_gemm_kernels.cpp src/gemm
 target_include_directories(sepal_cuda_kernel_gemm_tests PRIVATE ../tests src)
 target_include_directories(sepal_cuda_kernel_gemm_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_kernel_gemm_tests PRIVATE sepal_core sepal_cuda_flags)
+if(SEPAL_CUDA_TENSOR_CORES)
 foreach(suite gemmk_convert gemmk_accuracy gemmk_invariance gemmk_edge)
   add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_gemm_tests ${suite})
   set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
+endif()
 
 # ---- the int8 multiply kernels ----
 add_executable(sepal_cuda_kernel_s8_tests tests/test_gemm_s8_kernels.cpp src/gemm_s8_kernels.cu ../tests/test_main.cpp)
 target_include_directories(sepal_cuda_kernel_s8_tests PRIVATE ../tests src)
 target_include_directories(sepal_cuda_kernel_s8_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_kernel_s8_tests PRIVATE sepal_core sepal_cuda_flags)
+if(SEPAL_CUDA_TENSOR_CORES)
 foreach(suite s8_quantize s8_gemm s8_invariance s8_edge s8_smoothing)
   add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_s8_tests ${suite})
+  set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
+endforeach()
+endif()
+
+# ---- the float32 SIMT multiply of the Pascal profiles (gpu-bf16, gpu-w8g); no tensor cores, every architecture ----
+add_executable(sepal_cuda_kernel_simt_tests tests/test_gemm_simt_kernels.cpp src/gemm_simt_kernels.cu ../tests/test_main.cpp)
+target_include_directories(sepal_cuda_kernel_simt_tests PRIVATE ../tests src)
+target_include_directories(sepal_cuda_kernel_simt_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal_cuda_kernel_simt_tests PRIVATE sepal_cuda_elementwise sepal_core sepal_cuda_flags)
+add_executable(sepal-cuda-simt-bench tools/simt_gemm_bench.cpp src/gemm_simt_kernels.cu)
+target_include_directories(sepal-cuda-simt-bench PRIVATE src)
+target_include_directories(sepal-cuda-simt-bench SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
+target_link_libraries(sepal-cuda-simt-bench PRIVATE sepal_cublas sepal_cuda_flags)
+foreach(suite simt_exact simt_invariance simt_epilogue simt_quant simt_edge)
+  add_test(NAME cuda_${suite} COMMAND sepal_cuda_kernel_simt_tests ${suite})
   set_tests_properties(cuda_${suite} PROPERTIES TIMEOUT 600)
 endforeach()
 
@@ -289,12 +327,19 @@ add_executable(sepal_cuda_engine_tests
   tests/test_cuda_engine_snapshots.cpp
   tests/test_cuda_engine_real_snapshots.cpp
   tests/test_cuda_engine_real_int8.cpp
+  tests/test_cuda_engine_simt.cpp
   ../tests/test_main.cpp
 )
 target_include_directories(sepal_cuda_engine_tests PRIVATE ../tests tests src)
 target_include_directories(sepal_cuda_engine_tests SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine_tests PRIVATE sepal_cuda_engine sepal_core sepal_cuda_flags)
-foreach(suite engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply engine_int8 attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz snap_default snap_default_big real_half_state real_tiers soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
+# Without a tensor-core image only the float32 suites run (the others build float16 engines, which such a build refuses).
+if(SEPAL_CUDA_TENSOR_CORES)
+  set(SEPAL_ENGINE_SUITES engine_f32 engine_f16 engine_strict engine_natural engine_memory engine_negative engine_multiply engine_int8 attack_shapes attack_invariance attack_lifetime attack_memory attack_deepchain attack_determinism attack_concurrency attack_geometry snap_half snap_tiers snap_fuzz snap_default snap_default_big real_half_state real_tiers soak_short real_soak real_alerts real_cpu real_long real_diag real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b engine_simt)
+else()
+  set(SEPAL_ENGINE_SUITES engine_f32 engine_simt)
+endif()
+foreach(suite ${SEPAL_ENGINE_SUITES})
   add_test(NAME cuda_engine_${suite} COMMAND sepal_cuda_engine_tests ${suite})
   set_tests_properties(cuda_engine_${suite} PROPERTIES TIMEOUT 1800
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
@@ -302,7 +347,9 @@ endforeach()
 # A real-model suite prints "SKIPPED: real-model ..." and exits 0 when its environment variables are not set; CTest
 # must show that as Skipped, not Passed (the parent project's `real` test does the same).
 foreach(suite snap_default_big real_long real_cpu real_diag real_soak real_alerts real_half_state real_tiers real_f32 real_f16 real_strict real_natural real_2b real_int8 real_int8_2b)
-  set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
+  if(TEST cuda_engine_${suite})
+    set_tests_properties(cuda_engine_${suite} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: real-model")
+  endif()
 endforeach()
 
 # ---- the C ABI library of the GPU engine (same c_api.cpp object code as sepal_runner_cpu, plus the CUDA profiles) ----
@@ -319,6 +366,7 @@ add_executable(sepal-cuda-chunk-check tools/chunk_check.cpp)
 target_link_libraries(sepal-cuda-chunk-check PRIVATE sepal_cuda_deltanet_kernels sepal_core sepal_cuda_flags)
 
 # The chunked DeltaNet kernels against the scan kernel (random data, rows of 7 to 4096 tokens; exit status 1 when a difference is over 5% of the rms).
+if(SEPAL_CUDA_TENSOR_CORES)
 add_test(NAME cuda_deltanet_chunked_float COMMAND sepal-cuda-chunk-check)
 add_test(NAME cuda_deltanet_chunked_half_input COMMAND sepal-cuda-chunk-check --input half --lengths 1000,64,130,3000,1,2,3 --seed 5)
 add_test(NAME cuda_deltanet_chunked_half_state COMMAND sepal-cuda-chunk-check --input half --half-state on --lengths 700,64,257 --seed 7)
@@ -327,16 +375,23 @@ foreach(t float half_input half_state no_state)
   set_tests_properties(cuda_deltanet_chunked_${t} PROPERTIES TIMEOUT 600
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()
+endif()
 
 # The trained model against the golden set, with the gates of docs/RUNNER.md 14. Skipped (exit 77) unless SEPAL_TRAINED_FINAL,
 # SEPAL_TRAINED_BASE and SEPAL_GOLDEN_DIR are set (the golden set: runs/runner-golden/full08b).
 add_test(NAME cuda_golden_gpu_f32 COMMAND sepal-gpu-parity --profile gpu-f32 --max-tokens 20000 --skip-without-env on)
-add_test(NAME cuda_golden_gpu_f16_scan COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet scan --skip-without-env on)
-add_test(NAME cuda_golden_gpu_f16_chunked COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet chunked --skip-without-env on)
-add_test(NAME cuda_golden_gpu_f16_batch20 COMMAND sepal-gpu-parity --profile gpu-f16 --batch 20 --skip-without-env on)
-add_test(NAME cuda_golden_gpu_f16_strict COMMAND sepal-gpu-parity --profile gpu-f16-strict --max-tokens 20000 --skip-without-env on)
 add_test(NAME cuda_golden_gpu_f32_strict COMMAND sepal-gpu-parity --profile gpu-f32-strict --max-tokens 20000 --skip-without-env on)
-foreach(t gpu_f32 gpu_f16_scan gpu_f16_chunked gpu_f16_batch20 gpu_f16_strict gpu_f32_strict)
+add_test(NAME cuda_golden_gpu_bf16 COMMAND sepal-gpu-parity --profile gpu-bf16 --max-tokens 20000 --skip-without-env on)
+add_test(NAME cuda_golden_gpu_w8g COMMAND sepal-gpu-parity --profile gpu-w8g --max-tokens 20000 --skip-without-env on)
+set(SEPAL_GOLDEN_TESTS gpu_f32 gpu_f32_strict gpu_bf16 gpu_w8g)
+if(SEPAL_CUDA_TENSOR_CORES)
+  add_test(NAME cuda_golden_gpu_f16_scan COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet scan --skip-without-env on)
+  add_test(NAME cuda_golden_gpu_f16_chunked COMMAND sepal-gpu-parity --profile gpu-f16 --deltanet chunked --skip-without-env on)
+  add_test(NAME cuda_golden_gpu_f16_batch20 COMMAND sepal-gpu-parity --profile gpu-f16 --batch 20 --skip-without-env on)
+  add_test(NAME cuda_golden_gpu_f16_strict COMMAND sepal-gpu-parity --profile gpu-f16-strict --max-tokens 20000 --skip-without-env on)
+  list(APPEND SEPAL_GOLDEN_TESTS gpu_f16_scan gpu_f16_chunked gpu_f16_batch20 gpu_f16_strict)
+endif()
+foreach(t ${SEPAL_GOLDEN_TESTS})
   set_tests_properties(cuda_golden_${t} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${SEPAL_CUDA_DLL_DIR}")
 endforeach()

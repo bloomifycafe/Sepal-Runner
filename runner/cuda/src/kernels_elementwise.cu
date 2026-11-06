@@ -90,6 +90,26 @@ __device__ inline float4 load4_widened(const __half* row, std::size_t base, std:
     return v;
 }
 
+/// A bfloat16 table (raw bits): widening is a 16-bit shift, exact.
+struct Bf16Bits {
+    unsigned short bits;
+};
+__device__ inline float bf16_widen(Bf16Bits b) { return __uint_as_float(static_cast<unsigned>(b.bits) << 16); }
+
+__device__ inline float4 load4_widened(const Bf16Bits* row, std::size_t base, std::size_t width, bool aligned) {
+    if (aligned && base + 4 <= width) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(row + base);
+        return make_float4(__uint_as_float(packed.x << 16), __uint_as_float(packed.x & 0xFFFF0000u), __uint_as_float(packed.y << 16),
+                           __uint_as_float(packed.y & 0xFFFF0000u));
+    }
+    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (base < width) v.x = bf16_widen(row[base]);
+    if (base + 1 < width) v.y = bf16_widen(row[base + 1]);
+    if (base + 2 < width) v.z = bf16_widen(row[base + 2]);
+    if (base + 3 < width) v.w = bf16_widen(row[base + 3]);
+    return v;
+}
+
 // ---- the norm ----
 
 /// acc + v.x^2 + v.y^2 + v.z^2 + v.w^2, in that order, each step one fused multiply-add.
@@ -319,13 +339,16 @@ void require_output_type(Elem type) {
 
 void launch_embed(const std::uint32_t* token_ids, std::size_t n, const void* table, Elem table_type,
                   std::size_t vocab, std::size_t hidden, float* out, std::size_t out_stride, cudaStream_t stream) {
-    require(table_type == Elem::F32 || table_type == Elem::F16, "launch_embed: the table must be F32 or F16");
+    require(table_type == Elem::F32 || table_type == Elem::F16 || table_type == Elem::BF16, "launch_embed: the table must be F32, F16 or BF16");
     require_matrix(n, hidden, out_stride, "launch_embed: out_stride is smaller than hidden");
     if (n == 0 || hidden == 0) return;
     const bool aligned = hidden % 4 == 0 && out_stride % 4 == 0 && aligned16(table) && aligned16(out);
     if (table_type == Elem::F32) {
         embed_kernel<float><<<static_cast<unsigned>(n), kBlock, 0, stream>>>(
             token_ids, static_cast<const float*>(table), vocab, hidden, out, out_stride, aligned);
+    } else if (table_type == Elem::BF16) {
+        embed_kernel<Bf16Bits><<<static_cast<unsigned>(n), kBlock, 0, stream>>>(
+            token_ids, static_cast<const Bf16Bits*>(table), vocab, hidden, out, out_stride, aligned);
     } else {
         embed_kernel<__half><<<static_cast<unsigned>(n), kBlock, 0, stream>>>(
             token_ids, static_cast<const __half*>(table), vocab, hidden, out, out_stride, aligned);

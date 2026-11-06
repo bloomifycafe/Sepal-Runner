@@ -85,14 +85,25 @@ struct GpuDecisionEngine::Impl {
     Impl(const TrainedModel& m, const GpuDecisionOptions& o) : model(m), options(o) {
         const bool strict = o.profile == "gpu-f16-strict" || o.profile == "gpu-f32-strict";
         const bool f16 = o.profile == "gpu-f16" || o.profile == "gpu-f16-strict" || o.profile == "gpu-q8w";
-        if (!f16 && o.profile != "gpu-f32" && o.profile != "gpu-f32-strict")
-            throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16, gpu-q8w, gpu-f32, gpu-f16-strict or gpu-f32-strict)");
+        // The Pascal profiles: float32 arithmetic on the engine's own SIMT kernels, weights bfloat16 or int8 per group of 128.
+        const bool simt = o.profile == "gpu-bf16" || o.profile == "gpu-w8g";
+        if (!f16 && !simt && o.profile != "gpu-f32" && o.profile != "gpu-f32-strict")
+            throw std::invalid_argument("unknown GPU profile '" + o.profile + "' (gpu-f16, gpu-q8w, gpu-f32, gpu-f16-strict, gpu-f32-strict, gpu-bf16 or gpu-w8g)");
+        check(cudaSetDevice(o.device), "cudaSetDevice");
+        // The binary16 profiles run the engine's tensor-core kernels (mma.sync, cp.async, ldmatrix: sm_80 and up).
+        if (f16 && !device_has_tensor_cores()) {
+            cudaDeviceProp prop{};
+            check(cudaGetDeviceProperties(&prop, o.device), "cudaGetDeviceProperties");
+            throw std::invalid_argument("profile " + o.profile + " needs a card of compute capability 8.0 or later and a build with an sm_80+ image (this card, " +
+                                        std::string(prop.name) + ", is " + std::to_string(prop.major) + "." + std::to_string(prop.minor) + "); use gpu-bf16 or gpu-w8g");
+        }
         if (options.max_call_tokens == 0) {
             std::size_t free_bytes = 0, total = 0;
-            check(cudaSetDevice(o.device), "cudaSetDevice");
             check(cudaMemGetInfo(&free_bytes, &total), "cudaMemGetInfo");
             const std::size_t gib = std::size_t{1} << 30;
-            options.max_call_tokens = free_bytes >= 20 * gib ? 65536 : free_bytes >= 10 * gib ? 32768 : 16384;
+            // The float32 path's call buffers take about twice the binary16 path's per token (174 KB a token at 4B).
+            if (simt || !f16) options.max_call_tokens = free_bytes >= 20 * gib ? 16384 : free_bytes >= 10 * gib ? 4096 : 2048;
+            else options.max_call_tokens = free_bytes >= 20 * gib ? 65536 : free_bytes >= 10 * gib ? 32768 : 16384;
         }
         options.head.call_tokens = std::max(options.head.call_tokens, options.max_call_tokens);
         options.head.memory_tokens = std::max(options.head.memory_tokens, options.max_call_tokens); // one trunk call goes into the head whole
@@ -101,6 +112,8 @@ struct GpuDecisionEngine::Impl {
         EngineOptions eo;
         eo.device = o.device;
         eo.precision = f16 ? Precision::F16 : Precision::F32;
+        if (o.profile == "gpu-bf16") eo.weight_storage = WeightStorage::BF16;
+        if (o.profile == "gpu-w8g") eo.weight_storage = WeightStorage::Int8Group;
         eo.prune_last_layer = false; // the head reads every position
         eo.max_call_tokens = options.max_call_tokens;
         eo.max_call_rows = o.max_call_rows;

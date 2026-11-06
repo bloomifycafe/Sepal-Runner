@@ -107,7 +107,19 @@ int main(int argc, char** argv) {
         else if (a == "--skip-without-env") skip_without_env = v == "on";
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
     }
-    const auto from_env = [](const char* name) { const char* v = std::getenv(name); return v != nullptr ? std::string(v) : std::string(); };
+    const auto from_env = [](const char* name) {
+#if defined(_MSC_VER)
+        char* buffer = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr) return std::string();
+        const std::string value(buffer);
+        std::free(buffer);
+        return value;
+#else
+        const char* v = std::getenv(name);
+        return v != nullptr ? std::string(v) : std::string();
+#endif
+    };
     if (final_dir.empty()) final_dir = from_env("SEPAL_TRAINED_FINAL");
     if (base_dir.empty()) base_dir = from_env("SEPAL_TRAINED_BASE");
     if (golden_dir.empty()) golden_dir = from_env("SEPAL_GOLDEN_DIR");

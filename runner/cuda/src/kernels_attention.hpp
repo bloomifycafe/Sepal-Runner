@@ -39,7 +39,9 @@
 // Paths. `Reference` is a plain kernel, one block per (token, query head), for both element types and any
 // head_dim up to 256. `Tiled` is a tensor-core kernel (mma.sync, fp32 accumulation) for F16 only: a block
 // takes 64 rows of (token, head of one KV group) of one row and walks the keys 32 at a time with an online
-// softmax. It needs head_dim 16, 64, 128 or 256 and a group size heads / kv_heads of 1, 2, 4, 8 or 16.
+// softmax. It needs head_dim 16, 64, 128 or 256 and a group size heads / kv_heads of 1, 2, 4, 8 or 16 (sm_80 and up).
+// `TiledF32` is the same walk in float32 on the ordinary cores (the Pascal profiles): 32 query rows of one KV group per
+// block, keys 32 at a time, head_dim 16, 32, 64, 128 or 256; it takes F32 keys and values only.
 // Alignment the tiled kernel relies on (cp.async, 16 bytes): segment pointers and the q buffer are 16-byte
 // aligned and the q row stride is a multiple of 8 elements.
 #pragma once
@@ -62,7 +64,8 @@ enum class AttnElem : int { F32 = 0, F16 = 1 };
 enum class AttentionPath : int {
     Reference = 0, ///< the plain kernel: any head_dim up to 256, either element type
     Tiled = 1,     ///< tensor cores, F16 only; throws when the geometry is not supported
-    Auto = 2,      ///< Tiled when supported, otherwise Reference
+    Auto = 2,      ///< Tiled (F16) or TiledF32 (F32) when supported, otherwise Reference
+    TiledF32 = 3,  ///< float32 flash attention on the ordinary cores, F32 only (any architecture); throws when not supported
 };
 
 /// The attention geometry, read from the model configuration.
@@ -145,6 +148,11 @@ AttentionPath launch_attention(const AttentionShape& shape, const AttentionRows&
 
 /// True when the tiled kernel supports this geometry and K/V type.
 bool attention_tiled_supported(const AttentionShape& shape, AttnElem kv_type);
+
+/// True when the float32 tiled kernel (AttentionPath::TiledF32) supports this geometry and K/V type: F32, head_dim 16, 32, 64,
+/// 128 or 256, a group size heads / kv_heads of 1, 2, 4, 8 or 16. (The q buffer must also be 16-byte aligned with a row stride that is a
+/// multiple of 4; launch_attention checks that.)
+bool attention_f32_tiled_supported(const AttentionShape& shape, AttnElem kv_type);
 
 /// Host-side check of the tables before they are uploaded: every row has at least one segment, its segments lie
 /// inside the array, its own (last) segment holds exactly as many tokens as the row, and positions do not

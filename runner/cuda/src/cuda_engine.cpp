@@ -23,6 +23,7 @@
 #include "engine_kernels.hpp"
 #include "gemm_kernels.hpp"
 #include "gemm_s8_kernels.hpp"
+#include "gemm_simt_kernels.hpp"
 #include "kernels_attention.hpp"
 #include "kernels_deltanet.hpp"
 #include "kernels_deltanet_chunked.hpp"
@@ -231,6 +232,9 @@ struct LayerWeights {
     // mixer_in is then [mixed, z] only; its b and a rows stay binary16 in dn_ba.
     Q8Matrix q_mixer_in, q_mixer_out, q_gate_up, q_down;
     const void* dn_ba = nullptr;
+    // The float32 SIMT path (Impl::simt): every matrix as the multiply kernel reads it. gate_up's rows are packed for the fused
+    // SwiGLU (pack_gate_up_source). With Int8Group the DeltaNet's mixer_in is [mixed, z] only and its b and a rows are s_dn_ba.
+    SimtMatrix s_mixer_in, s_mixer_out, s_gate_up, s_down, s_dn_ba;
     DeltaNetWeights deltanet;
     const float* q_norm = nullptr;
     const float* k_norm = nullptr;
@@ -311,6 +315,19 @@ struct CudaEngine::Impl {
     char* hbuf = nullptr;    // binary16 results of the multiplies that accumulate in binary16, before they are widened [acc_rows, p_width]
     std::size_t acc_rows = 0;
     bool invariant_all = false; // the own kernel takes every multiply of the model: strict mode pads nothing
+    bool simt = false;          // float32 path on the own SIMT kernel (EngineOptions::weight_storage, or multiply_path Invariant)
+    SimtWeight simt_type = SimtWeight::F32;
+    Elem embed_elem = Elem::F16; // the embedding table's stored type
+    // The multiply of the SIMT path: rows [row0, row0 + n) of the stored matrix.
+    void mm(const void* in, std::size_t ld_in, const SimtMatrix& w, std::size_t row0, std::size_t n, std::size_t k, void* out,
+            std::size_t ld_out, std::size_t rows, SimtEpilogue epilogue) {
+        if (rows == 0) return;
+        SimtMatrix part = w;
+        const std::size_t bytes = w.type == SimtWeight::F32 ? 4 : w.type == SimtWeight::BF16 ? 2 : 1;
+        part.w = static_cast<const char*>(w.w) + row0 * w.ld_w * bytes;
+        if (w.scales != nullptr) part.scales = w.scales + row0 * w.ld_s;
+        launch_gemm_simt(static_cast<const float*>(in), ld_in, part, static_cast<float*>(out), ld_out, rows, n, k, epilogue, -1, stream);
+    }
     Int8Multiply q8;            // options.int8_multiply, validated
     signed char* aq = nullptr;  // int8 activations of one multiply [cap_rows, aq_width] (int8_activations only)
     float* asc = nullptr;       // their row scales [cap_rows]
@@ -427,7 +444,9 @@ void CudaEngine::Impl::resolve_multiply_path() {
     if (fa.gate_up != none.gate_up || fa.down != none.down || fa.mixer_in != none.mixer_in || fa.mixer_out != none.mixer_out || fa.flush_k != none.flush_k) {
         throw std::invalid_argument("EngineOptions: fp16_accumulate needs an explicit multiply_path (the default, Auto, chooses the accumulation itself)");
     }
-    if (!half || options.int8_multiply.any()) {
+    if (!half && options.weight_storage != WeightStorage::Float32) {
+        options.multiply_path = MultiplyPath::Invariant; // narrow float32-path weights: only the own SIMT kernel reads them
+    } else if (!half || options.int8_multiply.any()) {
         // The float32 path has no choice to make; the groups that stay binary16 next to int8 ones are the measured profiles'.
         options.multiply_path = MultiplyPath::Cublas;
     } else if (options.gemm_rows == 0) {
@@ -520,7 +539,59 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         return Q8Matrix{reinterpret_cast<const signed char*>(wq), reinterpret_cast<const float*>(sc), reinterpret_cast<const float*>(sm)};
     };
 
-    weights.embedding = put({std::string(embedding_name)}, operand, dim(config.vocab_size) * H);
+    // The float32 SIMT path: one matrix [rows, K] in the storage type, from tensors stacked row after row; `pack` interleaves
+    // [gate; up] in blocks of 64 rows for the fused SwiGLU. Int8Group goes through a float32 copy in q8_scratch.
+    const auto put_simt = [&](const std::vector<std::string>& names, std::size_t rows, std::size_t K, bool pack, SimtWeight type) {
+        SimtMatrix m;
+        m.type = type;
+        m.ld_w = K;
+        const bool q = type == SimtWeight::Int8Group;
+        const DType target = type == SimtWeight::F32 ? DType::F32 : DType::BF16;
+        char* dst = carve.take(rows * K * (type == SimtWeight::F32 ? 4 : type == SimtWeight::BF16 ? 2 : 1));
+        char* sc = q ? carve.take(rows * (K / kSimtGroup) * 4) : nullptr;
+        m.w = dst;
+        if (q) {
+            m.scales = reinterpret_cast<const float*>(sc);
+            m.ld_s = K / kSimtGroup;
+        }
+        // Where the values go before they are quantised (int8) or directly (float types).
+        char* land = q ? q8_scratch.data() : dst;
+        const DType land_type = q ? DType::F32 : target;
+        std::size_t at = 0;
+        if (pack) {
+            if (names.size() != 2 || rows % 128 != 0) throw std::logic_error("put_simt: packing needs [gate, up] with I a multiple of 64");
+            const std::size_t inter = rows / 2;
+            const HostTensor g = source(names[0]);
+            const HostTensor u = source(names[1]);
+            if (g.elements != inter * K || u.elements != inter * K) throw std::invalid_argument("weights: " + names[0] + " / " + names[1] + " have the wrong size");
+            if (!dry) {
+                const std::size_t eb = bytes_of(g.dtype);
+                for (std::size_t b = 0; b < inter / 64; ++b) {
+                    upload(HostTensor{static_cast<const char*>(g.data) + 64 * b * K * eb, g.dtype, 64 * K}, land_type, land, 128 * b * K, staging);
+                    upload(HostTensor{static_cast<const char*>(u.data) + 64 * b * K * bytes_of(u.dtype), u.dtype, 64 * K}, land_type, land,
+                           (128 * b + 64) * K, staging);
+                }
+            }
+            at = rows * K;
+        } else {
+            for (const std::string& name : names) {
+                const HostTensor t = source(name);
+                if (!dry) upload(t, land_type, land, at, staging);
+                at += t.elements;
+            }
+        }
+        if (at != rows * K) throw std::invalid_argument("weights: tensors " + names.front() + " ... have " + std::to_string(at) + " elements, expected " +
+                                                         std::to_string(rows * K));
+        if (q && !dry) {
+            launch_quantize_group_s8(reinterpret_cast<const float*>(q8_scratch.data()), K, reinterpret_cast<std::int8_t*>(dst), K,
+                                     reinterpret_cast<float*>(sc), K / kSimtGroup, rows, K, stream);
+            check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", "weight quantisation");
+        }
+        return m;
+    };
+
+    weights.embedding = put({std::string(embedding_name)}, simt ? (embed_elem == Elem::BF16 ? DType::BF16 : DType::F32) : operand,
+                            dim(config.vocab_size) * H);
     weights.final_norm = reinterpret_cast<const float*>(put({std::string(final_norm_name)}, DType::F32, H));
     weights.layers.assign(layers, LayerWeights{});
     std::size_t dn_seen = 0, attn_seen = 0;
@@ -530,6 +601,37 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         w.attention = config.is_full_attention(l);
         w.input_norm = reinterpret_cast<const float*>(put({pre + "input_layernorm.weight"}, DType::F32, H));
         w.post_norm = reinterpret_cast<const float*>(put({pre + "post_attention_layernorm.weight"}, DType::F32, H));
+        if (simt) {
+            const SimtWeight st = simt_type;
+            const SimtWeight small = st == SimtWeight::Int8Group ? SimtWeight::BF16 : st; // DeltaNet b and a rows
+            if (w.attention) {
+                const std::string a = pre + "self_attn.";
+                w.kind_index = attn_seen++;
+                w.s_mixer_in = put_simt({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, attn_in_width, H, false, st);
+                w.s_mixer_out = put_simt({a + "o_proj.weight"}, H, attn_width, false, st);
+                w.q_norm = reinterpret_cast<const float*>(put({a + "q_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
+                w.k_norm = reinterpret_cast<const float*>(put({a + "k_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
+            } else {
+                const std::string d = pre + "linear_attn.";
+                w.kind_index = dn_seen++;
+                if (st == SimtWeight::Int8Group) {
+                    w.s_mixer_in = put_simt({d + "in_proj_qkv.weight", d + "in_proj_z.weight"}, conv_dim + value_dim, H, false, st);
+                    w.s_dn_ba = put_simt({d + "in_proj_b.weight", d + "in_proj_a.weight"}, 2 * dim(config.dn_value_heads), H, false, small);
+                } else {
+                    w.s_mixer_in = put_simt({d + "in_proj_qkv.weight", d + "in_proj_z.weight", d + "in_proj_b.weight", d + "in_proj_a.weight"},
+                                            dn_in_width, H, false, st);
+                }
+                w.s_mixer_out = put_simt({d + "out_proj.weight"}, H, value_dim, false, st);
+                w.deltanet.conv = reinterpret_cast<const float*>(put({d + "conv1d.weight"}, DType::F32, conv_dim * dim(config.conv_kernel)));
+                w.deltanet.a_log = reinterpret_cast<const float*>(put({d + "A_log"}, DType::F32, dim(config.dn_value_heads)));
+                w.deltanet.dt_bias = reinterpret_cast<const float*>(put({d + "dt_bias"}, DType::F32, dim(config.dn_value_heads)));
+                w.deltanet.norm = reinterpret_cast<const float*>(put({d + "norm.weight"}, DType::F32, dim(config.dn_value_head_dim)));
+            }
+            const std::string mlp = pre + "mlp.";
+            w.s_gate_up = put_simt({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, 2 * I, H, true, st);
+            w.s_down = put_simt({mlp + "down_proj.weight"}, H, I, false, st);
+            continue;
+        }
         if (w.attention) {
             const std::string a = pre + "self_attn.";
             w.kind_index = attn_seen++;
@@ -704,6 +806,43 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
                          !invariant_all;
         acc_rows = !any ? 0 : (options.gemm_rows == 0 ? std::min(cap_rows, kAccumulateChunkRows) : options.gemm_rows);
     }
+    // The float32 SIMT path (WeightStorage): validated here, before anything is allocated.
+    if (options.weight_storage != WeightStorage::Float32 && half) {
+        throw std::invalid_argument("EngineOptions: weight_storage BF16 / Int8Group needs the float32 path (Precision::F32)");
+    }
+    simt = !half && options.multiply_path == MultiplyPath::Invariant;
+    embed_elem = half ? Elem::F16 : Elem::F32;
+    if (simt) {
+        simt_type = options.weight_storage == WeightStorage::BF16 ? SimtWeight::BF16
+                    : options.weight_storage == WeightStorage::Int8Group ? SimtWeight::Int8Group
+                                                                           : SimtWeight::F32;
+        if (simt_type != SimtWeight::F32) embed_elem = Elem::BF16;
+        const auto need = [&](SimtWeight t, std::size_t n_, std::size_t k_, std::size_t ld_in, std::size_t ld_out, SimtEpilogue e, const char* what) {
+            if (!gemm_simt_supports(t, n_, k_, ld_in, k_, ld_out, e)) {
+                throw std::invalid_argument(std::string("EngineOptions: the float32 SIMT multiply does not take the ") + what + " multiply (N " + std::to_string(n_) +
+                                            ", K " + std::to_string(k_) + "): K must be a multiple of 16 (128 with Int8Group), the intermediate size a multiple of 64");
+            }
+        };
+        need(simt_type, 2 * I, H, H, I, SimtEpilogue::SwiGLU, "gate/up");
+        need(simt_type, H, I, I, H, SimtEpilogue::Add, "down");
+        if (dn_layers != 0) {
+            need(simt_type, simt_type == SimtWeight::Int8Group ? conv_dim + value_dim : dn_in_width, H, H, p_width, SimtEpilogue::Store, "DeltaNet input");
+            if (simt_type == SimtWeight::Int8Group) need(SimtWeight::BF16, 2 * dim(config.dn_value_heads), H, H, p_width, SimtEpilogue::Store, "DeltaNet b/a");
+            need(simt_type, H, value_dim, mix_width, H, SimtEpilogue::Add, "DeltaNet output");
+        }
+        if (attn_layers != 0) {
+            need(simt_type, attn_in_width, H, H, p_width, SimtEpilogue::Store, "attention input");
+            need(simt_type, H, attn_width, mix_width, H, SimtEpilogue::Add, "attention output");
+        }
+        invariant_all = true; // every multiply is the own kernel: a row's bits depend on that row only
+        acc_rows = 0;
+        if (simt_type == SimtWeight::Int8Group) {
+            std::size_t scratch = 2 * I * H;
+            if (dn_layers != 0) scratch = std::max({scratch, (conv_dim + value_dim) * H, H * value_dim});
+            if (attn_layers != 0) scratch = std::max({scratch, attn_in_width * H, H * attn_width});
+            q8_scratch_bytes = std::max(q8_scratch_bytes, scratch * 4);
+        }
+    }
     cap_compact = std::min(cap_rows, options.gemm_rows == 0 ? std::size_t{1024} : align_up(std::size_t{1024}, options.gemm_rows));
 
     dn_geometry = DeltaNetGeometry{u32(dim(config.dn_key_heads)), u32(dim(config.dn_value_heads)),
@@ -721,6 +860,11 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     cudaDeviceProp prop{};
     check_cuda(cudaGetDeviceProperties(&prop, options.device), "cudaGetDeviceProperties");
     info.device = options.device;
+    if (half && !device_has_tensor_cores()) {
+        throw std::invalid_argument("CudaEngine: the float16 path runs tensor-core kernels (compute capability 8.0 or later, and a build with an sm_80+ "
+                                    "image); this card is " + std::string(prop.name) + " (" + std::to_string(prop.major) + "." + std::to_string(prop.minor) +
+                                    "): use Precision::F32 (weight_storage BF16 or Int8Group)");
+    }
     sm_count = std::max(1, prop.multiProcessorCount);
     info.name = prop.name;
     info.compute_major = prop.major;
@@ -1322,7 +1466,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             check_cuda(cudaMemsetAsync(a2 + n * mix_width * elem_bytes, 0, (padded - n) * mix_width * elem_bytes, stream), "cudaMemsetAsync");
             check_cuda(cudaMemsetAsync(a3 + n * I * elem_bytes, 0, (padded - n) * I * elem_bytes, stream), "cudaMemsetAsync");
         }
-        launch_embed(d_tokens, n, weights.embedding, elem, dim(config.vocab_size), H, x, H, stream);
+        launch_embed(d_tokens, n, weights.embedding, embed_elem, dim(config.vocab_size), H, x, H, stream);
         launch_rms_norm(x, H, weights.layers[0].input_norm, n, H, eps, a1, elem, H, stream);
     }
 
@@ -1370,7 +1514,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 2, a1, H, n);
-                gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded, false, fa.mixer_in, qp(w.q_mixer_in), 2 * attn_width); // keys and values of every token
+                if (simt) mm(a1, H, w.s_mixer_in, 2 * attn_width, 2 * attn_kv_width, H, p, p_width, n, SimtEpilogue::Store);
+                else gemm(a1, H, w_kv, 2 * attn_kv_width, H, p, p_width, padded, false, fa.mixer_in, qp(w.q_mixer_in), 2 * attn_width); // keys and values of every token
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -1389,7 +1534,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
-                gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u, false, fa.mixer_in, qp(w.q_mixer_in)); // queries and gates of the read-out tokens
+                if (simt) mm(a1c, H, w.s_mixer_in, 0, 2 * attn_width, H, p, p_width, ru, SimtEpilogue::Store);
+                else gemm(a1c, H, w.mixer_in, 2 * attn_width, H, p, p_width, padded_u, false, fa.mixer_in, qp(w.q_mixer_in)); // queries and gates of the read-out tokens
             }
             {
                 Phase phase(*this, &PhaseTimes::attention_ms);
@@ -1402,8 +1548,9 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, ru);
-                m_half = cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, m_half, fa.mixer_out, qp(w.q_mixer_out));
+                m_half = !simt && cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                if (simt) mm(a2, mix_width, w.s_mixer_out, 0, H, attn_width, m, H, ru, SimtEpilogue::Store);
+                else gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded_u, m_half, fa.mixer_out, qp(w.q_mixer_out));
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1413,17 +1560,19 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 0, a1c, H, ru);
-                gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up, fa.gate_up, qp(w.q_gate_up));
+                if (simt) mm(a1c, H, w.s_gate_up, 0, 2 * I, H, a3, I, ru, SimtEpilogue::SwiGLU); // SwiGLU fused
+                else gemm(a1c, H, w.gate_up, 2 * I, H, p, 2 * I, padded_u, half_gate_up, fa.gate_up, qp(w.q_gate_up));
             }
-            {
+            if (!simt) {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
                 swiglu(ru);
             }
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 1, a3, I, ru);
-                m_half = cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
-                gemm(a3, I, w.down, H, I, m, H, padded_u, m_half, fa.down, qp(w.q_down));
+                m_half = !simt && cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
+                if (simt) mm(a3, I, w.s_down, 0, H, I, m, H, ru, SimtEpilogue::Store);
+                else gemm(a3, I, w.down, H, I, m, H, padded_u, m_half, fa.down, qp(w.q_down));
             }
             {
                 Phase phase(*this, &PhaseTimes::elementwise_ms);
@@ -1436,7 +1585,15 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 2, a1, H, n);
-                if (w.q_mixer_in.w != nullptr) {
+                if (simt) {
+                    if (w.s_dn_ba.w != nullptr) {
+                        // int8 groups: [mixed, z]; the b and a rows stay bfloat16
+                        mm(a1, H, w.s_mixer_in, 0, conv_dim + value_dim, H, p, p_width, n, SimtEpilogue::Store);
+                        mm(a1, H, w.s_dn_ba, 0, 2 * dim(config.dn_value_heads), H, p + conv_dim + value_dim, p_width, n, SimtEpilogue::Store);
+                    } else {
+                        mm(a1, H, w.s_mixer_in, 0, dn_in_width, H, p, p_width, n, SimtEpilogue::Store);
+                    }
+                } else if (w.q_mixer_in.w != nullptr) {
                     // int8: [mixed, z]; the b and a rows stay binary16 (own kernel, float32 accumulators)
                     gemm(a1, H, nullptr, conv_dim + value_dim, H, p, p_width, padded, false, false, &w.q_mixer_in);
                     launch_gemm_nt(a1, H, w.dn_ba, H, p + conv_dim + value_dim, p_width, false, padded, 2 * dim(config.dn_value_heads), H, GemmAccumulate::Float32, 0, -1,
@@ -1474,14 +1631,20 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, n);
-                m_half = cublas16_route(H, value_dim, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
-                gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
+                if (simt) {
+                    mm(a2, mix_width, w.s_mixer_out, 0, H, value_dim, x, H, n, SimtEpilogue::Add); // x += out_proj(a2)
+                } else {
+                    m_half = cublas16_route(H, value_dim, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                    gemm(a2, mix_width, w.mixer_out, H, value_dim, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
+                }
             }
         } else {
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 2, a1, H, n);
-                if (options.gemm_rows != 0 && !invariant_all && l + 1 == layers) {
+                if (simt) {
+                    mm(a1, H, w.s_mixer_in, 0, attn_in_width, H, p, p_width, n, SimtEpilogue::Store);
+                } else if (options.gemm_rows != 0 && !invariant_all && l + 1 == layers) {
                     // Strict mode, last layer, which a pruned call computes as two multiplies (keys and values of every token; queries
                     // and gates of the read-out tokens): an unpruned call must run the very same multiplies, or the keys and values it
                     // leaves in a snapshot could differ in bits from the pruned call's. (With float32 accumulation cuBLAS happens to give
@@ -1509,32 +1672,45 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             {
                 Phase phase(*this, &PhaseTimes::multiplies_ms);
                 observe(l, 3, a2, mix_width, n);
-                m_half = cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
-                gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
+                if (simt) {
+                    mm(a2, mix_width, w.s_mixer_out, 0, H, attn_width, x, H, n, SimtEpilogue::Add); // x += o_proj(a2)
+                } else {
+                    m_half = cublas16_route(H, attn_width, mix_width, H, fa.mixer_out, qp(w.q_mixer_out));
+                    gemm(a2, mix_width, w.mixer_out, H, attn_width, m, H, padded, m_half, fa.mixer_out, qp(w.q_mixer_out));
+                }
             }
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
-            add_norm(x, n, w.post_norm, a1);
+            // The SIMT path added the mixer's output into x in its multiply (the same float32 additions as launch_add_rms_norm).
+            if (simt) launch_rms_norm(x, H, w.post_norm, n, H, eps, a1, elem, H, stream);
+            else add_norm(x, n, w.post_norm, a1);
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
             observe(l, 0, a1, H, n);
-            gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up, fa.gate_up, qp(w.q_gate_up));
+            if (simt) mm(a1, H, w.s_gate_up, 0, 2 * I, H, a3, I, n, SimtEpilogue::SwiGLU); // gate, up and SwiGLU in one kernel
+            else gemm(a1, H, w.gate_up, 2 * I, H, p, 2 * I, padded, half_gate_up, fa.gate_up, qp(w.q_gate_up));
         }
-        {
+        if (!simt) {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
             swiglu(n);
         }
         {
             Phase phase(*this, &PhaseTimes::multiplies_ms);
             observe(l, 1, a3, I, n);
-            m_half = cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
-            gemm(a3, I, w.down, H, I, m, H, padded, m_half, fa.down, qp(w.q_down));
+            if (simt) {
+                mm(a3, I, w.s_down, 0, H, I, x, H, n, SimtEpilogue::Add); // x += down(a3)
+            } else {
+                m_half = cublas16_route(H, I, I, H, fa.down, qp(w.q_down));
+                gemm(a3, I, w.down, H, I, m, H, padded, m_half, fa.down, qp(w.q_down));
+            }
         }
         {
             Phase phase(*this, &PhaseTimes::elementwise_ms);
-            if (l + 1 < layers) {
+            if (simt) {
+                if (l + 1 < layers) launch_rms_norm(x, H, weights.layers[l + 1].input_norm, n, H, eps, a1, elem, H, stream);
+            } else if (l + 1 < layers) {
                 add_norm(x, n, weights.layers[l + 1].input_norm, a1);
             } else {
                 add_only(x, n);
@@ -1719,6 +1895,7 @@ SnapshotIdentity CudaEngine::Impl::identity() {
                                             q8.int8_activations ? 1u : 0u};
     // Smoothing changes the numbers: the factors themselves are in the weight memory (weight fingerprint); this says how they are applied.
     if (smoothing) compute.insert(compute.end(), {1u, static_cast<std::uint64_t>(q8.smoothing.statistic), bits_of(static_cast<double>(q8.smoothing.alpha))});
+    if (simt) compute.insert(compute.end(), {0x51D7u, static_cast<std::uint64_t>(options.weight_storage)});
     id.compute_fp = fingerprint_of(compute, 0xC0FFEEull);
     id.precision = half ? 0u : 1u;
     id.state_format = options.half_state ? 1u : 0u;

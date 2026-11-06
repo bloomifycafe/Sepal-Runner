@@ -55,14 +55,22 @@ constexpr int kGroupM = 4;  // blocks run in groups of this many row tiles, so t
 constexpr int kPitch = kBK; // halves per shared-memory row: 64 bytes, four 16-byte chunks, stored XOR-swizzled (see swz)
 
 __device__ inline void mma_f16(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if SEPAL_TENSOR_CORES
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
                  : "+r"(c0), "+r"(c1)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 __device__ inline void mma_f32(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if SEPAL_TENSOR_CORES
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 __device__ inline void flush_pair(unsigned& h, float& lo, float& hi) {

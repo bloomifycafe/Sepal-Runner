@@ -12,6 +12,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include "device.hpp"
+
+// An image without tensor cores (sm_61, sm_75) keeps only traps of the kernels below; their constants are then unused.
+#if !SEPAL_TENSOR_CORES
+#pragma nv_diag_suppress 177
+#endif
 
 namespace sepal::cuda {
 namespace chunked {
@@ -113,6 +119,7 @@ constexpr int kPrepSmem = 16384 + 17408 + 17408 + 17408 + 9216 + 1536;
 
 template <class InT, bool HS>
 __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) {
+#if SEPAL_TENSOR_CORES
     extern __shared__ __align__(128) unsigned char smem_raw[];
     constexpr std::integral_constant<bool, HS> kHalfState{};
     float* F = reinterpret_cast<float*>(smem_raw);                        // [64][64]: T
@@ -383,6 +390,9 @@ __global__ void __launch_bounds__(kPrepThreads) prepare_kernel(const Args args) 
     });
     __syncthreads();
     product_to_global(U_t);
+#else
+    __trap();
+#endif
 }
 
 // ---- kernel 2: the state loop ----
@@ -396,11 +406,27 @@ constexpr int kOld = 36; // of the float32 staging [64][32]
 constexpr int kStateSmem = 100352;
 
 __device__ __forceinline__ void cp_async16(void* shared_dst, const void* global_src) {
+#if SEPAL_TENSOR_CORES
     const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(shared_dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(global_src));
+#else
+    __trap();
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_commit() {
+#if SEPAL_TENSOR_CORES
+    asm volatile("cp.async.commit_group;\n" ::);
+#else
+    __trap();
+#endif
+}
+__device__ __forceinline__ void cp_async_wait_all() {
+#if SEPAL_TENSOR_CORES
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#else
+    __trap();
+#endif
+}
 
 // A [64][128] tile of the workspace into a padded shared buffer, by the 128 threads of the block.
 __device__ __forceinline__ void fetch_big(__half* shared, const __half* global, std::uint32_t tid) {
@@ -414,6 +440,7 @@ __device__ __forceinline__ void fetch_mask(__half* shared, const __half* global,
 
 template <bool HS>
 __global__ void __launch_bounds__(128) state_kernel(const Args args) {
+#if SEPAL_TENSOR_CORES
     extern __shared__ __align__(128) unsigned char smem_raw[];
     constexpr std::integral_constant<bool, HS> kHalfState{};
     float* Sf = reinterpret_cast<float*>(smem_raw);                 // [128][32]
@@ -576,6 +603,9 @@ __global__ void __launch_bounds__(128) state_kernel(const Args args) {
                         args.saturations, kHalfState);
         }
     }
+#else
+    __trap();
+#endif
 }
 
 // ---- kernel 3: gated RMSNorm ----

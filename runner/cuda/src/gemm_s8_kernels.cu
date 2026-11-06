@@ -153,9 +153,13 @@ __global__ void channel_stats_kernel(const __half* __restrict__ x, std::size_t l
 constexpr int kBK8 = 64;
 
 __device__ inline void mma_s8(int* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if SEPAL_TENSOR_CORES
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 template <int BM, int BN, int WM, int WN, int STAGES, bool OUT_HALF, int MINB>
@@ -288,9 +292,13 @@ __device__ inline void widen_s8x4(unsigned v, unsigned& lo, unsigned& hi) {
 }
 
 __device__ inline void mma_f32_k16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if SEPAL_TENSOR_CORES
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 template <int BM, int BN, int WM, int WN, int STAGES, bool OUT_HALF, int MINB>

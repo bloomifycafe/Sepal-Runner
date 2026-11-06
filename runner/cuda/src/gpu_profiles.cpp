@@ -1,4 +1,5 @@
-// The CUDA library's profiles (sepal_runner_cuda): gpu-f16 and gpu-f32 on GpuDecisionEngine.
+// The CUDA library's profiles (sepal_runner_cuda) on GpuDecisionEngine: gpu-f16, gpu-q8w, gpu-f32, their strict forms, and the
+// float32 SIMT profiles gpu-bf16 and gpu-w8g (Pascal and later).
 #include "sepal/cuda/gpu_decision_engine.hpp"
 #include "sepal/engine.hpp"
 
@@ -42,6 +43,8 @@ void register_backend_profiles() {
     register_profile({"gpu-f16-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16-strict"); }});
     register_profile({"gpu-f32-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32-strict"); }});
     register_profile({"gpu-f32", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32"); }});
+    register_profile({"gpu-bf16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-bf16"); }});
+    register_profile({"gpu-w8g", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-w8g"); }});
 }
 
 } // namespace sepal
