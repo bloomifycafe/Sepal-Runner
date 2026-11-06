@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string>
 
 #include "sepal/cpu/aligned.hpp"
 #include "sepal/cpu/isa.hpp"
@@ -62,6 +63,18 @@ struct AttentionSegment {
     const float* gate = nullptr;
     float* out = nullptr;
 };
+
+/// The attention kernel. Tiled: the 0.4 kernel. Flash: the same online softmax with every buffer in the micro-kernel tile
+/// layout (no copies between the products), O accumulated inside the micro kernel, panel-outer loops and the last key tile
+/// cut to the visible keys; not bit-identical to Tiled, held to the cpu-bf16 parity gates (RUNNER.md 14).
+/// Default resolves to SEPAL_ATTENTION (tiled|flash) or the built-in choice.
+enum class AttentionKernel { Default, Tiled, Flash };
+const char* name_of(AttentionKernel k);
+AttentionKernel parse_attention_kernel(const std::string& name); // throws std::invalid_argument
+/// Process-wide override (bench and tests); Default restores the environment / built-in choice.
+void set_attention_kernel(AttentionKernel k);
+/// The kernel attention_forward uses now (never Default).
+AttentionKernel attention_kernel();
 
 void attention_forward(const AttentionGeometry& geometry, Isa isa, std::span<const AttentionSegment> segments, std::size_t ld_q,
                        std::size_t ld_gate, std::size_t gate_head_stride, std::size_t ld_out, ThreadPool& pool);

@@ -85,6 +85,9 @@ if(NOT MSVC)
   target_compile_options(sepal-cpu-gemm-bench PRIVATE -mavx2 -mfma)
 endif()
 
+add_executable(sepal-cpu-attn-bench tools/sepal_cpu_attn_bench.cpp)
+target_link_libraries(sepal-cpu-attn-bench PRIVATE sepal_cpu sepal_build_flags)
+
 add_executable(sepal-cpu-bench tools/sepal_cpu_bench.cpp)
 target_link_libraries(sepal-cpu-bench PRIVATE sepal_cpu sepal_build_flags)
 if(WIN32)
