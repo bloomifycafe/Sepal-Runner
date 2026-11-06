@@ -411,6 +411,10 @@ std::vector<ShapeSpec> shapes_for(const std::string& model) {
         return {{"mlp_gate_up", 7168, 1024, 24}, {"mlp_down", 1024, 3584, 24},     {"deltanet_in", 8224, 1024, 18},
                 {"deltanet_out", 1024, 2048, 18}, {"attn_in", 5120, 1024, 6},       {"attn_out", 1024, 2048, 6}, {"attn_kv", 1024, 1024, 1}, {"attn_qg", 4096, 1024, 1}};
     }
+    if (model == "4b") { // Qwen3.5-4B: hidden 2560, intermediate 9216, DeltaNet 16 key / 32 value heads x 128, attention 16q/4kv x 256
+        return {{"mlp_gate_up", 18432, 2560, 32}, {"mlp_down", 2560, 9216, 32}, {"deltanet_in", 12352, 2560, 24},
+                {"deltanet_out", 2560, 4096, 24},  {"attn_in", 10240, 2560, 8},  {"attn_out", 2560, 4096, 8}};
+    }
     return {{"mlp_gate_up", 12288, 2048, 24}, {"mlp_down", 2048, 6144, 24},     {"deltanet_in", 8224, 2048, 18},
             {"deltanet_out", 2048, 2048, 18}, {"attn_in", 5120, 2048, 6},        {"attn_out", 2048, 2048, 6}, {"attn_kv", 1024, 2048, 1}, {"attn_qg", 4096, 2048, 1}};
 }

@@ -107,7 +107,19 @@ int main(int argc, char** argv) {
         else if (a == "--skip-without-env") skip_without_env = v == "on";
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
     }
-    const auto from_env = [](const char* name) { const char* v = std::getenv(name); return v != nullptr ? std::string(v) : std::string(); };
+    const auto from_env = [](const char* name) {
+#ifdef _MSC_VER // std::getenv is deprecated under /W4 /WX
+        char* v = nullptr;
+        std::size_t n = 0;
+        if (_dupenv_s(&v, &n, name) != 0 || v == nullptr) return std::string();
+        std::string s(v);
+        std::free(v);
+        return s;
+#else
+        const char* v = std::getenv(name);
+        return v != nullptr ? std::string(v) : std::string();
+#endif
+    };
     if (final_dir.empty()) final_dir = from_env("SEPAL_TRAINED_FINAL");
     if (base_dir.empty()) base_dir = from_env("SEPAL_TRAINED_BASE");
     if (golden_dir.empty()) golden_dir = from_env("SEPAL_GOLDEN_DIR");

@@ -5,8 +5,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 // The kernels have external linkage on purpose (see convert_kernels.cu).
 
@@ -363,12 +366,12 @@ __host__ __device__ constexpr std::size_t tiled_smem_bytes() {
 
 // Loads key tile `tile` (or its values) of the chain into a 32-row shared buffer; positions past the end
 // of the chain become zeros, so that a probability of zero never meets a stale value.
-template <int HD>
+template <int HD, unsigned THREADS = kTiledThreads>
 __device__ inline void load_kv_tile(__half* buffer, const KvSegment* segments, const AttentionRowDesc& desc,
                                     std::uint32_t total, std::uint32_t tile, std::uint32_t kv_head,
                                     std::uint32_t kv_width, bool values) {
     constexpr int CPR = HD / 8;
-    for (unsigned c = threadIdx.x; c < kTileKeys * CPR; c += kTiledThreads) {
+    for (unsigned c = threadIdx.x; c < kTileKeys * CPR; c += THREADS) {
         const unsigned r = c / CPR;
         const unsigned ch = c % CPR;
         const std::uint32_t j = tile * kTileKeys + r;
@@ -569,6 +572,270 @@ __global__ void __launch_bounds__(kTiledThreads, 2) attention_tiled_kernel(const
     }
 }
 
+// ---- the second tiled kernel (F16 keys and values, head_dim 64/128/256) ----
+// The same arithmetic contract as attention_tiled_kernel (key tiles of 32 counted from the chain's first token, an
+// online softmax in float32 registers in the base-2 domain, P rounded to binary16, tiles a row cannot see contribute
+// exactly zero, so a token's bits depend on its own chain only), with three changes made for speed:
+//   * 8 warps and 128 query rows per block: every key and value tile fetched from L2 serves twice the rows, which halves
+//     the L2-to-SM traffic that bounds the first kernel at long contexts;
+//   * separate key and value buffers: the values of a tile load while its scores are computed and the next tile's keys
+//     load while the values are multiplied, instead of one buffer used in turn;
+//   * optionally (PV16) P V on binary16 accumulators: each tile's 32-key product is formed in binary16 (two roundings,
+//     P <= 1) and added to the float32 output accumulators as they are rescaled. GeForce Ampere runs binary16-accumulate
+//     mma.sync at twice its float32-accumulate rate. The scores Q K^T always accumulate in float32.
+// The order of the additions inside a tile differs from the first kernel's, so the bits differ from it in the last places.
+constexpr unsigned kV2Threads = 256;
+constexpr unsigned kV2Rows = 128;
+
+template <int HD>
+__host__ __device__ constexpr std::size_t v2_smem_bytes() {
+    return (static_cast<std::size_t>(kV2Rows) + 2 * kTileKeys) * HD * sizeof(__half);
+}
+
+__device__ inline void mma_16816_f16(std::uint32_t (&c)[2], const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+template <int HD, class TOut, bool PV16, bool QK16 = false>
+__global__ void __launch_bounds__(kV2Threads, 1) attention_v2_kernel(const TiledParams p) {
+    static_assert(HD >= 64, "the second tiled kernel takes head_dim 64, 128 or 256");
+    constexpr int CPR = HD / 8;
+    constexpr int NT = HD / 8;
+    extern __shared__ __align__(16) unsigned char v2_smem[];
+    __half* const Qs = reinterpret_cast<__half*>(v2_smem);
+    __half* const Ks = Qs + kV2Rows * HD;
+    __half* const Vs = Ks + kTileKeys * HD;
+
+    const std::uint32_t row = run_row(p.rows, blockIdx.z);
+    const RowSpan span = p.rows.spans[row];
+    const std::uint32_t len = span.length;
+    const std::uint32_t lg = p.group_log2;
+    const std::uint32_t group = 1u << lg;
+    const std::uint32_t tokens_per_tile = kV2Rows >> lg;
+    const std::uint32_t tiles = (len + tokens_per_tile - 1) / tokens_per_tile;
+    if (blockIdx.x >= tiles) return;
+    const std::uint32_t tile = tiles - 1 - blockIdx.x; // the heaviest query tile of a row first
+    const std::uint32_t kv_head = blockIdx.y;
+    const AttentionRowDesc desc = p.rows.descs[row];
+    const std::uint32_t kv_width = p.kv_heads * HD;
+    const std::uint32_t context = context_tokens(p.rows.segments, desc);
+    const std::uint32_t total = context + len;
+    const std::uint32_t t0 = tile * tokens_per_tile;
+    const std::uint32_t last_visible = context + min(len, t0 + tokens_per_tile);
+    const std::uint32_t key_tiles = (last_visible + kTileKeys - 1) / kTileKeys;
+
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid / 32;
+    const unsigned lane = tid % 32;
+    const unsigned g = lane >> 2;
+    const unsigned qd = lane & 3;
+
+    for (unsigned c = tid; c < kV2Rows * CPR; c += kV2Threads) {
+        const unsigned r = c / CPR;
+        const unsigned ch = c % CPR;
+        const std::uint32_t tl = t0 + (r >> lg);
+        __half* dst = Qs + tile_offset<HD>(r, ch);
+        if (tl < len) {
+            const std::size_t head = static_cast<std::size_t>(kv_head) * group + (r & (group - 1));
+            cp_async16(dst, p.q + (static_cast<std::size_t>(span.offset) + tl) * p.q_stride + head * HD + ch * 8);
+        } else {
+            zero16(dst);
+        }
+    }
+    load_kv_tile<HD, kV2Threads>(Ks, p.rows.segments, desc, total, 0, kv_head, kv_width, false);
+    cp_async_commit(); // the queries and the first keys
+    load_kv_tile<HD, kV2Threads>(Vs, p.rows.segments, desc, total, 0, kv_head, kv_width, true);
+    cp_async_commit(); // the first values
+
+    const unsigned row_a = warp * 16 + g;
+    const unsigned row_b = row_a + 8;
+    const std::uint32_t token_a = min(t0 + (row_a >> lg), len - 1);
+    const std::uint32_t token_b = min(t0 + (row_b >> lg), len - 1);
+    const std::uint32_t visible_a = context + token_a + 1;
+    const std::uint32_t visible_b = context + token_b + 1;
+
+    float o[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float max_a = neg_inf(), max_b = neg_inf();
+    float sum_a = 0.0f, sum_b = 0.0f; // this lane's share of the row sums
+
+    for (std::uint32_t kt = 0; kt < key_tiles; ++kt) {
+        // In flight: the keys of tile kt, then its values (one commit group each, in that order). Wait for the keys only.
+        cp_async_wait<1>();
+        __syncthreads();
+
+        float s[4][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
+#pragma unroll
+        for (int kg = 0; kg < HD / 64; ++kg) {
+            // QK16: binary16 accumulators over 64 dimensions at a time, then added into the float32 scores.
+            std::uint32_t h[4][2] = {{0u, 0u}, {0u, 0u}, {0u, 0u}, {0u, 0u}};
+#pragma unroll
+            for (int ki = 0; ki < 4; ++ki) {
+                const int ks = kg * 4 + ki;
+                std::uint32_t a[4];
+                ldmatrix_x4(a, Qs + tile_offset<HD>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 2 + (lane >> 4)));
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {
+                    std::uint32_t b[4];
+                    ldmatrix_x4(b, Ks + tile_offset<HD>(np * 16 + (lane >> 4) * 8 + (lane & 7), ks * 2 + ((lane >> 3) & 1)));
+                    if constexpr (QK16) {
+                        mma_16816_f16(h[2 * np], a, b[0], b[1]);
+                        mma_16816_f16(h[2 * np + 1], a, b[2], b[3]);
+                    } else {
+                        mma_16816(s[2 * np], a, b[0], b[1]);
+                        mma_16816(s[2 * np + 1], a, b[2], b[3]);
+                    }
+                }
+            }
+            if constexpr (QK16) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&h[i][0]));
+                    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&h[i][1]));
+                    s[i][0] += lo.x;
+                    s[i][1] += lo.y;
+                    s[i][2] += hi.x;
+                    s[i][3] += hi.y;
+                }
+            }
+        }
+
+        __syncthreads(); // every warp has read the keys: the buffer takes the next tile's keys
+        if (kt + 1 < key_tiles) load_kv_tile<HD, kV2Threads>(Ks, p.rows.segments, desc, total, kt + 1, kv_head, kv_width, false);
+        cp_async_commit(); // committed even when empty, so that the group count stays fixed
+
+        float x[4][4];
+        float tile_max_a = neg_inf(), tile_max_b = neg_inf();
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const std::uint32_t j = kt * kTileKeys + nt * 8 + qd * 2 + (e & 1);
+                const std::uint32_t visible = (e >> 1) ? visible_b : visible_a;
+                x[nt][e] = j < visible ? s[nt][e] * p.scale_log2 : neg_inf();
+            }
+            tile_max_a = fmaxf(tile_max_a, fmaxf(x[nt][0], x[nt][1]));
+            tile_max_b = fmaxf(tile_max_b, fmaxf(x[nt][2], x[nt][3]));
+        }
+        tile_max_a = fmaxf(tile_max_a, __shfl_xor_sync(0xFFFFFFFFu, tile_max_a, 1));
+        tile_max_a = fmaxf(tile_max_a, __shfl_xor_sync(0xFFFFFFFFu, tile_max_a, 2));
+        tile_max_b = fmaxf(tile_max_b, __shfl_xor_sync(0xFFFFFFFFu, tile_max_b, 1));
+        tile_max_b = fmaxf(tile_max_b, __shfl_xor_sync(0xFFFFFFFFu, tile_max_b, 2));
+        const float new_max_a = fmaxf(max_a, tile_max_a);
+        const float new_max_b = fmaxf(max_b, tile_max_b);
+        const float alpha_a = exp2f(max_a - new_max_a); // 0 on the first tile, 1 when the maximum did not move
+        const float alpha_b = exp2f(max_b - new_max_b);
+        max_a = new_max_a;
+        max_b = new_max_b;
+
+        float tile_sum_a = 0.0f, tile_sum_b = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            x[nt][0] = exp2f(x[nt][0] - new_max_a);
+            x[nt][1] = exp2f(x[nt][1] - new_max_a);
+            x[nt][2] = exp2f(x[nt][2] - new_max_b);
+            x[nt][3] = exp2f(x[nt][3] - new_max_b);
+            tile_sum_a += x[nt][0] + x[nt][1];
+            tile_sum_b += x[nt][2] + x[nt][3];
+        }
+        sum_a = sum_a * alpha_a + tile_sum_a;
+        sum_b = sum_b * alpha_b + tile_sum_b;
+
+        // The 16 x 32 probabilities of this warp as A operands, straight from the score accumulators.
+        std::uint32_t pa[2][4];
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            pa[kk][0] = pack_half2(x[2 * kk][0], x[2 * kk][1]);
+            pa[kk][1] = pack_half2(x[2 * kk][2], x[2 * kk][3]);
+            pa[kk][2] = pack_half2(x[2 * kk + 1][0], x[2 * kk + 1][1]);
+            pa[kk][3] = pack_half2(x[2 * kk + 1][2], x[2 * kk + 1][3]);
+        }
+
+        cp_async_wait<1>(); // this tile's values (the next tile's keys may still be in flight)
+        __syncthreads();
+
+        if constexpr (PV16) {
+#pragma unroll
+            for (int dp = 0; dp < HD / 16; ++dp) {
+                std::uint32_t c0[2] = {0u, 0u}, c1[2] = {0u, 0u};
+#pragma unroll
+                for (int kk = 0; kk < 2; ++kk) {
+                    std::uint32_t b[4];
+                    ldmatrix_x4_trans(b, Vs + tile_offset<HD>(kk * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), dp * 2 + (lane >> 4)));
+                    mma_16816_f16(c0, pa[kk], b[0], b[1]);
+                    mma_16816_f16(c1, pa[kk], b[2], b[3]);
+                }
+                const float2 c0a = __half22float2(*reinterpret_cast<const __half2*>(&c0[0]));
+                const float2 c0b = __half22float2(*reinterpret_cast<const __half2*>(&c0[1]));
+                const float2 c1a = __half22float2(*reinterpret_cast<const __half2*>(&c1[0]));
+                const float2 c1b = __half22float2(*reinterpret_cast<const __half2*>(&c1[1]));
+                o[2 * dp][0] = fmaf(o[2 * dp][0], alpha_a, c0a.x);
+                o[2 * dp][1] = fmaf(o[2 * dp][1], alpha_a, c0a.y);
+                o[2 * dp][2] = fmaf(o[2 * dp][2], alpha_b, c0b.x);
+                o[2 * dp][3] = fmaf(o[2 * dp][3], alpha_b, c0b.y);
+                o[2 * dp + 1][0] = fmaf(o[2 * dp + 1][0], alpha_a, c1a.x);
+                o[2 * dp + 1][1] = fmaf(o[2 * dp + 1][1], alpha_a, c1a.y);
+                o[2 * dp + 1][2] = fmaf(o[2 * dp + 1][2], alpha_b, c1b.x);
+                o[2 * dp + 1][3] = fmaf(o[2 * dp + 1][3], alpha_b, c1b.y);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                o[i][0] *= alpha_a;
+                o[i][1] *= alpha_a;
+                o[i][2] *= alpha_b;
+                o[i][3] *= alpha_b;
+            }
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+#pragma unroll
+                for (int dp = 0; dp < HD / 16; ++dp) {
+                    std::uint32_t b[4];
+                    ldmatrix_x4_trans(b, Vs + tile_offset<HD>(kk * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), dp * 2 + (lane >> 4)));
+                    mma_16816(o[2 * dp], pa[kk], b[0], b[1]);
+                    mma_16816(o[2 * dp + 1], pa[kk], b[2], b[3]);
+                }
+            }
+        }
+
+        __syncthreads(); // every warp has read the values: the buffer takes the next tile's values
+        if (kt + 1 < key_tiles) load_kv_tile<HD, kV2Threads>(Vs, p.rows.segments, desc, total, kt + 1, kv_head, kv_width, true);
+        cp_async_commit();
+    }
+    cp_async_wait<0>();
+
+    // The row sums: add the four lanes of a quad in a fixed order.
+    sum_a += __shfl_xor_sync(0xFFFFFFFFu, sum_a, 1);
+    sum_a += __shfl_xor_sync(0xFFFFFFFFu, sum_a, 2);
+    sum_b += __shfl_xor_sync(0xFFFFFFFFu, sum_b, 1);
+    sum_b += __shfl_xor_sync(0xFFFFFFFFu, sum_b, 2);
+
+#pragma unroll
+    for (int half_row = 0; half_row < 2; ++half_row) {
+        const unsigned r = half_row == 0 ? row_a : row_b;
+        const std::uint32_t tl = t0 + (r >> lg);
+        if (tl >= len) continue;
+        const float denominator = half_row == 0 ? sum_a : sum_b;
+        const std::size_t head = static_cast<std::size_t>(kv_head) * group + (r & (group - 1));
+        const std::size_t token = static_cast<std::size_t>(span.offset) + tl;
+        TOut* const out = static_cast<TOut*>(p.out) + token * p.out_stride + head * HD;
+        const float* const gate = p.gate.data + token * p.gate.stride + head * 2 * HD + HD;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int d = nt * 8 + static_cast<int>(qd) * 2 + e;
+                out[d] = from_float<TOut>(__fmul_rn(o[nt][half_row * 2 + e] / denominator, sigmoid_stable(gate[d])));
+            }
+        }
+    }
+}
+
 // ---- host side ----
 
 namespace {
@@ -608,6 +875,29 @@ void launch_tiled_instance(const TiledParams& params, unsigned max_tiles, const 
     attention_tiled_kernel<HD, TOut><<<grid, dim3(kTiledThreads), smem, stream>>>(params);
 }
 
+template <int HD, class TOut, bool PV16, bool QK16>
+void launch_v2_instance(const TiledParams& params, const AttentionRows& rows, const AttentionShape& shape, std::uint32_t lg,
+                        cudaStream_t stream) {
+    constexpr std::size_t smem = v2_smem_bytes<HD>();
+    static const cudaError_t configured = cudaFuncSetAttribute(
+        attention_v2_kernel<HD, TOut, PV16, QK16>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    check(configured, "cudaFuncSetAttribute");
+    const unsigned tokens_per_tile = kV2Rows >> lg;
+    const unsigned max_tiles = (rows.max_row_tokens + tokens_per_tile - 1) / tokens_per_tile;
+    const dim3 grid(max_tiles, shape.kv_heads, rows.run_count);
+    attention_v2_kernel<HD, TOut, PV16, QK16><<<grid, dim3(kV2Threads), smem, stream>>>(params);
+}
+
+template <class TOut, bool PV16, bool QK16 = false>
+void dispatch_v2(const TiledParams& params, const AttentionRows& rows, const AttentionShape& shape, std::uint32_t lg,
+                 cudaStream_t stream) {
+    switch (shape.head_dim) {
+    case 64: launch_v2_instance<64, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
+    case 128: launch_v2_instance<128, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
+    default: launch_v2_instance<256, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
+    }
+}
+
 template <class TOut>
 void dispatch_tiled(const TiledParams& params, unsigned max_tiles, const AttentionShape& shape,
                     std::uint32_t run_count, cudaStream_t stream) {
@@ -628,6 +918,30 @@ void launch_reference_instance(const ReferenceParams& params, const AttentionSha
 }
 
 } // namespace
+
+namespace {
+std::atomic<int> g_tiled_override{-1};
+} // namespace
+
+void set_tiled_kernel(TiledKernel kernel) { g_tiled_override.store(static_cast<int>(kernel)); }
+void reset_tiled_kernel() { g_tiled_override.store(-1); }
+
+TiledKernel tiled_kernel_choice() {
+    if (const int o = g_tiled_override.load(); o >= 0) return static_cast<TiledKernel>(o);
+    // SEPAL_ATTENTION_KERNEL=v1 | v2 | v2h | v2hh; read once per process. Unset: v2, which gives v1's bits faster. v2h and v2hh
+    // are faster still but miss the gpu-f16 parity gate on SEC-dev (max |dp| 0.057 and 0.064 against 0.03): opt-in.
+    static const TiledKernel choice = [] {
+        const char* v = std::getenv("SEPAL_ATTENTION_KERNEL");
+        if (v == nullptr || *v == '\0') return TiledKernel::Second; // v1's bits, faster (README.md, "Ampere")
+        const std::string s(v);
+        if (s == "v1") return TiledKernel::First;
+        if (s == "v2") return TiledKernel::Second;
+        if (s == "v2h") return TiledKernel::SecondPv16;
+        if (s == "v2hh") return TiledKernel::SecondFp16;
+        throw std::invalid_argument("SEPAL_ATTENTION_KERNEL must be v1, v2, v2h or v2hh, not " + s);
+    }();
+    return choice;
+}
 
 bool attention_tiled_supported(const AttentionShape& shape, AttnElem kv_type) {
     std::uint32_t lg = 0;
@@ -701,6 +1015,22 @@ AttentionPath launch_attention(const AttentionShape& shape, const AttentionRows&
         p.gate = gate;
         p.out = out.data;
         p.out_stride = out.stride;
+        const TiledKernel kernel = tiled_kernel_choice();
+        if (kernel != TiledKernel::First && shape.head_dim >= 64) {
+            const bool pv16 = kernel == TiledKernel::SecondPv16;
+            if (kernel == TiledKernel::SecondFp16) {
+                if (out_type == AttnElem::F16) dispatch_v2<__half, true, true>(p, rows, shape, lg, stream);
+                else dispatch_v2<float, true, true>(p, rows, shape, lg, stream);
+            } else if (out_type == AttnElem::F16) {
+                if (pv16) dispatch_v2<__half, true>(p, rows, shape, lg, stream);
+                else dispatch_v2<__half, false>(p, rows, shape, lg, stream);
+            } else {
+                if (pv16) dispatch_v2<float, true>(p, rows, shape, lg, stream);
+                else dispatch_v2<float, false>(p, rows, shape, lg, stream);
+            }
+            check(cudaGetLastError(), "attention_v2_kernel launch");
+            return used;
+        }
         const unsigned tokens_per_tile = kTileRows >> lg;
         const unsigned max_tiles = (rows.max_row_tokens + tokens_per_tile - 1) / tokens_per_tile;
         if (out_type == AttnElem::F16) {

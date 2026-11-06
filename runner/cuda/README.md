@@ -253,6 +253,7 @@ candidate, unmeasured) or less work per alert (last-layer pruning, the prefix ca
 | `include/sepal/cuda/cuda_gemm.hpp`, `src/cuda_gemm.cpp` | The provider |
 | `src/convert_kernels.hpp`, `src/convert_kernels.cu` | The element-type conversion kernels |
 | `src/gemm_kernels.hpp`, `src/gemm_kernels.cu` | The batch-invariant tensor-core multiply (binary16 or float32 accumulators) and the 2-D widening used by binary16-accumulating cuBLAS multiplies |
+| `src/lt_table_sm86.inc` | The cuBLASLt candidate per (4B multiply shape, row bucket) used with `SEPAL_GEMM_LT=1` (see "Ampere" at the end) |
 | `tests/test_cuda_gemm.cpp` | Suites `contract`, `parity_small`, `parity_real`, `rows` |
 | `tests/test_gemm_kernels.cpp` | Suites `gemmk_convert`, `gemmk_accuracy`, `gemmk_invariance`, `gemmk_edge` (CTest `cuda_gemmk_*`) |
 | `src/gemm_s8_kernels.hpp`, `src/gemm_s8_kernels.cu`, `src/gemm_ptx.cuh` | The int8 multiplies (int8 activations on `mma.m16n8k32`; binary16 activations with int8 weights), the row and weight quantisers, and the PTX helpers they share with `gemm_kernels.cu` |
@@ -1563,3 +1564,92 @@ multiplies 140 ms, attention 108 ms (about 65 TFLOP/s, about 90% of the card's f
 Saturated, the multiplies are more than half of the call and run near the fp16 tensor limit, so the saturated numbers are within about
 1.4x of what the card can do with these FLOPs; the levers are fewer FLOPs (prefix reuse: 3.4x on `shared_t4k_q8`) and, for one long
 request, the chunked DeltaNet.
+
+## Ampere (sm_86) speed work on Qwen3.5-4B (branch runner-gpu-ampere, 2026-11-07)
+
+Measured on a rented RTX 3060 12 GB (vast.ai, Linux, driver 595.99, the same CUDA 13.1 wheels built with the Linux branch of
+`CMakeLists.txt`, which needed no change) with the Sepal-4B final (`full15-4b/F15-s0`), and on the owner's RTX 3060 (Windows) for
+the SEC-dev parity and the tests. The box's 3060 is about 17% slower than the PC's at the same build (t1k 3,480 against 4,180
+tokens/s on `main`), so before/after pairs below are always from the same card, interleaved.
+
+### Where the time goes (`sepal-cuda-engine-bench --sections profile`, base 4B, f16, box, ms per call)
+
+| Call | multiplies | DeltaNet | attention | elementwise | host | wall |
+|---|---|---|---|---|---|---|
+| 1 row x 912 (t1k) | 205.8 (79%) | 34.8 (13%) | 6.2 (2%) | 10.7 (4%) | 2.5 (1%) | 260.0 |
+| 1 row x 2048 | 421.5 (77%) | 75.7 (14%) | 21.3 (4%) | 23.2 (4%) | 2.6 | 544.2 |
+| 1 row x 2048 after 14,336 tokens (the 8th call of a 16k log) | 380.0 (46%) | 68.8 (8%) | 351.7 (43%) | 23.1 (3%) | 2.5 | 826.0 |
+
+The multiplies run cuBLAS `CUBLAS_COMPUTE_16F` (GeForce Ampere's full tensor rate) at 38 TFLOP/s for 912 tokens, about 75% of the
+card's binary16-accumulate peak; the chunked DeltaNet (prepare 0.59 ms, state 0.51 ms, norm 0.09 ms per layer at 912 tokens) is the
+next item; attention matters only at long contexts, where it is 43% of a call. Elementwise and launch overhead are 5%: CUDA Graphs
+or more fusion would win at most that. (`--sections profile` now also has the 912-token row and the long-chain call; a call that does
+not fit the card is skipped instead of ending the run. `--run-lengths a,b,...` runs one row per length first.)
+
+### What changed
+
+1. **A second tiled attention kernel (`attention_v2_kernel`, default).** 8 warps and 128 query rows per block (the first kernel: 4
+   warps, 64 rows), so every key/value tile fetched from L2 serves twice the rows, and separate key and value buffers (the values of a
+   tile load while its scores are computed, the next tile's keys while the values are multiplied). Same tiles (32 keys counted from the
+   chain's first token), same online softmax and the same order of additions: **the same bits as the first kernel** (test
+   `chains.second_tiled_kernel_gives_the_bits_of_the_first`, 0.8B and 4B geometry, rows with a 5-link chain; checked by breaking it:
+   with v2h it fails 8 of 8 rows; TOOL n=150 on the box gives the identical dp statistics to all printed digits). Long-context call:
+   attention 351.7 -> 323.6 ms (-8%). `SEPAL_ATTENTION_KERNEL=v1` keeps the first kernel.
+2. **Opt-in: binary16 accumulators in attention.** `SEPAL_ATTENTION_KERNEL=v2h` forms each tile's P V on binary16 accumulators (P <= 1,
+   two roundings per 32 keys) and adds it into the float32 output as it is rescaled; `v2hh` also accumulates Q K^T in binary16, added
+   into float32 every 64 dimensions. GeForce Ampere runs binary16-accumulate `mma.sync` at twice the float32-accumulate rate. Attention
+   at the long-context call: 351.7 (v1) -> 290.5 (v2h); attention bench 1 x 4096 (0.8B geometry) 3.21 (v1) -> 2.73 ms (v2hh).
+3. **Opt-in: cuBLASLt with a fixed algorithm table** (`SEPAL_GEMM_LT=1`). The binary16-accumulate multiplies go to cuBLASLt with the
+   heuristic candidate that a table (`src/lt_table_sm86.inc`, the 4B shapes x row buckets 16..2048) names; shapes not in the table keep
+   `cublasGemmEx`. The table was made on the box with `SEPAL_GEMM_LT_TUNE=1` (times every candidate per multiply and prints one line per
+   shape; the raw lines are in the reports folder). Choosing by timing at run time was tried first and dropped: a fresh process gave
+   other bytes (`attack_determinism` failed) and the natural-mode drift test went to 1.03e-2 (> 1e-2); with the table both pass.
+   Multiplies at 912 tokens 205.8 -> 191.2 ms (-7%), at 2048 tokens 421.5 -> 402.6 ms (-4.5%).
+4. Tooling: `sepal-cuda-gemm-probe shapes --model 4b`; `tools/gpu_parity.cpp` reads its environment with `_dupenv_s` under MSVC
+   (it did not build on `main` with `/W4 /WX`).
+
+### Why 2 and 3 are not the default: the gpu-f16 parity gate
+
+SEC-dev n=300 (PC RTX 3060, PyTorch reference rows; gate from docs/RUNNER.md section 14: max |dp| <= 0.03, p99 <= 0.01, flips <= 0.5%):
+
+| Configuration | max \|dp\| T1 | p99 T1 | flips | max \|dp\| cal | p99 cal |
+|---|---|---|---|---|---|
+| `main` (v1, GemmEx) = new default (v2, GemmEx; same bits) | 0.0293 | 0.0092 | 0 | 0.0230 | 0.0103 |
+| v2h (fp16 P V), GemmEx | **0.0569** | 0.0060 | 0 | 0.0391 | 0.0062 |
+| v1, cuBLASLt table | **0.0484** | **0.0145** | 0 | 0.0366 | 0.0128 |
+| v2h + cuBLASLt table | **0.0834** | 0.0092 | 0 | 0.0647 | 0.0094 |
+| v2hh + cuBLASLt table | **0.0641** | **0.0120** | 0 | 0.0490 | 0.0136 |
+
+`main` itself sits at 0.0293 against the 0.03 gate, on a handful of sigma-rule questions whose logits move by 0.1 to 0.3 for
+rounding-level changes; each opt-in change moves a different one of them over the gate, so none can be the default without either a
+more accurate formulation or a decision on the gate. The p99 of the Lt table (0.0145) also suggests its winning candidates accumulate
+binary16 over longer stretches than cuBLAS's default kernel; a table restricted to candidates with the default's accuracy was not tried.
+TOOL n=150 (box) passes for every variant (max |dp| 0.0099 main, 0.0113 v2h+Lt, 0.0119 Lt, 0.0174 v2hh+Lt; no flips).
+LONG-LOG could not be scored with gpu-f16 on a 12 GB card on `main` or on the branch (the key/value heap runs out:
+"needs 32 MiB, largest free block 27.8 MiB"), as in the earlier full15-4b run.
+
+### Speed (box RTX 3060, `bench.py` / `rescore.py` harness, gpu-f16, tokens/s)
+
+| Configuration | t1k_q1 | t16k_q32 | TOOL n=40 | VRAM peak (MiB) | runs |
+|---|---|---|---|---|---|
+| `main` | 3,482 | 2,829 | 3,131 | 11,089 / 11,491 / 11,492 | 4, interleaved |
+| **branch default** (attention v2, GemmEx; `main`'s bits) | 3,476 (-0.2%) | 2,887 (+2.1%) | 3,160 (+0.9%) | 11,090 / 11,490 / 11,492 | 2 |
+| `SEPAL_GEMM_LT=1` (v2 + Lt table) | 3,716 (+6.7%) | 3,182 (+12.5%) | 3,498 (+11.7%) | 11,092 / 11,487 / 11,492 | 1 |
+| `SEPAL_GEMM_LT=1 SEPAL_ATTENTION_KERNEL=v2h` | 3,747 (+7.6%) | 3,265 (+15.4%) | 3,556 (+13.6%) | 11,089 / 11,491 / 11,491 | 1 |
+| `SEPAL_GEMM_LT=1 SEPAL_ATTENTION_KERNEL=v2hh` | 3,729 (+7.1%) | 3,356 (+18.6%) | 3,614 (+15.4%) | 11,092 / 11,490 / 11,490 | 2 |
+
+Baseline flags of the full15-4b run (`max_call_tokens` 2048, `trunk_budget_mib` 9300 for t1k and 9700 with `prefix_cache` off for the
+others; t1k 20 timed requests, t16k 3, TOOL 40). The t1k/t16k workloads on the box are synthetic look-alikes of the encoded ones
+(same lengths, spans and template tokens, other tokens random): the SOCDecide-derived originals stay on the PC. Engine-bench phase
+times of the default and the fastest opt-in are in the reports folder (`F-default`, `F-v2hh-lt`); the 8th call of a 16k log goes
+826 -> 804 ms (default) and -> 679 ms (v2hh + Lt).
+
+### Tried and not kept
+
+- Timed cuBLASLt choice at run time (above): not deterministic across processes.
+- v2 without binary16 accumulators is slower than v1 on short causal rows with no context (attention bench 1 x 4096 without context:
+  3.72 against 3.21 ms; 16 x 640: 2.40 against 2.23) because 128-row tiles leave half the SMs' worth of blocks and waste more of the
+  causal triangle; it wins at long contexts (the case that matters for 16k logs), and it is the default because its bits are v1's.
+- Nsight Compute could not be used on the box (no access to the performance counters in the container); profiling is by phase timing.
+- Not attempted for lack of time: occupancy of the chunked DeltaNet state kernel (one 100 KB block per SM, 128 blocks for one row
+  run in 5 waves of a serial chain), CUDA Graphs for the layer sequence, int8 group weights (left for after the Pascal PR).
