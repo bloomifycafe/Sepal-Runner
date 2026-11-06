@@ -597,7 +597,7 @@ __device__ inline void mma_16816_f16(std::uint32_t (&c)[2], const std::uint32_t 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-template <int HD, class TOut, bool PV16>
+template <int HD, class TOut, bool PV16, bool QK16 = false>
 __global__ void __launch_bounds__(kV2Threads, 1) attention_v2_kernel(const TiledParams p) {
     static_assert(HD >= 64, "the second tiled kernel takes head_dim 64, 128 or 256");
     constexpr int CPR = HD / 8;
@@ -670,15 +670,37 @@ __global__ void __launch_bounds__(kV2Threads, 1) attention_v2_kernel(const Tiled
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
 #pragma unroll
-        for (int ks = 0; ks < HD / 16; ++ks) {
-            std::uint32_t a[4];
-            ldmatrix_x4(a, Qs + tile_offset<HD>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 2 + (lane >> 4)));
+        for (int kg = 0; kg < HD / 64; ++kg) {
+            // QK16: binary16 accumulators over 64 dimensions at a time, then added into the float32 scores.
+            std::uint32_t h[4][2] = {{0u, 0u}, {0u, 0u}, {0u, 0u}, {0u, 0u}};
 #pragma unroll
-            for (int np = 0; np < 2; ++np) {
-                std::uint32_t b[4];
-                ldmatrix_x4(b, Ks + tile_offset<HD>(np * 16 + (lane >> 4) * 8 + (lane & 7), ks * 2 + ((lane >> 3) & 1)));
-                mma_16816(s[2 * np], a, b[0], b[1]);
-                mma_16816(s[2 * np + 1], a, b[2], b[3]);
+            for (int ki = 0; ki < 4; ++ki) {
+                const int ks = kg * 4 + ki;
+                std::uint32_t a[4];
+                ldmatrix_x4(a, Qs + tile_offset<HD>(warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ks * 2 + (lane >> 4)));
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {
+                    std::uint32_t b[4];
+                    ldmatrix_x4(b, Ks + tile_offset<HD>(np * 16 + (lane >> 4) * 8 + (lane & 7), ks * 2 + ((lane >> 3) & 1)));
+                    if constexpr (QK16) {
+                        mma_16816_f16(h[2 * np], a, b[0], b[1]);
+                        mma_16816_f16(h[2 * np + 1], a, b[2], b[3]);
+                    } else {
+                        mma_16816(s[2 * np], a, b[0], b[1]);
+                        mma_16816(s[2 * np + 1], a, b[2], b[3]);
+                    }
+                }
+            }
+            if constexpr (QK16) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&h[i][0]));
+                    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&h[i][1]));
+                    s[i][0] += lo.x;
+                    s[i][1] += lo.y;
+                    s[i][2] += hi.x;
+                    s[i][3] += hi.y;
+                }
             }
         }
 
@@ -852,26 +874,26 @@ void launch_tiled_instance(const TiledParams& params, unsigned max_tiles, const 
     attention_tiled_kernel<HD, TOut><<<grid, dim3(kTiledThreads), smem, stream>>>(params);
 }
 
-template <int HD, class TOut, bool PV16>
+template <int HD, class TOut, bool PV16, bool QK16>
 void launch_v2_instance(const TiledParams& params, const AttentionRows& rows, const AttentionShape& shape, std::uint32_t lg,
                         cudaStream_t stream) {
     constexpr std::size_t smem = v2_smem_bytes<HD>();
     static const cudaError_t configured = cudaFuncSetAttribute(
-        attention_v2_kernel<HD, TOut, PV16>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+        attention_v2_kernel<HD, TOut, PV16, QK16>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
     check(configured, "cudaFuncSetAttribute");
     const unsigned tokens_per_tile = kV2Rows >> lg;
     const unsigned max_tiles = (rows.max_row_tokens + tokens_per_tile - 1) / tokens_per_tile;
     const dim3 grid(max_tiles, shape.kv_heads, rows.run_count);
-    attention_v2_kernel<HD, TOut, PV16><<<grid, dim3(kV2Threads), smem, stream>>>(params);
+    attention_v2_kernel<HD, TOut, PV16, QK16><<<grid, dim3(kV2Threads), smem, stream>>>(params);
 }
 
-template <class TOut, bool PV16>
+template <class TOut, bool PV16, bool QK16 = false>
 void dispatch_v2(const TiledParams& params, const AttentionRows& rows, const AttentionShape& shape, std::uint32_t lg,
                  cudaStream_t stream) {
     switch (shape.head_dim) {
-    case 64: launch_v2_instance<64, TOut, PV16>(params, rows, shape, lg, stream); break;
-    case 128: launch_v2_instance<128, TOut, PV16>(params, rows, shape, lg, stream); break;
-    default: launch_v2_instance<256, TOut, PV16>(params, rows, shape, lg, stream); break;
+    case 64: launch_v2_instance<64, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
+    case 128: launch_v2_instance<128, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
+    default: launch_v2_instance<256, TOut, PV16, QK16>(params, rows, shape, lg, stream); break;
     }
 }
 
@@ -905,7 +927,8 @@ TiledKernel tiled_kernel_choice() {
         if (s == "v1") return TiledKernel::First;
         if (s == "v2") return TiledKernel::Second;
         if (s == "v2h") return TiledKernel::SecondPv16;
-        throw std::invalid_argument("SEPAL_ATTENTION_KERNEL must be v1, v2 or v2h, not " + s);
+        if (s == "v2hh") return TiledKernel::SecondFp16;
+        throw std::invalid_argument("SEPAL_ATTENTION_KERNEL must be v1, v2, v2h or v2hh, not " + s);
     }();
     return choice;
 }
@@ -985,7 +1008,10 @@ AttentionPath launch_attention(const AttentionShape& shape, const AttentionRows&
         const TiledKernel kernel = tiled_kernel_choice();
         if (kernel != TiledKernel::First && shape.head_dim >= 64) {
             const bool pv16 = kernel == TiledKernel::SecondPv16;
-            if (out_type == AttnElem::F16) {
+            if (kernel == TiledKernel::SecondFp16) {
+                if (out_type == AttnElem::F16) dispatch_v2<__half, true, true>(p, rows, shape, lg, stream);
+                else dispatch_v2<float, true, true>(p, rows, shape, lg, stream);
+            } else if (out_type == AttnElem::F16) {
                 if (pv16) dispatch_v2<__half, true>(p, rows, shape, lg, stream);
                 else dispatch_v2<__half, false>(p, rows, shape, lg, stream);
             } else {

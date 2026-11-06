@@ -5,6 +5,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -976,16 +977,38 @@ void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, st
 }
 
 // Y^T [n, t] = op_T(W stored [n][k]) X^T, binary16 operands, accumulators and result, by cuBLASLt. False when Lt is off or
-// has no usable algorithm for the shape (the caller then runs cublasGemmEx). The algorithm is chosen per (n, k, ld_x, ld_y,
-// rows rounded up to a power of two) the first time such a multiply runs: up to 8 candidates of Lt's heuristic are timed on
-// the actual operands (1 warm-up and 3 timed runs each) and the fastest is kept for the rest of the process. The candidates
-// all run the same binary16-accumulate arithmetic as CUBLAS_COMPUTE_16F; the chosen one can differ from one process to the
-// next (by timing), so the last bits of a result can too, as they already do with the number of rows in natural mode.
+// the shape has no entry in kLtTable (the caller then runs cublasGemmEx, as before).
+//
+// Which algorithm runs is a pure function of the shape and the number of rows, never of timing, so a fresh process gives
+// the same bits (the determinism tests): Lt's heuristic is asked for its candidates for exactly this multiply, and the table
+// names the candidate to take for the shape and the power-of-two bucket of the rows. The table was made by timing every
+// candidate on an RTX 3060 (sm_86, cuBLAS 13.2) with SEPAL_GEMM_LT_TUNE=1, which picks the fastest candidate per multiply
+// instead and prints one line per new (shape, rows) to stderr. All candidates run the arithmetic of CUBLAS_COMPUTE_16F.
+namespace {
+struct LtTableEntry {
+    int n, k, bucket, index;
+};
+// clang-format off
+constexpr LtTableEntry kLtTable[] = {
+#include "lt_table_sm86.inc"
+};
+// clang-format on
+int lt_table_index(int n, int k, long long bucket) {
+    for (const LtTableEntry& e : kLtTable) {
+        if (e.n == n && e.k == k && e.bucket == bucket) return e.index;
+    }
+    return -1;
+}
+} // namespace
+
 bool CudaEngine::Impl::lt_gemm16(const void* w, int n, int k, const void* xs, int ld_x, int t, void* y, int ld_y) {
     if (lt == nullptr || t <= 0) return false;
+    static const bool tune = env_value("SEPAL_GEMM_LT_TUNE") == "1";
     long long bucket = 16;
     while (bucket < t) bucket *= 2;
-    const std::array<long long, 5> key{n, k, ld_x, ld_y, bucket};
+    const int table_index = tune ? 0 : lt_table_index(n, k, bucket);
+    if (table_index < 0) return false;
+    const std::array<long long, 5> key{n, k, ld_x, ld_y, t};
     const auto found = lt_choices.find(key);
     if (found != lt_choices.end() && !found->second.usable) return false;
 
@@ -1012,26 +1035,43 @@ bool CudaEngine::Impl::lt_gemm16(const void* w, int n, int k, const void* xs, in
             cublasLtMatmulHeuristicResult_t results[8] = {};
             int returned = 0;
             if (cublasLtMatmulAlgoGetHeuristic(lt, desc, la, lb, lc, lc, pref, 8, results, &returned) == CUBLAS_STATUS_SUCCESS) {
-                float best = 0.0f;
-                cudaEvent_t e0 = nullptr, e1 = nullptr;
-                cudaEventCreate(&e0);
-                cudaEventCreate(&e1);
-                for (int i = 0; i < returned; ++i) {
-                    if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
-                    if (run_algo(results[i].algo) != CUBLAS_STATUS_SUCCESS) continue; // warm-up; also rejects an unusable one
-                    cudaEventRecord(e0, stream);
-                    for (int r = 0; r < 3; ++r) run_algo(results[i].algo);
-                    cudaEventRecord(e1, stream);
-                    float ms = 0.0f;
-                    if (cudaEventSynchronize(e1) != cudaSuccess || cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess) continue;
-                    if (!choice.usable || ms < best) {
+                if (!tune) {
+                    if (table_index < returned && results[table_index].state == CUBLAS_STATUS_SUCCESS) {
                         choice.usable = true;
-                        choice.algo = results[i].algo;
-                        best = ms;
+                        choice.algo = results[table_index].algo;
+                    }
+                } else {
+                    float best = 0.0f, first = 0.0f;
+                    int best_index = -1;
+                    cudaEvent_t e0 = nullptr, e1 = nullptr;
+                    cudaEventCreate(&e0);
+                    cudaEventCreate(&e1);
+                    for (int i = 0; i < returned; ++i) {
+                        if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+                        if (run_algo(results[i].algo) != CUBLAS_STATUS_SUCCESS) continue; // warm-up; also rejects an unusable one
+                        float ms = 1e30f;
+                        for (int rep = 0; rep < 3; ++rep) { // the fastest of three runs of five
+                            cudaEventRecord(e0, stream);
+                            for (int r = 0; r < 5; ++r) run_algo(results[i].algo);
+                            cudaEventRecord(e1, stream);
+                            float elapsed = 0.0f;
+                            if (cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&elapsed, e0, e1) == cudaSuccess) ms = std::min(ms, elapsed / 5);
+                        }
+                        if (i == 0) first = ms;
+                        if (best_index < 0 || ms < best) {
+                            best_index = i;
+                            best = ms;
+                        }
+                    }
+                    cudaEventDestroy(e0);
+                    cudaEventDestroy(e1);
+                    if (best_index >= 0) {
+                        choice.usable = true;
+                        choice.algo = results[best_index].algo;
+                        std::fprintf(stderr, "lt-tune n %d k %d ld_x %d ld_y %d t %d bucket %lld candidates %d best %d %.4f ms first %.4f ms\n", n, k, ld_x, ld_y,
+                                     t, bucket, returned, best_index, best, first);
                     }
                 }
-                cudaEventDestroy(e0);
-                cudaEventDestroy(e1);
             }
             cublasLtMatmulPreferenceDestroy(pref);
         }
@@ -1041,7 +1081,7 @@ bool CudaEngine::Impl::lt_gemm16(const void* w, int n, int k, const void* xs, in
     if (ok) {
         const LtChoice& choice = lt_choices[key];
         ok = choice.usable && run_algo(choice.algo) == CUBLAS_STATUS_SUCCESS;
-        if (!ok) lt_choices[key].usable = false; // a later multiply of this bucket that the algorithm cannot take: GemmEx from now on
+        if (!ok) lt_choices[key].usable = false; // GemmEx for this shape from now on
     }
     if (lc != nullptr) cublasLtMatrixLayoutDestroy(lc);
     if (lb != nullptr) cublasLtMatrixLayoutDestroy(lb);

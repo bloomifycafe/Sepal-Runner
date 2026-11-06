@@ -60,6 +60,7 @@ struct Options {
     bool accumulate_given = false; // --fp16-accumulate was passed
     sepal::cuda::Int8Multiply int8_multiply;
     bool prefill = true, alerts = true, cached = true, profile = true;
+    std::vector<std::size_t> run_lengths; // --run-lengths: one call of one row per length, before the sections (multiply tuning)
 };
 
 [[noreturn]] void usage(const std::string& why) {
@@ -142,6 +143,9 @@ Options parse(int argc, char** argv) {
             o.fp16_accumulate.mixer_out = value.find("mixer_out") != std::string::npos || value == "all";
         } else if (flag == "--prune-last-layer") {
             o.prune_last_layer = value != "0";
+        } else if (flag == "--run-lengths") {
+            std::stringstream list(value);
+            for (std::string part; std::getline(list, part, ',');) o.run_lengths.push_back(std::stoull(part));
         } else if (flag == "--sections") {
             o.prefill = o.alerts = o.cached = o.profile = false;
             std::stringstream ss(value);
@@ -465,6 +469,13 @@ int main(int argc, char** argv) {
             std::printf("\n");
         }
 
+        if (!opt.run_lengths.empty()) {
+            const std::vector<std::uint32_t> pool = token_pool(alerts, 16384 + 64);
+            for (const std::size_t len : opt.run_lengths) {
+                const std::vector<EngineRow> rows{plain_row(pool, 0, len, true)};
+                engine.run(std::span<const EngineRow>(rows));
+            }
+        }
         if (opt.profile) {
             std::printf("TIME BREAKDOWN (synchronised profiling mode; the best of 5 runs; ms per call)\n");
             const std::vector<std::uint32_t> pool = token_pool(alerts, 16 * 640 + 64);
