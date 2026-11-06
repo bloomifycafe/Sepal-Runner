@@ -1,0 +1,5 @@
+name = "ExactTrack"
+defaultTargets = ["ExactTrack"]
+
+[[lean_lib]]
+name = "ExactTrack"

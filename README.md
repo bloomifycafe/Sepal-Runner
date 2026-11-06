@@ -106,6 +106,19 @@ What to expect, Sepal-4B `cpu-bf16`, measured on an E5-2698 v4 in a cloud contai
 | 10 | 86.0 tok/s (about 11 s) | 73.6 tok/s (about 216 s) | 71.1 / 62.2 tok/s |
 | 12 | about 105 tok/s (about 9 s), estimated from the 10-core run, not measured | | 87 tok/s on a user's server |
 
+Since 2026-11-06 the GEMM writes each finished tile at once (same bits) and attention uses the `flash` kernel. Measured on an E5-2673 v4
+(the same Broadwell core, cores 0-11 of a shared two-socket host, each change run alternately against the one before it):
+
+| Cores | Change | Short alert (~860 tokens) | 16k-token log |
+|---|---|---|---|
+| 12 | GEMM tile writes (2 rounds) | 99.0 -> 100.9 tok/s (+1.9%) | 85.6 -> 86.8 tok/s (+1.4%) |
+| 12 | flash attention (2 rounds) | 101.3 -> 101.5 tok/s (+0.2%) | 86.8 -> 88.3 tok/s (+1.8%) |
+| 10 | GEMM tile writes | 82.9 -> 84.9 tok/s (+2.4%) | 72.1 -> 73.3 tok/s (+1.7%) |
+| 10 | flash attention | 85.4 -> 85.6 tok/s (+0.3%, 2 rounds) | 69.7 -> 70.9 tok/s (+1.7%) |
+
+On the 16k log at 12 cores the matrix products went from 157 s to 146 s and attention from 27.8 s to 23.9 s. The shared host moves single
+runs by a few percent (the two sessions above differ by 3% in their baselines), so read the differences, not the absolute speeds.
+
 Sepal-0.8B is about 6x faster (505 tok/s on short alerts at 10 cores). If the same log is checked against several sets of questions, the prefix
 cache, on by default when RAM allows, makes the repeats about 4x faster (49 s to 12 s per request for a 4k log on 10 cores). Another engine that
 streams memory on the same socket slows the runner by about 15%; on the other socket it costs nothing. `cpu-q8` (`--allow-q8`) is slower than
