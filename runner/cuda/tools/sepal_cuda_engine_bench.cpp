@@ -294,9 +294,15 @@ void profile_call(CudaEngine& engine, const std::string& name, const std::vector
     engine.set_profiling(true);
     cuda::PhaseTimes best;
     best.wall_ms = 1e300;
-    for (int i = 0; i < runs + 1; ++i) {
-        engine.run(std::span<const EngineRow>(rows));
-        if (i > 0 && engine.last_profile().wall_ms < best.wall_ms) best = engine.last_profile();
+    try {
+        for (int i = 0; i < runs + 1; ++i) {
+            engine.run(std::span<const EngineRow>(rows));
+            if (i > 0 && engine.last_profile().wall_ms < best.wall_ms) best = engine.last_profile();
+        }
+    } catch (const std::exception& e) { // a call that does not fit this card's budget is skipped, not fatal
+        engine.set_profiling(false);
+        std::printf("  (skipped %s: %s)\n", name.c_str(), e.what());
+        return;
     }
     engine.set_profiling(false);
     g_profiles.push_back({name, tokens_of(rows), best});
@@ -464,7 +470,26 @@ int main(int argc, char** argv) {
             const std::vector<std::uint32_t> pool = token_pool(alerts, 16 * 640 + 64);
             profile_call(engine, "1 row x 64", {plain_row(pool, 0, 64, true)}, 5);
             profile_call(engine, "1 row x 600", {plain_row(pool, 0, 600, true)}, 5);
+            profile_call(engine, "1 row x 912", {plain_row(pool, 0, 912, true)}, 5);
             profile_call(engine, "1 row x 2048", {plain_row(pool, 0, 2048, true)}, 5);
+            if (opt.max_call_tokens >= 2048) { // a long log scored in calls of 2048 tokens: the 8th call, after 14,336 tokens of chain
+                try {
+                    const std::vector<std::uint32_t> long_pool = token_pool(alerts, 16384);
+                    DeviceSnapshot chain;
+                    for (std::size_t c = 0; c < 7; ++c) {
+                        EngineRow r = plain_row(long_pool, c * 2048, 2048, false);
+                        r.keep_snapshot = true;
+                        if (chain.valid()) r.parent = chain;
+                        auto out = engine.run(std::span<const EngineRow>(&r, 1));
+                        chain = out[0].snapshot;
+                    }
+                    EngineRow last = plain_row(long_pool, 7 * 2048, 2048, true);
+                    last.parent = chain;
+                    profile_call(engine, "1 row x 2048 after 14336", {last}, 5);
+                } catch (const std::exception& e) {
+                    std::printf("  (skipped the long chain: %s)\n", e.what());
+                }
+            }
             {
                 std::vector<EngineRow> rows;
                 for (std::size_t i = 0; i < 16; ++i) rows.push_back(plain_row(pool, i * 640, 640, true));
@@ -475,7 +500,7 @@ int main(int argc, char** argv) {
                 for (std::size_t i = 0; i < a; ++i) add_alert(rows, alerts[i]);
                 if (tokens_of(rows) <= opt.max_call_tokens) profile_call(engine, std::to_string(a) + " alert(s) per call", rows, 5);
             }
-            {
+            if (16 * alerts[0].state.size() <= opt.max_call_tokens) {
                 std::vector<EngineRow> state_rows;
                 for (std::size_t i = 0; i < 16; ++i) {
                     EngineRow s;

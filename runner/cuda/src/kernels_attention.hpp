@@ -65,6 +65,15 @@ enum class AttentionPath : int {
     Auto = 2,      ///< Tiled when supported, otherwise Reference
 };
 
+/// Which tensor-core kernel the Tiled path runs (head_dim 64 and up; a 16-wide head always takes the first). Chosen once per
+/// process by the environment variable SEPAL_ATTENTION_KERNEL (v1, v2, v2h); unset means SecondPv16.
+enum class TiledKernel : int {
+    First = 0,      ///< v1: 4 warps, 64 query rows, one buffer for a tile's keys and then its values
+    Second = 1,     ///< v2: 8 warps, 128 query rows, separate key and value buffers; P V in float32
+    SecondPv16 = 2, ///< v2h: the same with each tile's P V on binary16 accumulators, added into float32
+};
+TiledKernel tiled_kernel_choice();
+
 /// The attention geometry, read from the model configuration.
 struct AttentionShape {
     std::uint32_t heads;       ///< query heads

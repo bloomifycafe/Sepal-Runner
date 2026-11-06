@@ -14,6 +14,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <array>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -49,6 +51,21 @@ void check_cuda(cudaError_t status, const char* what, const std::string& context
     if (status == cudaSuccess) return;
     (void)cudaGetLastError(); // the error is reported by the exception: do not leave it for the next call's check
     throw CudaError(what, static_cast<long long>(status), cudaGetErrorString(status), context);
+}
+
+// An environment variable's value, or "" when it is not set (std::getenv is deprecated under MSVC's /W4 /WX).
+std::string env_value(const char* name) {
+#ifdef _MSC_VER
+    char* buffer = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr) return {};
+    std::string value(buffer);
+    std::free(buffer);
+    return value;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string();
+#endif
 }
 
 void check_blas(cublasStatus_t status, const char* what, const std::string& context = {}) {
@@ -290,6 +307,17 @@ struct CudaEngine::Impl {
 
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
+    // cuBLASLt for the binary16-accumulate multiplies (natural mode): the algorithm of each (n, k, strides, row bucket) is
+    // chosen once per process by timing the candidates of Lt's heuristic on the first multiply of that bucket; see lt_gemm16.
+    // SEPAL_GEMM_LT=0 turns it off (cublasGemmEx with CUBLAS_GEMM_DEFAULT, as before).
+    cublasLtHandle_t lt = nullptr;
+    void* blas_workspace = nullptr;
+    struct LtChoice {
+        bool usable = false;
+        cublasLtMatmulAlgo_t algo{};
+    };
+    std::map<std::array<long long, 5>, LtChoice> lt_choices;
+    bool lt_gemm16(const void* w, int n, int k, const void* xs, int ld_x, int t, void* y, int ld_y);
 
     DeviceBuffer<char> weight_memory;
     DeviceWeights weights;
@@ -361,6 +389,8 @@ struct CudaEngine::Impl {
         if (ev_start != nullptr) cudaEventDestroy(ev_start);
         if (ev_stop != nullptr) cudaEventDestroy(ev_stop);
         if (blas != nullptr) cublasDestroy(blas);
+        if (lt != nullptr) cublasLtDestroy(lt);
+        lt = nullptr;
         if (stream != nullptr) cudaStreamDestroy(stream);
         ev_start = ev_stop = nullptr;
         blas = nullptr;
@@ -751,6 +781,7 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     check_blas(cublasCreate(&blas), "cublasCreate");
     check_blas(cublasGetVersion(blas, &info.cublas_version), "cublasGetVersion");
     check_blas(cublasSetStream(blas, stream), "cublasSetStream");
+    if (env_value("SEPAL_GEMM_LT") != "0") check_blas(cublasLtCreate(&lt), "cublasLtCreate");
 
     // Weights.
     {
@@ -829,8 +860,8 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     call_memory = DeviceBuffer<char>(call_needed);
     call_buffer_bytes_needed(true);
-    check_blas(cublasSetWorkspace(blas, call_memory.data() + call_needed - kCublasWorkspace, kCublasWorkspace),
-               "cublasSetWorkspace");
+    blas_workspace = call_memory.data() + call_needed - kCublasWorkspace;
+    check_blas(cublasSetWorkspace(blas, blas_workspace, kCublasWorkspace), "cublasSetWorkspace");
     call_bytes = call_needed;
     if (options.half_state) {
         saturation_counter = DeviceBuffer<unsigned>(1);
@@ -922,6 +953,10 @@ void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, st
             // binary16 accumulators and binary16 result; widened into the float32 output unless that is binary16 itself.
             void* target = out_half ? static_cast<void*>(yout) : static_cast<void*>(hbuf);
             const int ld_target = out_half ? static_cast<int>(ld_out) : m_;
+            if (options.gemm_rows == 0 && lt_gemm16(w, m_, k_, xin, static_cast<int>(ld_in), t_, target, ld_target)) {
+                if (!out_half) launch_half_to_float_2d(hbuf, n, yout, ld_out, t, n, stream);
+                continue;
+            }
             check_blas(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m_, t_, k_, &alpha_h, w, CUDA_R_16F, k_, xin, CUDA_R_16F,
                                     static_cast<int>(ld_in), &beta_h, target, CUDA_R_16F, ld_target, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT),
                        "cublasGemmEx", context);
@@ -938,6 +973,81 @@ void CudaEngine::Impl::gemm(const void* in, std::size_t ld_in, const void* w, st
                        "cublasSgemm", context);
         }
     }
+}
+
+// Y^T [n, t] = op_T(W stored [n][k]) X^T, binary16 operands, accumulators and result, by cuBLASLt. False when Lt is off or
+// has no usable algorithm for the shape (the caller then runs cublasGemmEx). The algorithm is chosen per (n, k, ld_x, ld_y,
+// rows rounded up to a power of two) the first time such a multiply runs: up to 8 candidates of Lt's heuristic are timed on
+// the actual operands (1 warm-up and 3 timed runs each) and the fastest is kept for the rest of the process. The candidates
+// all run the same binary16-accumulate arithmetic as CUBLAS_COMPUTE_16F; the chosen one can differ from one process to the
+// next (by timing), so the last bits of a result can too, as they already do with the number of rows in natural mode.
+bool CudaEngine::Impl::lt_gemm16(const void* w, int n, int k, const void* xs, int ld_x, int t, void* y, int ld_y) {
+    if (lt == nullptr || t <= 0) return false;
+    long long bucket = 16;
+    while (bucket < t) bucket *= 2;
+    const std::array<long long, 5> key{n, k, ld_x, ld_y, bucket};
+    const auto found = lt_choices.find(key);
+    if (found != lt_choices.end() && !found->second.usable) return false;
+
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+    bool ok = cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_16F, CUDA_R_16F) == CUBLAS_STATUS_SUCCESS;
+    const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+    ok = ok && cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&la, CUDA_R_16F, static_cast<std::uint64_t>(k), static_cast<std::uint64_t>(n), k) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&lb, CUDA_R_16F, static_cast<std::uint64_t>(k), static_cast<std::uint64_t>(t), ld_x) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&lc, CUDA_R_16F, static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(t), ld_y) == CUBLAS_STATUS_SUCCESS;
+    const __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+    const auto run_algo = [&](const cublasLtMatmulAlgo_t& algo) {
+        return cublasLtMatmul(lt, desc, &alpha, w, la, xs, lb, &beta, y, lc, y, lc, &algo, blas_workspace, kCublasWorkspace, stream);
+    };
+
+    if (ok && found == lt_choices.end()) {
+        LtChoice choice;
+        cublasLtMatmulPreference_t pref = nullptr;
+        if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+            const std::size_t ws = kCublasWorkspace;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof ws);
+            cublasLtMatmulHeuristicResult_t results[8] = {};
+            int returned = 0;
+            if (cublasLtMatmulAlgoGetHeuristic(lt, desc, la, lb, lc, lc, pref, 8, results, &returned) == CUBLAS_STATUS_SUCCESS) {
+                float best = 0.0f;
+                cudaEvent_t e0 = nullptr, e1 = nullptr;
+                cudaEventCreate(&e0);
+                cudaEventCreate(&e1);
+                for (int i = 0; i < returned; ++i) {
+                    if (results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+                    if (run_algo(results[i].algo) != CUBLAS_STATUS_SUCCESS) continue; // warm-up; also rejects an unusable one
+                    cudaEventRecord(e0, stream);
+                    for (int r = 0; r < 3; ++r) run_algo(results[i].algo);
+                    cudaEventRecord(e1, stream);
+                    float ms = 0.0f;
+                    if (cudaEventSynchronize(e1) != cudaSuccess || cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess) continue;
+                    if (!choice.usable || ms < best) {
+                        choice.usable = true;
+                        choice.algo = results[i].algo;
+                        best = ms;
+                    }
+                }
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+            }
+            cublasLtMatmulPreferenceDestroy(pref);
+        }
+        lt_choices[key] = choice;
+        ok = choice.usable;
+    }
+    if (ok) {
+        const LtChoice& choice = lt_choices[key];
+        ok = choice.usable && run_algo(choice.algo) == CUBLAS_STATUS_SUCCESS;
+        if (!ok) lt_choices[key].usable = false; // a later multiply of this bucket that the algorithm cannot take: GemmEx from now on
+    }
+    if (lc != nullptr) cublasLtMatrixLayoutDestroy(lc);
+    if (lb != nullptr) cublasLtMatrixLayoutDestroy(lb);
+    if (la != nullptr) cublasLtMatrixLayoutDestroy(la);
+    if (desc != nullptr) cublasLtMatmulDescDestroy(desc);
+    return ok;
 }
 
 namespace {
