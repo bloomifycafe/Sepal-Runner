@@ -114,6 +114,11 @@ struct GpuDecisionEngine::Impl {
         eo.precision = f16 ? Precision::F16 : Precision::F32;
         if (o.profile == "gpu-bf16") eo.weight_storage = WeightStorage::BF16;
         if (o.profile == "gpu-w8g") eo.weight_storage = WeightStorage::Int8Group;
+        if (simt) {
+            // The embedding table stays on the host (the head reads its rows there already): 1.27 GB of VRAM at 4B.
+            const TrainedModel* held = &model;
+            eo.host_embedding = [held](std::uint32_t token, float* out) { held->embedding_row(token, out); };
+        }
         eo.prune_last_layer = false; // the head reads every position
         eo.max_call_tokens = options.max_call_tokens;
         eo.max_call_rows = o.max_call_rows;

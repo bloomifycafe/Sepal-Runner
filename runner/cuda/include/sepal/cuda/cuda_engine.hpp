@@ -198,6 +198,11 @@ struct EngineOptions {
     Precision precision = Precision::F16;
     /// Float32 path only: see WeightStorage.
     WeightStorage weight_storage = WeightStorage::Float32;
+    /// When set, the embedding table stays in host memory: a call gathers its tokens' rows on the host through this function
+    /// (float32, the values the table holds) into a pinned buffer and uploads them, and the device holds no table (at 4B that
+    /// saves 1.27 GB as bfloat16, 2.5 GB as float32). The bits are those of the device gather of the same values. Called from
+    /// `run` only, under the engine's call lock, once per token of the call.
+    std::function<void(std::uint32_t token, float* out)> host_embedding;
     /// Device memory the engine may take altogether, weights included. 0 sizes the pools for `pool_snapshots` snapshots (see
     /// there) within 85% of the memory free at creation.
     std::size_t memory_budget_bytes = 0;

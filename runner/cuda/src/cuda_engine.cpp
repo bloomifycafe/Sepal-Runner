@@ -294,6 +294,7 @@ struct CudaEngine::Impl {
 
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
+    float* host_rows = nullptr; // pinned [cap_rows, H]: the embedding rows of a call (EngineOptions::host_embedding)
 
     DeviceBuffer<char> weight_memory;
     DeviceWeights weights;
@@ -379,6 +380,8 @@ struct CudaEngine::Impl {
         if (ev_stop != nullptr) cudaEventDestroy(ev_stop);
         if (blas != nullptr) cublasDestroy(blas);
         if (stream != nullptr) cudaStreamDestroy(stream);
+        if (host_rows != nullptr) cudaFreeHost(host_rows);
+        host_rows = nullptr;
         ev_start = ev_stop = nullptr;
         blas = nullptr;
         stream = nullptr;
@@ -590,8 +593,12 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         return m;
     };
 
-    weights.embedding = put({std::string(embedding_name)}, simt ? (embed_elem == Elem::BF16 ? DType::BF16 : DType::F32) : operand,
-                            dim(config.vocab_size) * H);
+    if (options.host_embedding) {
+        weights.embedding = nullptr; // gathered on the host per call
+    } else {
+        weights.embedding = put({std::string(embedding_name)}, simt ? (embed_elem == Elem::BF16 ? DType::BF16 : DType::F32) : operand,
+                                dim(config.vocab_size) * H);
+    }
     weights.final_norm = reinterpret_cast<const float*>(put({std::string(final_norm_name)}, DType::F32, H));
     weights.layers.assign(layers, LayerWeights{});
     std::size_t dn_seen = 0, attn_seen = 0;
@@ -973,6 +980,11 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     }
     call_memory = DeviceBuffer<char>(call_needed);
     call_buffer_bytes_needed(true);
+    if (options.host_embedding) {
+        void* pinned = nullptr;
+        check_cuda(cudaMallocHost(&pinned, cap_rows * H * sizeof(float)), "cudaMallocHost", "embedding rows");
+        host_rows = static_cast<float*>(pinned);
+    }
     check_blas(cublasSetWorkspace(blas, call_memory.data() + call_needed - kCublasWorkspace, kCublasWorkspace),
                "cublasSetWorkspace");
     call_bytes = call_needed;
@@ -1466,7 +1478,13 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             check_cuda(cudaMemsetAsync(a2 + n * mix_width * elem_bytes, 0, (padded - n) * mix_width * elem_bytes, stream), "cudaMemsetAsync");
             check_cuda(cudaMemsetAsync(a3 + n * I * elem_bytes, 0, (padded - n) * I * elem_bytes, stream), "cudaMemsetAsync");
         }
-        launch_embed(d_tokens, n, weights.embedding, embed_elem, dim(config.vocab_size), H, x, H, stream);
+        if (options.host_embedding) {
+            // The previous call ended with a synchronisation, so the pinned rows are free to overwrite.
+            for (std::size_t t = 0; t < n; ++t) options.host_embedding(token_ids[t], host_rows + t * H);
+            check_cuda(cudaMemcpyAsync(x, host_rows, n * H * sizeof(float), cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync", "embedding rows");
+        } else {
+            launch_embed(d_tokens, n, weights.embedding, embed_elem, dim(config.vocab_size), H, x, H, stream);
+        }
         launch_rms_norm(x, H, weights.layers[0].input_norm, n, H, eps, a1, elem, H, stream);
     }
 

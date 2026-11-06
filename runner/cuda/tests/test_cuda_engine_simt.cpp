@@ -219,6 +219,38 @@ SEPAL_TEST(engine_simt, rows_are_bit_invariant) {
     }
 }
 
+SEPAL_TEST(engine_simt, host_embedding_gives_the_same_bits) {
+    const ModelConfig cfg = simt_config();
+    const Weights<float>& w = weights_of(450);
+    for (const WeightStorage storage : {WeightStorage::BF16, WeightStorage::Int8Group}) {
+        EngineOptions on_device = simt_options(storage);
+        EngineOptions on_host = simt_options(storage);
+        // The host function hands the table's values: the bfloat16 rounding the device table would hold.
+        const BasicTensor<float>& table = w[std::string(embedding_name)];
+        const std::size_t hidden = ref::dim(cfg.hidden_size);
+        on_host.host_embedding = [&table, hidden](std::uint32_t token, float* out) {
+            for (std::size_t i = 0; i < hidden; ++i) out[i] = bf16_round(table[token * hidden + i]);
+        };
+        CudaEngine a(cfg, w, on_device);
+        CudaEngine b(cfg, w, on_host);
+        CHECK(b.memory().weights_bytes + cfg.vocab_size * hidden * 2 <= a.memory().weights_bytes + 256);
+        Rng rng(91);
+        std::vector<EngineRow> rows;
+        for (std::size_t r = 0; r < 3; ++r) {
+            EngineRow row;
+            row.token_ids.resize(40 + 30 * r);
+            for (auto& t : row.token_ids) t = static_cast<std::uint32_t>(rng.below(cfg.vocab_size));
+            row.readout_offsets = {row.token_ids.size() - 1, 0};
+            rows.push_back(row);
+        }
+        const auto x = run(a, rows);
+        const auto y = run(b, rows);
+        bool same = true;
+        for (std::size_t r = 0; r < rows.size(); ++r) same = same && same_bits(x[r].hidden, y[r].hidden);
+        CHECK(same);
+    }
+}
+
 SEPAL_TEST(engine_simt, options_and_memory) {
     const ModelConfig cfg = simt_config();
     const Weights<float>& w = weights_of(500);

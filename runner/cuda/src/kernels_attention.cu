@@ -598,23 +598,24 @@ __global__ void __launch_bounds__(kTiledThreads, 2) attention_tiled_kernel(const
 }
 
 // ---- the tiled float32 kernel (F32 keys and values, no tensor cores: every architecture from sm_61 up) ----
-// One block (4 warps) takes one KV head of one row and 32 "query rows": the (token, head) pairs of one KV group for
-// 32 / group consecutive tokens, token-major, so the group's heads share every key and value the block loads. The block
-// walks the chain's keys 32 at a time (tiles counted from the chain's first token, as the tensor-core kernel does) up to
-// the last key its last token sees (causal skip): S = Q K^T in float32 (each score one fmaf chain over the head
-// dimensions in order), the mask, an online softmax per query row (the running maximum, a rescale factor and the sum),
-// and O = O * alpha + P V (one fmaf chain per output over the keys in order). The queries stay in shared memory for the
-// whole walk; keys and values pass through one buffer 64 head dimensions at a time. A tile in which a row sees nothing
-// leaves that row's bits unchanged (alpha = exp(0) = 1, p = 0), so a token's result does not depend on the other tokens
-// of its block: it depends on its row's chain only (proofs/ExactTrack/OnlineSoftmax.lean has the softmax identity).
+// One block takes one KV head of one row and 64 "query rows": the (token, head) pairs of one KV group for 64 / group
+// consecutive tokens, token-major, so the group's heads share every key and value the block loads. Each query row is held by
+// SLICES = head_dim / 64 threads (a narrower head is one slice padded with zeros), each owning 64 head dimensions of the
+// row's query and of its output in registers; a block has 64 * SLICES threads. The block walks the chain's keys 16 at a time
+// (tiles counted from the chain's first token, so they do not depend on segment boundaries or on the query tile) up to the
+// last key its last token sees (causal skip). Per tile: the keys and values go to shared memory (fetched into registers
+// during the previous tile, so the loads overlap the arithmetic); a thread's partial score over its 64 dimensions is one fmaf
+// chain in dimension order, the slices are added by a fixed butterfly (the same bits in every thread of the row); every thread
+// of the row then runs the same online softmax (running maximum, rescale factor exp(m_old - m_new), sum of the probabilities in
+// key order) and O = O * alpha + P V on its dimensions (one fmaf chain per output over the keys in order). A tile in which a row
+// sees nothing leaves that row's bits unchanged (alpha = exp(0) = 1, p = 0), so a token's result depends on its row's chain
+// only, never on the other tokens of its block (proofs/ExactTrack/OnlineSoftmax.lean has the softmax identity).
 
-constexpr unsigned kF32Threads = 128;
-constexpr unsigned kF32Rows = 32;  // query rows per block
-constexpr unsigned kF32Keys = 32;  // keys per tile
-constexpr unsigned kF32Chunk = 64; // head dimensions per staged chunk
-constexpr unsigned kF32KStride = kF32Keys + 4;   // K chunk stored [d][key]
-constexpr unsigned kF32VStride = kF32Chunk + 4;  // V chunk stored [key][d]
-constexpr unsigned kF32Buffer = kF32Chunk * kF32KStride > kF32Keys * kF32VStride ? kF32Chunk * kF32KStride : kF32Keys * kF32VStride;
+constexpr unsigned kF32Rows = 64;  // query rows per block
+constexpr unsigned kF32Keys = 16;  // keys per tile
+constexpr unsigned kF32Slice = 64; // head dimensions per thread
+constexpr unsigned kF32Pitch = kF32Slice + 4;                 // floats per key row of a slice in shared memory
+constexpr unsigned kF32SliceStride = kF32Keys * kF32Pitch + 8; // so that the slices of one key fall in different bank groups
 
 struct TiledF32Params {
     AttentionRows rows;
@@ -628,18 +629,21 @@ struct TiledF32Params {
     std::size_t out_stride;
 };
 
+template <int HD>
+__host__ __device__ constexpr int f32_slices() {
+    return HD <= static_cast<int>(kF32Slice) ? 1 : HD / static_cast<int>(kF32Slice);
+}
+
 template <int HD, class TOut>
-__global__ void __launch_bounds__(kF32Threads) attention_f32_tiled_kernel(const TiledF32Params p) {
-    // A head narrower than 64 is padded to 64 with zeros (which add nothing to a score and are never written out).
-    constexpr int kHDP = HD < static_cast<int>(kF32Chunk) ? static_cast<int>(kF32Chunk) : HD;
-    constexpr int kChunks = kHDP / static_cast<int>(kF32Chunk);
-    __shared__ __align__(16) float Qs[kHDP][kF32Rows];
-    __shared__ __align__(16) float KV[kF32Buffer];
-    __shared__ float Ps[kF32Rows][kF32Keys + 1];
-    __shared__ float row_alpha[kF32Rows];
-    __shared__ float row_sum[kF32Rows];
-    __shared__ const float* key_ptr[kF32Keys];
-    __shared__ const float* value_ptr[kF32Keys];
+__global__ void __launch_bounds__(kF32Rows * f32_slices<HD>(), 1) attention_f32_tiled_kernel(const TiledF32Params p) {
+    constexpr int kSlices = f32_slices<HD>();
+    constexpr int kThreads = static_cast<int>(kF32Rows) * kSlices;
+    constexpr int kHDP = kSlices * static_cast<int>(kF32Slice); // padded head dimension
+    constexpr int kVec = kHDP / 4;                                 // float4 per key row
+    constexpr int kPer = static_cast<int>(kF32Keys) * kVec / kThreads; // float4 of K (and of V) per thread per tile: 4
+    static_assert(kPer * kThreads == static_cast<int>(kF32Keys) * kVec, "tile loads must divide evenly");
+    __shared__ __align__(16) float Ks[kSlices * kF32SliceStride];
+    __shared__ __align__(16) float Vs[kSlices * kF32SliceStride];
 
     const std::uint32_t row = run_row(p.rows, blockIdx.z);
     const RowSpan span = p.rows.spans[row];
@@ -656,187 +660,136 @@ __global__ void __launch_bounds__(kF32Threads) attention_f32_tiled_kernel(const 
     const std::uint32_t key_tiles = (block_visible + kF32Keys - 1) / kF32Keys;
     const std::size_t kv_width = static_cast<std::size_t>(p.kv_heads) * HD;
     const unsigned tid = threadIdx.x;
+    const unsigned slice = tid % kSlices;
+    const unsigned qrow = tid / kSlices;
+    const std::uint32_t t = tok0 + (qrow >> lg);
+    const bool live = t < span.length;
+    const std::uint32_t head = kvh * group + (qrow & (group - 1));
+    const unsigned d0 = slice * kF32Slice; // this thread's first head dimension
 
-    // ---- the queries, transposed: Qs[d][r] ----
-    for (unsigned idx = tid; idx < kF32Rows * kHDP / 4; idx += kF32Threads) {
-        const unsigned r = idx / (kHDP / 4);
-        const unsigned d4 = (idx % (kHDP / 4)) * 4;
-        const std::uint32_t t = tok0 + (r >> lg);
-        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (t < span.length && d4 < static_cast<unsigned>(HD)) {
-            const std::size_t token = static_cast<std::size_t>(span.offset) + t;
-            const std::uint32_t head = kvh * group + (r & (group - 1));
-            v = *reinterpret_cast<const float4*>(p.q + token * p.q_stride + static_cast<std::size_t>(head) * HD + d4);
+    // ---- this thread's 64 dimensions of the query ----
+    float q[kF32Slice];
+    {
+        const float* src = live ? p.q + (static_cast<std::size_t>(span.offset) + t) * p.q_stride + static_cast<std::size_t>(head) * HD : nullptr;
+#pragma unroll
+        for (int i = 0; i < static_cast<int>(kF32Slice); i += 4) {
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (src != nullptr && d0 + static_cast<unsigned>(i) < static_cast<unsigned>(HD)) v = *reinterpret_cast<const float4*>(src + d0 + i);
+            q[i] = v.x;
+            q[i + 1] = v.y;
+            q[i + 2] = v.z;
+            q[i + 3] = v.w;
         }
-        Qs[d4 + 0][r] = v.x;
-        Qs[d4 + 1][r] = v.y;
-        Qs[d4 + 2][r] = v.z;
-        Qs[d4 + 3][r] = v.w;
     }
-
-    // Thread roles: scores (2 rows x 4 keys), softmax (one row, 8 keys), P V (4 rows x 4 dims of every chunk).
-    const unsigned sy = tid / 8, sx = tid % 8;
-    const unsigned srow = tid / 4, spart = tid % 4;
-    const unsigned py = tid / 16, px = tid % 16;
+    float o[kF32Slice];
+#pragma unroll
+    for (int i = 0; i < static_cast<int>(kF32Slice); ++i) o[i] = 0.0f;
     float m_run = neg_inf();
     float l_run = 0.0f;
-    float o[kChunks][4][4];
-#pragma unroll
-    for (int c = 0; c < kChunks; ++c)
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-#pragma unroll
-            for (int j = 0; j < 4; ++j) o[c][i][j] = 0.0f;
 
-    for (std::uint32_t kt = 0; kt < key_tiles; ++kt) {
-        const std::uint32_t key0 = kt * kF32Keys;
-        if (tid < kF32Keys) {
-            const std::uint32_t j = key0 + tid;
-            const float* kp = nullptr;
-            const float* vp = nullptr;
-            if (j < block_visible) {
+    // ---- the tile fetch: kPer float4 of keys and of values per thread ----
+    float4 kr[kPer], vr[kPer];
+    const auto fetch = [&](std::uint32_t key0) {
+#pragma unroll
+        for (int e = 0; e < kPer; ++e) {
+            const int idx = static_cast<int>(tid) + e * kThreads;
+            const std::uint32_t j = key0 + static_cast<std::uint32_t>(idx / kVec);
+            const int d = (idx % kVec) * 4;
+            kr[e] = vr[e] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (j < block_visible && d < HD) {
                 std::uint32_t local;
                 const KvSegment* seg = locate_key(p.rows.segments, desc, j, local);
-                const std::size_t at = static_cast<std::size_t>(local) * kv_width + static_cast<std::size_t>(kvh) * HD;
-                kp = static_cast<const float*>(seg->keys) + at;
-                vp = static_cast<const float*>(seg->values) + at;
+                const std::size_t at = static_cast<std::size_t>(local) * kv_width + static_cast<std::size_t>(kvh) * HD + static_cast<std::size_t>(d);
+                kr[e] = *reinterpret_cast<const float4*>(static_cast<const float*>(seg->keys) + at);
+                vr[e] = *reinterpret_cast<const float4*>(static_cast<const float*>(seg->values) + at);
             }
-            key_ptr[tid] = kp;
-            value_ptr[tid] = vp;
         }
+    };
+    const auto stage = [&]() {
+#pragma unroll
+        for (int e = 0; e < kPer; ++e) {
+            const int idx = static_cast<int>(tid) + e * kThreads;
+            const int j = idx / kVec;
+            const int d = (idx % kVec) * 4;
+            const int at = (d / static_cast<int>(kF32Slice)) * static_cast<int>(kF32SliceStride) + j * static_cast<int>(kF32Pitch) + d % static_cast<int>(kF32Slice);
+            *reinterpret_cast<float4*>(&Ks[at]) = kr[e];
+            *reinterpret_cast<float4*>(&Vs[at]) = vr[e];
+        }
+    };
 
-        // ---- S = Q K^T, 64 head dimensions at a time ----
-        float s[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
-#pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-            __syncthreads();
-            for (unsigned idx = tid; idx < kF32Keys * kF32Chunk / 4; idx += kF32Threads) {
-                const unsigned j = idx / (kF32Chunk / 4);
-                const unsigned d4 = (idx % (kF32Chunk / 4)) * 4;
-                const float* kp = key_ptr[j];
-                const bool in = kp != nullptr && c * kF32Chunk + d4 < static_cast<unsigned>(HD);
-                const float4 v = in ? *reinterpret_cast<const float4*>(kp + c * kF32Chunk + d4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                KV[(d4 + 0) * kF32KStride + j] = v.x;
-                KV[(d4 + 1) * kF32KStride + j] = v.y;
-                KV[(d4 + 2) * kF32KStride + j] = v.z;
-                KV[(d4 + 3) * kF32KStride + j] = v.w;
-            }
-            __syncthreads();
-#pragma unroll 8
-            for (unsigned dd = 0; dd < kF32Chunk; ++dd) {
-                const float2 qv = *reinterpret_cast<const float2*>(&Qs[c * kF32Chunk + dd][2 * sy]);
-                const float4 kv = *reinterpret_cast<const float4*>(&KV[dd * kF32KStride + 4 * sx]);
-                s[0][0] = __fmaf_rn(qv.x, kv.x, s[0][0]);
-                s[0][1] = __fmaf_rn(qv.x, kv.y, s[0][1]);
-                s[0][2] = __fmaf_rn(qv.x, kv.z, s[0][2]);
-                s[0][3] = __fmaf_rn(qv.x, kv.w, s[0][3]);
-                s[1][0] = __fmaf_rn(qv.y, kv.x, s[1][0]);
-                s[1][1] = __fmaf_rn(qv.y, kv.y, s[1][1]);
-                s[1][2] = __fmaf_rn(qv.y, kv.z, s[1][2]);
-                s[1][3] = __fmaf_rn(qv.y, kv.w, s[1][3]);
-            }
-        }
-        // Scale and mask. A key is visible to token t when its chain index is at most ctx + t. Rows past the row's end
-        // (the last tile of a short row) get zeros and are never written out.
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const unsigned r = 2 * sy + static_cast<unsigned>(i);
-            const std::uint32_t t = tok0 + (r >> lg);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const std::uint32_t key = key0 + 4 * sx + static_cast<std::uint32_t>(j);
-                float v = 0.0f;
-                if (t < span.length) v = key <= ctx + t ? __fmul_rn(s[i][j], p.scale) : neg_inf();
-                Ps[r][4 * sx + j] = v;
-            }
-        }
+    fetch(0);
+    const float* const ks = Ks + slice * kF32SliceStride;
+    const float* const vs = Vs + slice * kF32SliceStride;
+    for (std::uint32_t kt = 0; kt < key_tiles; ++kt) {
+        const std::uint32_t key0 = kt * kF32Keys;
+        __syncthreads(); // the previous tile's arithmetic is done with the buffers
+        stage();
         __syncthreads();
+        if (kt + 1 < key_tiles) fetch(key0 + kF32Keys); // in flight during this tile's arithmetic
 
-        // ---- online softmax: four threads per row, eight keys each ----
-        {
-            float x[8];
-            float mx = neg_inf();
+        // S: the partial score of this thread's 64 dimensions, then the slices added by a fixed butterfly.
+        float s[kF32Keys];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                x[j] = Ps[srow][spart * 8 + j];
-                mx = fmaxf(mx, x[j]);
-            }
-            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 1));
-            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 2));
-            const float new_max = fmaxf(m_run, mx);
-            const float alpha = expf(m_run - new_max); // 0 on the first tile, 1 on a tile this row does not see
-            float sum = 0.0f;
+        for (int j = 0; j < static_cast<int>(kF32Keys); ++j) s[j] = 0.0f;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                x[j] = expf(x[j] - new_max);
-                sum = __fadd_rn(sum, x[j]);
-            }
-            sum = __fadd_rn(sum, __shfl_xor_sync(0xFFFFFFFFu, sum, 1));
-            sum = __fadd_rn(sum, __shfl_xor_sync(0xFFFFFFFFu, sum, 2));
-            l_run = __fadd_rn(__fmul_rn(l_run, alpha), sum);
-            m_run = new_max;
+        for (int i = 0; i < static_cast<int>(kF32Slice); i += 4) {
 #pragma unroll
-            for (int j = 0; j < 8; ++j) Ps[srow][spart * 8 + j] = x[j];
-            if (spart == 0) row_alpha[srow] = alpha;
-        }
-        __syncthreads();
-
-        // ---- O = O * alpha + P V ----
-        float alpha_r[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) alpha_r[i] = row_alpha[4 * py + i];
-#pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) o[c][i][j] = __fmul_rn(o[c][i][j], alpha_r[i]);
-            if (c > 0) __syncthreads();
-            for (unsigned idx = tid; idx < kF32Keys * kF32Chunk / 4; idx += kF32Threads) {
-                const unsigned j = idx / (kF32Chunk / 4);
-                const unsigned d4 = (idx % (kF32Chunk / 4)) * 4;
-                const float* vp = value_ptr[j];
-                const bool in = vp != nullptr && c * kF32Chunk + d4 < static_cast<unsigned>(HD);
-                const float4 v = in ? *reinterpret_cast<const float4*>(vp + c * kF32Chunk + d4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                *reinterpret_cast<float4*>(&KV[j * kF32VStride + d4]) = v;
-            }
-            __syncthreads();
-#pragma unroll 4
-            for (unsigned j = 0; j < kF32Keys; ++j) {
-                const float4 v = *reinterpret_cast<const float4*>(&KV[j * kF32VStride + 4 * px]);
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const float pj = Ps[4 * py + i][j];
-                    o[c][i][0] = __fmaf_rn(pj, v.x, o[c][i][0]);
-                    o[c][i][1] = __fmaf_rn(pj, v.y, o[c][i][1]);
-                    o[c][i][2] = __fmaf_rn(pj, v.z, o[c][i][2]);
-                    o[c][i][3] = __fmaf_rn(pj, v.w, o[c][i][3]);
-                }
+            for (int j = 0; j < static_cast<int>(kF32Keys); ++j) {
+                const float4 kv = *reinterpret_cast<const float4*>(ks + j * static_cast<int>(kF32Pitch) + i);
+                s[j] = __fmaf_rn(q[i], kv.x, s[j]);
+                s[j] = __fmaf_rn(q[i + 1], kv.y, s[j]);
+                s[j] = __fmaf_rn(q[i + 2], kv.z, s[j]);
+                s[j] = __fmaf_rn(q[i + 3], kv.w, s[j]);
             }
         }
-        __syncthreads(); // the key and value pointers and P are rewritten by the next tile
+#pragma unroll
+        for (int offset = 1; offset < kSlices; offset <<= 1) {
+#pragma unroll
+            for (int j = 0; j < static_cast<int>(kF32Keys); ++j) s[j] = __fadd_rn(s[j], __shfl_xor_sync(0xFFFFFFFFu, s[j], offset));
+        }
+        // Scale, mask (a key is visible to token t when its chain index is at most ctx + t), online softmax. A row past the
+        // row's end (the last tile of a short row) keeps zeros and is never written out.
+        float mx = neg_inf();
+#pragma unroll
+        for (int j = 0; j < static_cast<int>(kF32Keys); ++j) {
+            const std::uint32_t key = key0 + static_cast<std::uint32_t>(j);
+            s[j] = !live ? 0.0f : key <= ctx + t ? __fmul_rn(s[j], p.scale) : neg_inf();
+            mx = fmaxf(mx, s[j]);
+        }
+        const float new_max = fmaxf(m_run, mx);
+        const float alpha = expf(m_run - new_max); // 0 on the first tile, 1 on a tile this row does not see
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < static_cast<int>(kF32Keys); ++j) {
+            s[j] = expf(s[j] - new_max);
+            sum = __fadd_rn(sum, s[j]);
+        }
+        l_run = __fadd_rn(__fmul_rn(l_run, alpha), sum);
+        m_run = new_max;
+        // O = O * alpha + P V on this thread's dimensions.
+#pragma unroll
+        for (int i = 0; i < static_cast<int>(kF32Slice); ++i) o[i] = __fmul_rn(o[i], alpha);
+#pragma unroll
+        for (int j = 0; j < static_cast<int>(kF32Keys); ++j) {
+#pragma unroll
+            for (int i = 0; i < static_cast<int>(kF32Slice); i += 4) {
+                const float4 vv = *reinterpret_cast<const float4*>(vs + j * static_cast<int>(kF32Pitch) + i);
+                o[i] = __fmaf_rn(s[j], vv.x, o[i]);
+                o[i + 1] = __fmaf_rn(s[j], vv.y, o[i + 1]);
+                o[i + 2] = __fmaf_rn(s[j], vv.z, o[i + 2]);
+                o[i + 3] = __fmaf_rn(s[j], vv.w, o[i + 3]);
+            }
+        }
     }
 
-    if (spart == 0) row_sum[srow] = l_run;
-    __syncthreads();
+    if (!live) return;
+    const std::size_t token = static_cast<std::size_t>(span.offset) + t;
+    TOut* const out = static_cast<TOut*>(p.out) + token * p.out_stride + static_cast<std::size_t>(head) * HD;
+    const float* const gate = p.gate.data + token * p.gate.stride + static_cast<std::size_t>(head) * 2 * HD + HD;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const unsigned r = 4 * py + static_cast<unsigned>(i);
-        const std::uint32_t t = tok0 + (r >> lg);
-        if (t >= span.length) continue;
-        const std::size_t token = static_cast<std::size_t>(span.offset) + t;
-        const std::uint32_t head = kvh * group + (r & (group - 1));
-        const float denominator = row_sum[r];
-        TOut* const out = static_cast<TOut*>(p.out) + token * p.out_stride + static_cast<std::size_t>(head) * HD;
-        const float* const gate = p.gate.data + token * p.gate.stride + static_cast<std::size_t>(head) * 2 * HD + HD;
-#pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const unsigned d = static_cast<unsigned>(c) * kF32Chunk + 4 * px + static_cast<unsigned>(j);
-                if (d < static_cast<unsigned>(HD)) out[d] = from_float<TOut>(__fmul_rn(o[c][i][j] / denominator, sigmoid_stable(gate[d])));
-            }
-        }
+    for (int i = 0; i < static_cast<int>(kF32Slice); ++i) {
+        const unsigned d = d0 + static_cast<unsigned>(i);
+        if (d < static_cast<unsigned>(HD)) out[d] = from_float<TOut>(__fmul_rn(o[i] / l_run, sigmoid_stable(gate[d])));
     }
 }
 
@@ -894,7 +847,7 @@ template <int HD, class TOut>
 void launch_f32_tiled_instance(const TiledF32Params& params, unsigned max_tiles, const AttentionShape& shape, std::uint32_t run_count,
                                cudaStream_t stream) {
     const dim3 grid(max_tiles, shape.kv_heads, run_count);
-    attention_f32_tiled_kernel<HD, TOut><<<grid, dim3(kF32Threads), 0, stream>>>(params);
+    attention_f32_tiled_kernel<HD, TOut><<<grid, dim3(kF32Rows * static_cast<unsigned>(f32_slices<HD>())), 0, stream>>>(params);
 }
 
 template <class TOut>

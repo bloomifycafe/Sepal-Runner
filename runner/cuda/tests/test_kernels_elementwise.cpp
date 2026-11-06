@@ -519,7 +519,7 @@ SEPAL_TEST(contract, argument_checks_and_empty_launches) {
     CHECK_THROWS(sepal::cuda::launch_rms_norm(a.data(), 16, w.data(), 4, 16, kEps, h.data(), Elem::BF16, 16, stream()), std::invalid_argument);
     CHECK_THROWS(sepal::cuda::launch_swiglu(a.data(), 16, b.data(), 16, 4, 16, h.data(), Elem::BF16, 16, stream()), std::invalid_argument);
     CHECK_THROWS(sepal::cuda::launch_add_rms_norm(a.data(), 16, b.data(), 16, out, 16, w.data(), 4, 16, kEps, h.data(), Elem::BF16, 16, stream()), std::invalid_argument);
-    CHECK_THROWS(sepal::cuda::launch_embed(ids.data(), 4, h.data(), Elem::BF16, 16, 16, out, 16, stream()), std::invalid_argument);
+    CHECK_THROWS(sepal::cuda::launch_embed(ids.data(), 4, h.data(), static_cast<Elem>(7), 16, 16, out, 16, stream()), std::invalid_argument);
     // A stride smaller than the width
     CHECK_THROWS(sepal::cuda::launch_rms_norm(a.data(), 8, w.data(), 4, 16, kEps, out, Elem::F32, 16, stream()), std::invalid_argument);
     CHECK_THROWS(sepal::cuda::launch_rms_norm(a.data(), 16, w.data(), 4, 16, kEps, out, Elem::F32, 8, stream()), std::invalid_argument);
@@ -553,10 +553,17 @@ void embed_case(const EmbedCase& c, Elem table_type, Rng& rng, int& cases) {
     // Table: random bit patterns for binary16 (every exponent, denormals and infinities; no NaN), random floats otherwise.
     std::vector<std::uint16_t> half_table;
     std::vector<float> float_table;
+    const auto bf16_is_nan = [](std::uint16_t v) { return (v & 0x7F80u) == 0x7F80u && (v & 0x007Fu) != 0; };
     if (table_type == Elem::F16) {
         half_table.resize(c.vocab * c.hidden);
         for (auto& v : half_table) {
             do { v = static_cast<std::uint16_t>(rng.next()); } while (half_is_nan(v));
+        }
+    } else if (table_type == Elem::BF16) {
+        // Every bfloat16 bit pattern but NaN (the gpu-bf16 / gpu-w8g tables): widening is a 16-bit shift.
+        half_table.resize(c.vocab * c.hidden);
+        for (auto& v : half_table) {
+            do { v = static_cast<std::uint16_t>(rng.next()); } while (bf16_is_nan(v));
         }
     } else {
         float_table.resize(c.vocab * c.hidden);
@@ -570,7 +577,7 @@ void embed_case(const EmbedCase& c, Elem table_type, Rng& rng, int& cases) {
     const bool with_bad = c.n > 3;
     if (with_bad) ids[3] = static_cast<std::uint32_t>(c.vocab); // outside the vocabulary: a zero row
 
-    const Bits got = run_embed(ids, table_type == Elem::F16 ? static_cast<const void*>(half_table.data()) : static_cast<const void*>(float_table.data()),
+    const Bits got = run_embed(ids, table_type != Elem::F32 ? static_cast<const void*>(half_table.data()) : static_cast<const void*>(float_table.data()),
                                table_type, c.vocab, c.hidden, c.out);
     std::size_t bad = 0;
     for (std::size_t t = 0; t < c.n; ++t) {
@@ -578,7 +585,9 @@ void embed_case(const EmbedCase& c, Elem table_type, Rng& rng, int& cases) {
             std::uint32_t want = 0;
             if (ids[t] < c.vocab) {
                 const std::size_t at = static_cast<std::size_t>(ids[t]) * c.hidden + i;
-                want = table_type == Elem::F16 ? std::bit_cast<std::uint32_t>(half_to_float(half_table[at])) : std::bit_cast<std::uint32_t>(float_table[at]);
+                want = table_type == Elem::F16    ? std::bit_cast<std::uint32_t>(half_to_float(half_table[at]))
+                       : table_type == Elem::BF16 ? static_cast<std::uint32_t>(half_table[at]) << 16
+                                                  : std::bit_cast<std::uint32_t>(float_table[at]);
             }
             if (got[t][i] != want) ++bad;
         }
@@ -596,7 +605,7 @@ void embed_case(const EmbedCase& c, Elem table_type, Rng& rng, int& cases) {
 SEPAL_TEST(embed, gather_is_exact) {
     Rng rng(101);
     int cases = 0;
-    for (const Elem type : {Elem::F32, Elem::F16}) {
+    for (const Elem type : {Elem::F32, Elem::F16, Elem::BF16}) {
         // The real widths, N from 1 to several thousand
         for (const std::size_t hidden : {std::size_t{1024}, std::size_t{2048}, std::size_t{2560}, std::size_t{4096}}) {
             for (const std::size_t n : {std::size_t{1}, std::size_t{5}, std::size_t{1024}, std::size_t{4096}}) {
@@ -612,7 +621,7 @@ SEPAL_TEST(embed, gather_is_exact) {
         embed_case({3000, 1024, 3000, {0, 0}}, type, rng, cases);
         embed_case({3000, 1024, 3000, {12, 1}}, type, rng, cases);
     }
-    std::printf("  embed: bit-exact in %d cases (binary16 and float32 tables)\n", cases);
+    std::printf("  embed: bit-exact in %d cases (binary16, bfloat16 and float32 tables)\n", cases);
 }
 
 SEPAL_TEST(embed, full_vocabulary_table) {
