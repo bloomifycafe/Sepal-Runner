@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -918,11 +919,20 @@ void launch_reference_instance(const ReferenceParams& params, const AttentionSha
 
 } // namespace
 
+namespace {
+std::atomic<int> g_tiled_override{-1};
+} // namespace
+
+void set_tiled_kernel(TiledKernel kernel) { g_tiled_override.store(static_cast<int>(kernel)); }
+void reset_tiled_kernel() { g_tiled_override.store(-1); }
+
 TiledKernel tiled_kernel_choice() {
-    // SEPAL_ATTENTION_KERNEL=v1 | v2 | v2h; read once per process. Unset: the default below.
+    if (const int o = g_tiled_override.load(); o >= 0) return static_cast<TiledKernel>(o);
+    // SEPAL_ATTENTION_KERNEL=v1 | v2 | v2h | v2hh; read once per process. Unset: v2, which gives v1's bits faster. v2h and v2hh
+    // are faster still but miss the gpu-f16 parity gate on SEC-dev (max |dp| 0.057 and 0.064 against 0.03): opt-in.
     static const TiledKernel choice = [] {
         const char* v = std::getenv("SEPAL_ATTENTION_KERNEL");
-        if (v == nullptr || *v == '\0') return TiledKernel::SecondPv16;
+        if (v == nullptr || *v == '\0') return TiledKernel::Second; // v1's bits, faster (README.md, "Ampere")
         const std::string s(v);
         if (s == "v1") return TiledKernel::First;
         if (s == "v2") return TiledKernel::Second;

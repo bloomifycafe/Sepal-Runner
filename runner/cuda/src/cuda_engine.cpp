@@ -310,7 +310,7 @@ struct CudaEngine::Impl {
     cublasHandle_t blas = nullptr;
     // cuBLASLt for the binary16-accumulate multiplies (natural mode): the algorithm of each (n, k, strides, row bucket) is
     // chosen once per process by timing the candidates of Lt's heuristic on the first multiply of that bucket; see lt_gemm16.
-    // SEPAL_GEMM_LT=0 turns it off (cublasGemmEx with CUBLAS_GEMM_DEFAULT, as before).
+    // Off unless SEPAL_GEMM_LT=1; the default stays cublasGemmEx with CUBLAS_GEMM_DEFAULT.
     cublasLtHandle_t lt = nullptr;
     void* blas_workspace = nullptr;
     struct LtChoice {
@@ -782,7 +782,9 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     check_blas(cublasCreate(&blas), "cublasCreate");
     check_blas(cublasGetVersion(blas, &info.cublas_version), "cublasGetVersion");
     check_blas(cublasSetStream(blas, stream), "cublasSetStream");
-    if (env_value("SEPAL_GEMM_LT") != "0") check_blas(cublasLtCreate(&lt), "cublasLtCreate");
+    // Opt-in (SEPAL_GEMM_LT=1; SEPAL_GEMM_LT_TUNE=1 times the candidates instead): faster, but it misses the gpu-f16 parity gate
+    // on SEC-dev (max |dp| 0.048 against 0.03, p99 0.0145 against 0.01; README.md, "Ampere").
+    if (env_value("SEPAL_GEMM_LT") == "1" || env_value("SEPAL_GEMM_LT_TUNE") == "1") check_blas(cublasLtCreate(&lt), "cublasLtCreate");
 
     // Weights.
     {
