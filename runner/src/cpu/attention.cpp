@@ -285,10 +285,9 @@ void run_task_flash(const AttentionGeometry& geo, Isa isa, const AttentionSegmen
                 float* const srow = scores + mb * kp * tile_floats + rr * nr; // key j at srow[(j / nr) * tile_floats + j % nr]
                 const std::size_t pos = r < rows_used ? w.pos[r] : 0;
                 if (r >= rows_used || pos < j0) {  // padding row, or no visible key in this tile: P is zero, the state is untouched
-                    for (std::size_t np = 0; np < npn; ++np) {
-                        _mm256_store_ps(srow + np * tile_floats, _mm256_setzero_ps());
-                        _mm256_store_ps(srow + np * tile_floats + 8, _mm256_setzero_ps());
-                    }
+                    // The whole panel row (nr floats: 16 on the AVX2 sets, 32 on AVX-512), not just the first 16.
+                    for (std::size_t np = 0; np < npn; ++np)
+                        for (std::size_t c = 0; c < nr; c += 8) _mm256_store_ps(srow + np * tile_floats + c, _mm256_setzero_ps());
                     continue;
                 }
                 const std::size_t valid = std::min(kn, pos - j0 + 1);
@@ -341,8 +340,7 @@ void run_task_flash(const AttentionGeometry& geo, Isa isa, const AttentionSegmen
                     float* orow = acc + mb * dpn * tile_floats + rr * nr;
                     for (std::size_t dp = 0; dp < dpn; ++dp) {
                         float* o = orow + dp * tile_floats;
-                        _mm256_store_ps(o, _mm256_mul_ps(av, _mm256_load_ps(o)));
-                        _mm256_store_ps(o + 8, _mm256_mul_ps(av, _mm256_load_ps(o + 8)));
+                        for (std::size_t c = 0; c < nr; c += 8) _mm256_store_ps(o + c, _mm256_mul_ps(av, _mm256_load_ps(o + c)));
                     }
                 }
             }
