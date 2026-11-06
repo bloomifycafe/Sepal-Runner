@@ -47,6 +47,8 @@ struct GpuDecisionOptions {
     std::size_t gemm_rows = 0;
     /// int8 weights for chosen multiply groups of the gpu-f16 trunk (off by default; see the int8 section of README.md).
     Int8Multiply int8;
+    /// gpu-w8g: which matrices are int8 (EngineOptions::int8_group).
+    Int8GroupSelect int8_group;
     /// The Gated DeltaNet layers: scan kernel, chunked tensor-core kernels, or a per-wave choice (see DeltaNetMode). gpu-f16 only.
     DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Prefix reuse (RUNNER.md section 7): a snapshot of the trunk plus the head's memory rows at a cut before the first question

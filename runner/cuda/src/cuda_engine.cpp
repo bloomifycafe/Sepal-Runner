@@ -612,33 +612,36 @@ void CudaEngine::Impl::place_weights(const TensorSource& source, char* base, Dev
         w.post_norm = reinterpret_cast<const float*>(put({pre + "post_attention_layernorm.weight"}, DType::F32, H));
         if (simt) {
             const SimtWeight st = simt_type;
-            const SimtWeight small = st == SimtWeight::Int8Group ? SimtWeight::BF16 : st; // DeltaNet b and a rows
+            const bool i8 = st == SimtWeight::Int8Group;
+            const SimtWeight small = i8 ? SimtWeight::BF16 : st; // DeltaNet b and a rows
+            const Int8GroupSelect& sel = options.int8_group;
+            const auto pick = [&](bool on) { return i8 && !on ? SimtWeight::BF16 : st; };
             if (w.attention) {
                 const std::string a = pre + "self_attn.";
                 w.kind_index = attn_seen++;
-                w.s_mixer_in = put_simt({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, attn_in_width, H, false, st);
-                w.s_mixer_out = put_simt({a + "o_proj.weight"}, H, attn_width, false, st);
+                w.s_mixer_in = put_simt({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"}, attn_in_width, H, false, pick(sel.attn_in));
+                w.s_mixer_out = put_simt({a + "o_proj.weight"}, H, attn_width, false, pick(sel.attn_out));
                 w.q_norm = reinterpret_cast<const float*>(put({a + "q_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
                 w.k_norm = reinterpret_cast<const float*>(put({a + "k_norm.weight"}, DType::F32, dim(config.attn_head_dim)));
             } else {
                 const std::string d = pre + "linear_attn.";
                 w.kind_index = dn_seen++;
-                if (st == SimtWeight::Int8Group) {
-                    w.s_mixer_in = put_simt({d + "in_proj_qkv.weight", d + "in_proj_z.weight"}, conv_dim + value_dim, H, false, st);
+                if (i8) {
+                    w.s_mixer_in = put_simt({d + "in_proj_qkv.weight", d + "in_proj_z.weight"}, conv_dim + value_dim, H, false, pick(sel.dn_in));
                     w.s_dn_ba = put_simt({d + "in_proj_b.weight", d + "in_proj_a.weight"}, 2 * dim(config.dn_value_heads), H, false, small);
                 } else {
                     w.s_mixer_in = put_simt({d + "in_proj_qkv.weight", d + "in_proj_z.weight", d + "in_proj_b.weight", d + "in_proj_a.weight"},
                                             dn_in_width, H, false, st);
                 }
-                w.s_mixer_out = put_simt({d + "out_proj.weight"}, H, value_dim, false, st);
+                w.s_mixer_out = put_simt({d + "out_proj.weight"}, H, value_dim, false, pick(sel.dn_out));
                 w.deltanet.conv = reinterpret_cast<const float*>(put({d + "conv1d.weight"}, DType::F32, conv_dim * dim(config.conv_kernel)));
                 w.deltanet.a_log = reinterpret_cast<const float*>(put({d + "A_log"}, DType::F32, dim(config.dn_value_heads)));
                 w.deltanet.dt_bias = reinterpret_cast<const float*>(put({d + "dt_bias"}, DType::F32, dim(config.dn_value_heads)));
                 w.deltanet.norm = reinterpret_cast<const float*>(put({d + "norm.weight"}, DType::F32, dim(config.dn_value_head_dim)));
             }
             const std::string mlp = pre + "mlp.";
-            w.s_gate_up = put_simt({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, 2 * I, H, true, st);
-            w.s_down = put_simt({mlp + "down_proj.weight"}, H, I, false, st);
+            w.s_gate_up = put_simt({mlp + "gate_proj.weight", mlp + "up_proj.weight"}, 2 * I, H, true, pick(sel.mlp));
+            w.s_down = put_simt({mlp + "down_proj.weight"}, H, I, false, pick(sel.mlp));
             continue;
         }
         if (w.attention) {
@@ -1922,7 +1925,11 @@ SnapshotIdentity CudaEngine::Impl::identity() {
                                             q8.int8_activations ? 1u : 0u};
     // Smoothing changes the numbers: the factors themselves are in the weight memory (weight fingerprint); this says how they are applied.
     if (smoothing) compute.insert(compute.end(), {1u, static_cast<std::uint64_t>(q8.smoothing.statistic), bits_of(static_cast<double>(q8.smoothing.alpha))});
-    if (simt) compute.insert(compute.end(), {0x51D7u, static_cast<std::uint64_t>(options.weight_storage)});
+    if (simt) {
+        const Int8GroupSelect& g = options.int8_group;
+        compute.insert(compute.end(), {0x51D7u, static_cast<std::uint64_t>(options.weight_storage), g.mlp ? 1u : 0u, g.dn_in ? 1u : 0u, g.dn_out ? 1u : 0u,
+                                       g.attn_in ? 1u : 0u, g.attn_out ? 1u : 0u});
+    }
     id.compute_fp = fingerprint_of(compute, 0xC0FFEEull);
     id.precision = half ? 0u : 1u;
     id.state_format = options.half_state ? 1u : 0u;

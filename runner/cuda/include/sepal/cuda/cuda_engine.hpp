@@ -197,11 +197,24 @@ enum class DeltaNetMode {
 /// keys, values and states stay float32 (attention: AttentionPath::TiledF32). Precision::F32 only.
 enum class WeightStorage { Float32 = 0, BF16 = 1, Int8Group = 2 };
 
+/// With WeightStorage::Int8Group: which matrices are int8 (the others stay bfloat16). The default is the int8 column of
+/// docs/RUNNER.md section 11: the MLP and the input projections int8, the DeltaNet output projection (`out_proj`, a sensitive
+/// tensor) and its in_proj_b / in_proj_a bfloat16 (those two always), the attention output projection int8.
+struct Int8GroupSelect {
+    bool mlp = true;      // gate, up, down
+    bool dn_in = true;    // DeltaNet in_proj_qkv, in_proj_z
+    bool dn_out = false;  // DeltaNet out_proj
+    bool attn_in = true;  // attention q (with its gate), k, v
+    bool attn_out = true; // attention o_proj
+};
+
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
     /// Float32 path only: see WeightStorage.
     WeightStorage weight_storage = WeightStorage::Float32;
+    /// WeightStorage::Int8Group only: see Int8GroupSelect.
+    Int8GroupSelect int8_group;
     /// When set, the embedding table stays in host memory: a call gathers its tokens' rows on the host through this function
     /// (float32, the values the table holds) into a pinned buffer and uploads them, and the device holds no table (at 4B that
     /// saves 1.27 GB as bfloat16, 2.5 GB as float32). The bits are those of the device gather of the same values. Called from

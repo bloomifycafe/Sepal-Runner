@@ -113,8 +113,15 @@ struct GpuDecisionEngine::Impl {
         eo.device = o.device;
         eo.precision = f16 ? Precision::F16 : Precision::F32;
         if (o.profile == "gpu-bf16") eo.weight_storage = WeightStorage::BF16;
-        if (o.profile == "gpu-w8g") eo.weight_storage = WeightStorage::Int8Group;
+        if (o.profile == "gpu-w8g") {
+            eo.weight_storage = WeightStorage::Int8Group;
+            eo.int8_group = o.int8_group;
+        }
         if (simt) {
+            // DeltaNet state slots: a call holds one per row that is continued (a long request cut into calls holds one at a time) and
+            // the prefix cache one per entry; the rest of the budget goes to the float32 keys and values (64 KiB a token at 4B), not 40%
+            // of it to slots as the engine's default would (a 24k-token request then fits an 8 GB card under gpu-w8g).
+            eo.state_slots = (options.prefix_cache ? options.prefix_entries : 0) + 8;
             // The embedding table stays on the host (the head reads its rows there already): 1.27 GB of VRAM at 4B.
             const TrainedModel* held = &model;
             eo.host_embedding = [held](std::uint32_t token, float* out) { held->embedding_row(token, out); };
