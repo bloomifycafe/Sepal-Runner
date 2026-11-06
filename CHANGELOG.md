@@ -30,6 +30,12 @@ logs: Sepal `reports/runner-broadwell/exact-track/`).
   softmax equals softmax over an abstract exp field. fp32 error bound of online vs two-pass softmax in `proofs/LEAN-NOTES.md`
   section 10.4 (prose, not machine-checked).
 - Tools: `sepal-cpu-gemm-bench --schedule a,b --measure-peak 1`; new `sepal-cpu-attn-bench`.
+- Tried and not kept (same box, numbers in the logs): `fused` without the prefetch, layer mix +0.4% at 12 cores (fused-prefetch
+  +3.5%); other task blockings with fused-prefetch (cols 128/192/256, rows 84/60/48, row-major order), no change beyond the host's
+  +-5% noise at one core, so the cache-derived blocking stays; the first flash version (tile layout, in-kernel accumulation, panel-outer
+  loops, but with a 64-bit division per 8 softmax scores) was only +1 to +3% at 16k, profiling with rdtsc showed the softmax at 25% of
+  the attention time, removing the division gave the +15 to +18%. Profile of the 16k log after both changes (12 cores): matrix products
+  146 s of 178 s, attention 24 s, DeltaNet 5.3 s, other 3.0 s; nothing outside the GEMM is large enough for a bigger exact win.
 
 ### 2026-11-05: LONG-LOG parity traced to the reference's bf16 error
 
