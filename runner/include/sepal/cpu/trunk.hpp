@@ -20,6 +20,7 @@
 #include "sepal/config.hpp"
 #include "sepal/cpu/aligned.hpp"
 #include "sepal/cpu/attention.hpp"
+#include "sepal/cpu/gemm.hpp"
 #include "sepal/cpu/isa.hpp"
 #include "sepal/cpu/thread_pool.hpp"
 #include "sepal/weights.hpp"
@@ -51,6 +52,8 @@ struct TrunkOptions {
     bool force_isa = false;                  // use `isa` instead of the best one
     Isa isa = Isa::Avx2;
     std::string cpus;                        // CPU list for the thread pool ("0-11"); empty: all allowed (or SEPAL_CPU_SET)
+    std::string gemm;                        // GEMM mode of the float weights (classical, strassen1, winograd1; prototype, see
+                                             // sepal/cpu/gemm.hpp); empty: SEPAL_CPU_GEMM, else classical
 };
 
 /// Wall-clock milliseconds of the last `forward`, by kind of work.
@@ -104,6 +107,7 @@ public:
     const ModelConfig& config() const;
     const TrunkOptions& options() const;
     Isa isa() const;
+    GemmMode gemm_mode() const;
     unsigned threads() const;
     ThreadPool& pool();
     std::uint64_t weight_bytes() const;

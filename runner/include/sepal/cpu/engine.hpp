@@ -29,6 +29,7 @@ struct CpuEngineOptions {
     bool force_isa = false;
     Isa isa = Isa::Avx2;
     std::string cpus;                        // CPU list of the thread pool, e.g. "0-11" (Linux); empty: every allowed CPU
+    std::string gemm;                        // GEMM mode (TrunkOptions::gemm): empty = SEPAL_CPU_GEMM, else classical
 };
 
 /// Parses "cpu-f32" / "cpu-bf16" / "cpu-q8"; throws std::invalid_argument for anything else.

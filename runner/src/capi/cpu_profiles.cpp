@@ -2,7 +2,8 @@
 //   cpu-f32, cpu-bf16, cpu-q8: packed-GEMM trunk + CPU Clef head (sepal/cpu/engine.hpp).
 // Extra option keys: "chunk_tokens", "step_tokens", "delta_chunk", "group_tokens" (numbers), "cpus" (the CPU list of the
 // thread pool, e.g. "0-11"), "cpu_isa" (the kernel set: "auto", "avx2", "avx2-tuned", "avx512"; a set the CPU lacks is refused
-// with the missing features named) and, for cpu-q8, "q8" (a string naming the int8 groups: any of "mlp", "attn", "dn_in";
+// with the missing features named), "cpu_gemm" (the GEMM mode: "classical", "strassen1", "winograd1"; a prototype, off by
+// default; SEPAL_CPU_GEMM sets it when the key is absent) and, for cpu-q8, "q8" (a string naming the int8 groups: any of "mlp", "attn", "dn_in";
 // default all three).
 #include "sepal/cpu/engine.hpp"
 #include "sepal/engine.hpp"
@@ -31,6 +32,7 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
         cpu::require_isa(opt.isa);
         opt.force_isa = true;
     }
+    if (const auto it = o.extra.find("cpu_gemm"); it != o.extra.end()) opt.gemm = cpu::name_of(cpu::parse_gemm_mode(it->second.as_string()));
     if (const auto it = o.extra.find("q8"); it != o.extra.end()) {
         const std::string& s = it->second.as_string();
         opt.q8.mlp = s.find("mlp") != std::string::npos;
@@ -47,7 +49,7 @@ std::unique_ptr<DecisionEngine> make_fast(const std::string& profile, const Engi
 void register_backend_profiles() {
     register_ref_profiles();
     const std::vector<std::string> keys = {"chunk_tokens", "step_tokens", "delta_chunk", "group_tokens", "prefix_cache_mib", "prefix_min_tokens",
-                                           "cpus", "cpu_isa"};
+                                           "cpus", "cpu_isa", "cpu_gemm"};
     for (const char* name : {"cpu-f32", "cpu-bf16"}) {
         const std::string profile = name;
         register_profile({profile, "cpu", keys, [profile](const EngineOptions& o) { return make_fast(profile, o); }});

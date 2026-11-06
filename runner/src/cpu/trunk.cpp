@@ -147,6 +147,7 @@ struct CpuTrunk::Impl {
     ModelConfig cfg;
     TrunkOptions opt;
     Isa isa;
+    GemmMode gemm_mode;
     ThreadPool pool;
     EmbeddingFn embed;
     std::vector<Layer> layers;
@@ -164,7 +165,13 @@ struct CpuTrunk::Impl {
     ActsCache acts_h, acts_c;
 
     Impl(const ModelConfig& c, const TrunkOptions& o, EmbeddingFn e)
-        : cfg(c), opt(o), isa(o.force_isa ? (require_isa(o.isa), o.isa) : best_isa()), pool(o.threads, o.cpus), embed(std::move(e)) {}
+        : cfg(c), opt(o), isa(o.force_isa ? (require_isa(o.isa), o.isa) : best_isa()),
+          gemm_mode(o.gemm.empty() ? gemm_mode_from_env() : parse_gemm_mode(o.gemm)), pool(o.threads, o.cpus), embed(std::move(e)) {}
+
+    // The fast GEMM mode for a float weight (no-op for the classical mode, int8 weights and shapes it does not cover).
+    void fast(PackedWeight& w) {
+        if (gemm_mode != GemmMode::Classical) prepare_fast_gemm(w, gemm_mode, pool);
+    }
 
     WeightKind kind_for(bool int8_group) const {
         switch (opt.profile) {
@@ -228,6 +235,8 @@ void CpuTrunk::Impl::build(const WeightSource& source) {
         const Weights<float> mlp_w = lw.scope("mlp");
         L.gate_up = pack_weight_swiglu(mlp_w["gate_proj.weight"].data(), mlp_w["up_proj.weight"].data(), H, I, H, k_gate_up, isa, pool);
         L.down = pack_weight(mlp_w["down_proj.weight"].data(), I, H, I, k_down, isa, pool);
+        fast(L.gate_up);
+        fast(L.down);
         weight_bytes += L.gate_up.bytes() + L.down.bytes();
         if (L.attention) {
             const Weights<float> a = lw.scope("self_attn");
@@ -237,6 +246,8 @@ void CpuTrunk::Impl::build(const WeightSource& source) {
             L.at.o = pack_weight(a["o_proj.weight"].data(), heads * hd, H, heads * hd, k_attn, isa, pool);
             L.at.q_norm1 = one_plus(a["q_norm.weight"]);
             L.at.k_norm1 = one_plus(a["k_norm.weight"]);
+            fast(L.at.qkv);
+            fast(L.at.o);
             weight_bytes += L.at.qkv.bytes() + L.at.o.bytes();
             ++n_attn;
         } else {
@@ -253,6 +264,9 @@ void CpuTrunk::Impl::build(const WeightSource& source) {
             L.dn.a_log = copy_of(d["A_log"]);
             L.dn.dt_bias = copy_of(d["dt_bias"]);
             L.dn.norm_w = copy_of(d["norm.weight"]);
+            fast(L.dn.in_qz);
+            fast(L.dn.ab);
+            fast(L.dn.out);
             weight_bytes += L.dn.in_qz.bytes() + L.dn.ab.bytes() + L.dn.out.bytes();
             ++n_dn;
         }
@@ -518,6 +532,7 @@ CpuTrunk::~CpuTrunk() = default;
 const ModelConfig& CpuTrunk::config() const { return impl_->cfg; }
 const TrunkOptions& CpuTrunk::options() const { return impl_->opt; }
 Isa CpuTrunk::isa() const { return impl_->isa; }
+GemmMode CpuTrunk::gemm_mode() const { return impl_->gemm_mode; }
 unsigned CpuTrunk::threads() const { return impl_->pool.size(); }
 ThreadPool& CpuTrunk::pool() { return impl_->pool; }
 std::uint64_t CpuTrunk::weight_bytes() const { return impl_->weight_bytes; }

@@ -37,6 +37,7 @@ public:
         t.force_isa = options.force_isa;
         t.isa = options.isa;
         t.cpus = options.cpus;
+        t.gemm = options.gemm;
         trunk_ = std::make_unique<CpuTrunk>(
             model_.config(), [this](const std::string& scope) { return model_.merged_scope<float>(scope); },
             [this](std::uint32_t token, float* out) { model_.embedding_row(token, out); }, t);
@@ -172,7 +173,7 @@ public:
         return std::string("kernels ") + name_of(isa) + " (" + name_of(v) + " " + std::to_string(info(v).mr) + "x" + std::to_string(info(v).nr) +
                ", kc " + std::to_string(b.kc) + ", rows " + std::to_string(b.rows) + ", cols " + std::to_string(b.cols) + "; L1D " +
                std::to_string(cs.l1d / 1024) + " KiB, L2 " + std::to_string(cs.l2 / 1024) + " KiB, L3 " + std::to_string(cs.l3 / 1024) +
-               " KiB) on " + features().brand + "; " + trunk_->pool().layout();
+               " KiB), gemm " + name_of(trunk_->gemm_mode()) + " on " + features().brand + "; " + trunk_->pool().layout();
     }
     std::uint64_t max_tokens() const override { return options_.max_tokens; }
     ScoreTimes last_times() const override { return times_; }

@@ -406,3 +406,153 @@ SEPAL_TEST(cpu_gemm, provider_interface) {
     CHECK(worst < 1e-5);
     CHECK_THROWS(fast->gemm_f(ConstMatView(x.data(), s.rows, s.k), ConstMatView(w.data(), s.n, s.k - 1), MatView(got.data(), s.rows, s.n), 0.0f), std::invalid_argument);
 }
+
+// ---- fast mode (one level of Strassen / Winograd; prototype) ----------------------------------------------------------
+
+namespace {
+
+// Runs one product in `mode` on the tuned AVX2 set (fast threshold lowered to one row), packing `w` [n, k] (or a SwiGLU pair).
+std::vector<float> run_fast(const std::vector<float>& x, const std::vector<float>& w, const std::vector<float>* up, std::size_t rows,
+                            std::size_t n, std::size_t k, WeightKind kind, GemmMode mode, unsigned threads, bool* applied = nullptr,
+                            const std::vector<float>* base = nullptr) {
+    ThreadPool pool(threads);
+    PackedWeight pw = up != nullptr ? pack_weight_swiglu(w.data(), up->data(), k, n, k, kind, Isa::Avx2Tuned, pool)
+                                    : pack_weight(w.data(), k, n, k, kind, Isa::Avx2Tuned, pool);
+    const bool ok = prepare_fast_gemm(pw, mode, pool);
+    if (applied != nullptr) *applied = ok;
+    PackedActs pa;
+    pack_acts(pa, x.data(), k, rows, k, pw.variant(), pool);
+    std::vector<float> y = base != nullptr ? *base : std::vector<float>(rows * n, -7.0f);
+    set_fast_gemm_min_rows(1);
+    gemm_packed(pw, pa, y.data(), n, base != nullptr, pool);
+    set_fast_gemm_min_rows(0);
+    return y;
+}
+
+} // namespace
+
+SEPAL_TEST(cpu_gemm, fast_products_satisfy_the_brent_equations) {
+    // sum_p a_p[A_xy] b_p[B_yz'] c_p[C_x'z] = 1 exactly when y = y', x = x', z = z' (C = A B), else 0: the 7 products compute the 2x2 product
+    // over any ring.
+    for (const GemmMode mode : {GemmMode::Strassen1, GemmMode::Winograd1}) {
+        const FastProduct* p = fast_products(mode);
+        CHECK(p != nullptr);
+        bool ok = true;
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b)
+                for (int c = 0; c < 4; ++c) {
+                    int sum = 0;
+                    for (int i = 0; i < 7; ++i) sum += p[i].a[a] * p[i].b[b] * p[i].c[c];
+                    const bool want = a % 2 == b / 2 && a / 2 == c / 2 && b % 2 == c % 2;
+                    ok = ok && sum == (want ? 1 : 0);
+                }
+        CHECK(ok);
+    }
+    CHECK(fast_products(GemmMode::Classical) == nullptr);
+    CHECK(parse_gemm_mode("strassen1") == GemmMode::Strassen1);
+    CHECK(parse_gemm_mode("") == GemmMode::Classical);
+    CHECK_THROWS(parse_gemm_mode("strassen9"), std::invalid_argument);
+}
+
+SEPAL_TEST(cpu_gemm, fast_modes_match_float64) {
+    if (!isa_supported(Isa::Avx2Tuned)) return;
+    // Odd row counts (a padded row block, an odd block count), n with a partial last panel, several k slices.
+    const Shape fast_shapes[] = {{13, 32, 6}, {29, 60, 100}, {37, 64, 70}, {97, 96, 258}, {200, 160, 1024}, {61, 128, 2600}};
+    for (const WeightKind kind : {WeightKind::F32, WeightKind::BF16}) {
+        for (const GemmMode mode : {GemmMode::Strassen1, GemmMode::Winograd1}) {
+            double worst_fast = 0, worst_classical = 0, worst_rel = 0;
+            for (const Shape s : fast_shapes) {
+                const auto x = random_matrix(s.rows, s.k, 41);
+                auto w = random_matrix(s.n, s.k, 42);
+                bool applied = false;
+                const auto y = run_fast(x, w, nullptr, s.rows, s.n, s.k, kind, mode, 3, &applied);
+                CHECK(applied);
+                const auto classical = run_gemm(x, w, s.rows, s.n, s.k, kind, Isa::Avx2Tuned, 3);
+                if (kind == WeightKind::BF16)
+                    for (float& v : w) v = round_bf16(v);
+                std::vector<double> ref, bound;
+                reference(x, w, s.rows, s.n, s.k, ref, bound);
+                // Normwise: Strassen has no componentwise bound, only ||C - C^|| <= c(n) u ||A|| ||B||.
+                double scale = 0, ref_max = 0, err = 0, err_classical = 0;
+                for (std::size_t i = 0; i < y.size(); ++i) {
+                    scale = std::max(scale, bound[i]);
+                    ref_max = std::max(ref_max, std::fabs(ref[i]));
+                    err = std::max(err, std::fabs(y[i] - ref[i]));
+                    err_classical = std::max(err_classical, std::fabs(classical[i] - ref[i]));
+                }
+                worst_fast = std::max(worst_fast, err / scale);
+                worst_classical = std::max(worst_classical, err_classical / scale);
+                worst_rel = std::max(worst_rel, err / ref_max);
+            }
+            std::printf("  %s %s: max |y - y64| / max (|x||w|) %.2e (classical %.2e); max |y - y64| / max |y64| %.2e\n", name_of(mode),
+                        name_of(kind), worst_fast, worst_classical, worst_rel);
+            CHECK(worst_fast < 1e-6);
+            CHECK(worst_rel < 1e-5);
+        }
+    }
+}
+
+SEPAL_TEST(cpu_gemm, fast_modes_swiglu_accumulate_and_threads) {
+    if (!isa_supported(Isa::Avx2Tuned)) return;
+    const Shape s{75, 96, 300};
+    const auto x = random_matrix(s.rows, s.k, 51);
+    const auto gate = random_matrix(s.n, s.k, 52);
+    const auto up = random_matrix(s.n, s.k, 53);
+    const auto base = random_matrix(s.rows, s.n, 54);
+    for (const WeightKind kind : {WeightKind::F32, WeightKind::BF16}) {
+        for (const GemmMode mode : {GemmMode::Strassen1, GemmMode::Winograd1}) {
+            // The thread count changes no bit.
+            const auto one = run_fast(x, gate, nullptr, s.rows, s.n, s.k, kind, mode, 1);
+            for (const unsigned threads : {2u, 5u}) {
+                const auto many = run_fast(x, gate, nullptr, s.rows, s.n, s.k, kind, mode, threads);
+                CHECK(std::memcmp(one.data(), many.data(), one.size() * sizeof(float)) == 0);
+            }
+            // Accumulate adds the same product to y.
+            const auto acc = run_fast(x, gate, nullptr, s.rows, s.n, s.k, kind, mode, 3, nullptr, &base);
+            bool same = true;
+            for (std::size_t i = 0; i < acc.size(); ++i) same = same && acc[i] == base[i] + one[i];
+            CHECK(same);
+            // SwiGLU: silu(gate) * up of the fast products, close to the classical pair.
+            const auto fast = run_fast(x, gate, &up, s.rows, s.n, s.k, kind, mode, 4);
+            ThreadPool pool(4);
+            const PackedWeight pw = pack_weight_swiglu(gate.data(), up.data(), s.k, s.n, s.k, kind, Isa::Avx2Tuned, pool);
+            PackedActs pa;
+            pack_acts(pa, x.data(), s.k, s.rows, s.k, pw.variant(), pool);
+            std::vector<float> classical(s.rows * s.n);
+            gemm_packed(pw, pa, classical.data(), s.n, false, pool);
+            // Normwise, as above (silu(g) u amplifies the error of g by |u|).
+            double diff = 0, top = 0;
+            for (std::size_t i = 0; i < fast.size(); ++i) {
+                diff = std::max(diff, std::fabs(static_cast<double>(fast[i]) - classical[i]));
+                top = std::max(top, std::fabs(static_cast<double>(classical[i])));
+            }
+            CHECK(diff / top < 1e-5);
+        }
+    }
+}
+
+SEPAL_TEST(cpu_gemm, fast_modes_fall_back_to_the_classical_schedule) {
+    if (!isa_supported(Isa::Avx2Tuned)) return;
+    // An odd number of panels or an odd k leaves the weight classical; one row block (and fewer rows than the threshold) runs classical.
+    const Shape fallback[] = {{40, 48, 64}, {40, 64, 129}, {6, 64, 64}};
+    for (const Shape s : fallback) {
+        const auto x = random_matrix(s.rows, s.k, 61);
+        const auto w = random_matrix(s.n, s.k, 62);
+        bool applied = true;
+        const auto y = run_fast(x, w, nullptr, s.rows, s.n, s.k, WeightKind::BF16, GemmMode::Strassen1, 2, &applied);
+        CHECK_EQ(applied, s.rows == 6);
+        const auto classical = run_gemm(x, w, s.rows, s.n, s.k, WeightKind::BF16, Isa::Avx2Tuned, 2);
+        CHECK(std::memcmp(y.data(), classical.data(), y.size() * sizeof(float)) == 0);
+    }
+    ThreadPool pool(2);
+    const auto w = random_matrix(64, 64, 63);
+    PackedWeight generic = pack_weight(w.data(), 64, 64, 64, WeightKind::BF16, Isa::Avx2, pool);
+    CHECK(!prepare_fast_gemm(generic, GemmMode::Strassen1, pool));
+    PackedWeight tuned = pack_weight(w.data(), 64, 64, 64, WeightKind::BF16, Isa::Avx2Tuned, pool);
+    CHECK(prepare_fast_gemm(tuned, GemmMode::Strassen1, pool));
+    CHECK_EQ(tuned.fast_bytes(), std::size_t{5 * 64 * 64});  // 5 sums of n/2 x k/2 floats = 5 n k bytes
+    CHECK(prepare_fast_gemm(tuned, GemmMode::Winograd1, pool));
+    CHECK_EQ(tuned.fast_bytes(), std::size_t{4 * 64 * 64});
+    CHECK(!prepare_fast_gemm(tuned, GemmMode::Classical, pool));
+    CHECK_EQ(tuned.fast_bytes(), std::size_t{0});
+}

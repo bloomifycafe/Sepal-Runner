@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### 2026-11-06: one-level Strassen / Winograd GEMM (prototype, opt in, off by default)
+
+`SEPAL_CPU_GEMM=strassen1|winograd1` (or the `cpu_gemm` open option) runs the tuned AVX2 float GEMMs (`F32_Y3`, `BF16_Y3`) as one level of a
+7-product 2x2 algorithm in the Strassen Reloaded form: the weight-side sums are precomputed at load in float32 (exact unless two bf16 exponents
+differ by more than 15; 5 n k extra bytes for Strassen, 4 n k for Winograd, i.e. 2.5x and 2x the bf16 weight), the activation-side sums are
+formed once per call from the packed blocks, single quadrants are read in place, and each product tile is added with its sign into its output
+quadrants after its last k slice. The micro-kernels are unchanged. Applies to products of at least `SEPAL_FAST_GEMM_MIN_ROWS` rows (512) with an
+even k and an even panel count; everything else stays classical. It gives up two determinism rules: an output is no longer one chain in increasing
+k, and a row's result depends on the row it is paired with (t and t + rows/2), so on the batch; thread counts still change no bit. Max error
+against float64 on small and odd shapes: 2.4e-7 (Strassen) and 4.0e-7 (Winograd) of max |x||w|, against 1.7e-7 classical. PC (Ryzen 7600X,
+MSVC intrinsics, avx2-tuned, rows 1024) layer mix: 1 thread +3.7% / +6.7%, 6 threads +5.6% / +7.5%. Broadwell measurement pending.
+`sepal-cpu-gemm-bench --gemm classical,strassen1,winograd1 --measure-peak 1` compares the modes interleaved.
+
 ### 2026-11-05: LONG-LOG parity traced to the reference's bf16 error
 
 The LONG-LOG failure of the `cpu-bf16` gate (every CPU path, `cpu-f32` too) comes from the reference rows, not from the runner. An fp32 PyTorch
