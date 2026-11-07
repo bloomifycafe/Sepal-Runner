@@ -197,15 +197,17 @@ enum class DeltaNetMode {
 /// keys, values and states stay float32 (attention: AttentionPath::TiledF32). Precision::F32 only.
 enum class WeightStorage { Float32 = 0, BF16 = 1, Int8Group = 2 };
 
-/// With WeightStorage::Int8Group: which matrices are int8 (the others stay bfloat16). The default is the int8 column of
-/// docs/RUNNER.md section 11: the MLP and the input projections int8, the DeltaNet output projection (`out_proj`, a sensitive
-/// tensor) and its in_proj_b / in_proj_a bfloat16 (those two always), the attention output projection int8.
+/// With WeightStorage::Int8Group: which matrices are int8 (the others stay bfloat16; the DeltaNet in_proj_b / in_proj_a always do).
+/// The default is the MLP only (gate, up, down: 63% of the trunk's weights). Measured on Sepal-4B, LONG-LOG n12 against cpu-f32
+/// (the fp32 truth), max |dp| / flips of 162: MLP only 0.048 / 0; MLP and attention 0.101 / 1; MLP, attention and the DeltaNet input
+/// projections (the int8 column of docs/RUNNER.md section 11) 0.143 / 1; gpu-bf16 0.032 / 0 (runner/cuda/README.md, "Pascal").
+/// The other sets trade that accuracy on long logs for memory (3.6 GiB of weights instead of 4.6 at 4B).
 struct Int8GroupSelect {
-    bool mlp = true;      // gate, up, down
-    bool dn_in = true;    // DeltaNet in_proj_qkv, in_proj_z
-    bool dn_out = false;  // DeltaNet out_proj
-    bool attn_in = true;  // attention q (with its gate), k, v
-    bool attn_out = true; // attention o_proj
+    bool mlp = true;       // gate, up, down
+    bool dn_in = false;    // DeltaNet in_proj_qkv, in_proj_z
+    bool dn_out = false;   // DeltaNet out_proj
+    bool attn_in = false;  // attention q (with its gate), k, v
+    bool attn_out = false; // attention o_proj
 };
 
 struct EngineOptions {

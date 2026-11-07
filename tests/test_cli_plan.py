@@ -98,7 +98,7 @@ def test_1080_ti_gets_gpu_bf16():
 @pytest.mark.parametrize("card", [GTX_1080, GTX_1070])
 def test_8gb_pascal_cards_get_gpu_w8g_with_a_note_that_it_stores_int8(card):
     plan = cli.make_plan(FOUR_B, hw(32, card, cc=6.1), 24576, args())
-    assert plan.profile == "gpu-w8g" and plan.window >= 4096 and plan.engine_options["max_call_tokens"] == 2048
+    assert plan.profile == "gpu-w8g" and plan.window >= 4096 and plan.engine_options["max_call_tokens"] in (1024, 2048)
     assert any("int8 weights" in n and "128" in n for n in plan.notes)
     assert plan.engine_options["trunk_budget_mib"] < 7500                       # inside the 7.5 GiB the card has free
 
@@ -176,9 +176,9 @@ def test_existing_profiles_keep_their_device_figures():
 def test_gpu_bf16_and_gpu_w8g_device_figures():
     bf16, outside = cli.gpu_need(FOUR_B, "gpu-bf16", 24576, 2048)
     w8g, _ = cli.gpu_need(FOUR_B, "gpu-w8g", 24576, 2048)
-    # weights 6.65 GiB (bf16) / 3.69e9 bytes (int8 + scales), buffers 174 KB a call token, float32 K/V 64 KiB a token, 4 slots of 50.3 MiB.
+    # weights 6.65 GiB (bf16) / 4.95e9 bytes (MLP int8 + scales, the rest bf16), buffers 174 KB a call token, float32 K/V 64 KiB a token, 4 slots of 50.3 MiB.
     extra = 2048 * 174 * 1024 + int(1.15 * 24576 * 65536) + 4 * FOUR_B.slot_bytes + (64 << 20)
-    assert abs(bf16 - (7.14e9 + extra)) < 1e6 and abs(w8g - (3.69e9 + extra)) < 5e7
+    assert abs(bf16 - (7.14e9 + extra)) < 1e6 and abs(w8g - (4.95e9 + extra)) < 5e7
     assert outside == cli.gpu_need(FOUR_B, "gpu-f16", 24576, 2048)[1]
     # float32 keys and values cost twice the binary16 bytes per token of context
     assert cli.gpu_need(FOUR_B, "gpu-bf16", 24576, 2048)[0] - cli.gpu_need(FOUR_B, "gpu-bf16", 12288, 2048)[0] == pytest.approx(1.15 * 12288 * 65536, abs=1)

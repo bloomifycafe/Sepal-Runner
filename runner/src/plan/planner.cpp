@@ -75,10 +75,9 @@ const std::vector<PrecisionProfile>& precision_profiles() {
 
         PrecisionProfile w8g = bf16;
         w8g.id = "gpu-w8g";
-        w8g.mlp = DType::I8;
-        w8g.mixer_proj = DType::I8;
-        w8g.dn_out_proj = DType::I8;      // out_proj joins the int8 matrices ...
-        w8g.dn_sensitive = DType::BF16;   // ... in_proj_a and in_proj_b stay bfloat16
+        w8g.mlp = DType::I8;              // the default int8 set of the CUDA engine (Int8GroupSelect): the MLP only;
+        w8g.mixer_proj = DType::BF16;     // the attention and DeltaNet projections stay bfloat16 (long-log accuracy,
+        w8g.dn_sensitive = DType::BF16;   // runner/cuda/README.md, "Pascal")
         w8g.scale_group = 128;
         v.push_back(w8g);
         return v;

@@ -104,9 +104,8 @@ Weights<float> stored_weights(const ModelConfig& cfg, const Weights<float>& w, W
         if (storage == WeightStorage::BF16 && (matrix || embedding)) {
             for (std::size_t i = 0; i < t.size(); ++i) t[i] = bf16_round(t[i]);
         } else if (storage == WeightStorage::Int8Group) {
-            // bfloat16 under the default Int8GroupSelect: the DeltaNet's in_proj_b / in_proj_a and its out_proj.
-            const bool ba = name.find("in_proj_b.weight") != std::string::npos || name.find("in_proj_a.weight") != std::string::npos ||
-                            name.find("linear_attn.out_proj.weight") != std::string::npos;
+            // Under the default Int8GroupSelect only the MLP is int8; every other matrix is bfloat16.
+            const bool ba = name.find(".mlp.") == std::string::npos;
             if (embedding || (matrix && ba)) {
                 for (std::size_t i = 0; i < t.size(); ++i) t[i] = bf16_round(t[i]);
             } else if (matrix) {

@@ -309,18 +309,16 @@ SEPAL_TEST(planner, pascal_profiles_weights_at_4b) {
 
     CHECK(w8g_bytes < bf16_bytes);
     CHECK(bf16_bytes < 2 * w8g_bytes);
-    // gpu-w8g: the CUDA library's computed 3.69e9 bytes at 4B (int8 bytes + 3.1% scales + the small tensors), within 2%.
-    CHECK_NEAR(static_cast<double>(w8g_bytes), 3.69e9, 0.02 * 3.69e9);
+    // gpu-w8g (the MLP int8 with 3.1% of scales, every other matrix bfloat16): 4.95e9 bytes at 4B, within 2%.
+    CHECK_NEAR(static_cast<double>(w8g_bytes), 4.95e9, 0.02 * 4.95e9);
     // gpu-bf16: every matrix at 2 bytes, the small tensors at 4; 6.65 GiB measured on the device.
     CHECK_NEAR(static_cast<double>(bf16_bytes) / (1024.0 * 1024.0 * 1024.0), 6.65, 0.02);
 
-    // Exact by hand. The DeltaNet in_proj_b and in_proj_a (2 x hidden x value heads per layer) stay bfloat16 in gpu-w8g;
-    // the other classes are int8. Every input width at 4B is a multiple of 128, so the float32 scales are
-    // (int8 values / 128) x 4 bytes.
-    const std::uint64_t gates = c.num_deltanet_layers() * 2 * c.hidden_size * c.dn_value_heads;
-    const std::uint64_t int8_values = n.mlp + n.mixer_proj + (n.dn_sensitive - gates);
+    // Exact by hand. Only the MLP is int8 in gpu-w8g; the mixer projections and the DeltaNet out_proj / in_proj_a / in_proj_b
+    // stay bfloat16. Every input width at 4B is a multiple of 128, so the float32 scales are (int8 values / 128) x 4 bytes.
+    const std::uint64_t int8_values = n.mlp;
     CHECK_EQ(bf16_bytes, 2 * (n.mlp + n.mixer_proj + n.dn_sensitive) + 4 * n.small);
-    CHECK_EQ(w8g_bytes, int8_values + 4 * (int8_values / 128) + 2 * gates + 4 * n.small);
+    CHECK_EQ(w8g_bytes, int8_values + 4 * (int8_values / 128) + 2 * (n.mixer_proj + n.dn_sensitive) + 4 * n.small);
     CHECK_EQ(int8_values % 128, 0u);
     CHECK_EQ(w8g.scale_group, 128u);
     CHECK_EQ(bf16.scale_group, 0u);
@@ -349,15 +347,21 @@ SEPAL_TEST(planner, group_scales_round_up_per_row) {
     const std::uint64_t h = c.hidden_size;
     const std::uint64_t i = c.intermediate_size;
     const auto rows_x_groups = [](std::uint64_t rows, std::uint64_t inputs) { return rows * ((inputs + 127) / 128); };
-    const std::uint64_t expected =
-        c.num_layers * (2 * rows_x_groups(i, h) + rows_x_groups(h, i)) +
-        c.num_attention_layers() * (rows_x_groups(c.attn_in_proj_width(), h) + rows_x_groups(h, c.attn_width())) +
-        c.num_deltanet_layers() * (rows_x_groups(c.dn_conv_dim(), h) + rows_x_groups(c.dn_value_dim(), h) +
-                                   rows_x_groups(h, c.dn_value_dim()));
+    // gpu-w8g's int8 set is the MLP (gate and up [I, H], down [H, I]).
+    const std::uint64_t expected = c.num_layers * (2 * rows_x_groups(i, h) + rows_x_groups(h, i));
     CHECK_EQ(trunk_weight_bytes(c, w8g) - trunk_weight_bytes(c, no_scales), 4 * expected);
     const ParamCounts n = count_params(c);
-    const std::uint64_t gates = c.num_deltanet_layers() * 2 * h * c.dn_value_heads;
-    CHECK(expected > (n.mlp + n.mixer_proj + (n.dn_sensitive - gates)) / 128); // rounding up gives more than the plain division
+    CHECK(expected > n.mlp / 128); // rounding up gives more than the plain division
+    // A profile with every mixer matrix in int8 counts their scales too.
+    PrecisionProfile wide = w8g;
+    wide.mixer_proj = DType::I8;
+    wide.dn_out_proj = DType::I8;
+    PrecisionProfile wide_no_scales = wide;
+    wide_no_scales.scale_group = 0;
+    const std::uint64_t expected_wide =
+        expected + c.num_attention_layers() * (rows_x_groups(c.attn_in_proj_width(), h) + rows_x_groups(h, c.attn_width())) +
+        c.num_deltanet_layers() * (rows_x_groups(c.dn_conv_dim(), h) + rows_x_groups(c.dn_value_dim(), h) + rows_x_groups(h, c.dn_value_dim()));
+    CHECK_EQ(trunk_weight_bytes(c, wide) - trunk_weight_bytes(c, wide_no_scales), 4 * expected_wide);
 }
 
 SEPAL_TEST(planner, pascal_profiles_state_embedding_and_budgets) {
@@ -370,8 +374,8 @@ SEPAL_TEST(planner, pascal_profiles_state_embedding_and_budgets) {
         CHECK_EQ(snapshot_bytes(c, p, 600), 600ull * 65536ull + 50331648ull + 2359296ull);
     }
     CHECK(profile("gpu-bf16").mlp == DType::BF16 && profile("gpu-bf16").embedding == DType::BF16);
-    CHECK(profile("gpu-w8g").mlp == DType::I8 && profile("gpu-w8g").mixer_proj == DType::I8);
-    CHECK(profile("gpu-w8g").dn_out_proj == DType::I8 && profile("gpu-w8g").dn_sensitive == DType::BF16);
+    CHECK(profile("gpu-w8g").mlp == DType::I8 && profile("gpu-w8g").mixer_proj == DType::BF16);
+    CHECK(!profile("gpu-w8g").dn_out_proj.has_value() && profile("gpu-w8g").dn_sensitive == DType::BF16);
 
     // The embedding table (bfloat16, 248,320 x 2,560) stays on the host unless the request says otherwise.
     for (const char* id : {"gpu-bf16", "gpu-w8g"}) {

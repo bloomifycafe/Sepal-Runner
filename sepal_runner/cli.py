@@ -7,13 +7,13 @@
 Profiles chosen automatically: on a CUDA card of compute capability 8.0 or later (RTX 30xx and newer, A100), `gpu-f16` on 12 GB and up when
 the plan fits, otherwise `cpu-bf16`. On a card below 8.0 (Pascal: GTX 10xx, Tesla P40; Volta and Turing too) the binary16 profiles `gpu-f16`
 and `gpu-q8w` cannot run (they need tensor-core kernels) and are refused by name; `auto` takes `gpu-bf16` (bfloat16 weights, float32
-arithmetic on ordinary CUDA cores) when its plan fits, else `gpu-w8g` (the same arithmetic over int8 weights with a float32 scale per group of
-128 input values, about half the weight memory), else `cpu-bf16`. `gpu-bf16` and `gpu-w8g` can also be asked for with `--profile` on any CUDA
+arithmetic on ordinary CUDA cores) when its plan fits, else `gpu-w8g` (the same arithmetic with the MLP weights int8, a float32 scale per
+group of 128 input values; 70% of the weight memory), else `cpu-bf16`. `gpu-bf16` and `gpu-w8g` can also be asked for with `--profile` on any CUDA
 card, but on a card with tensor cores `gpu-f16` is about four times faster. The compute capability comes from `nvidia-smi`; a driver too old
 to report it counts as unknown, and unknown is treated as a modern card.
 `gpu-q8w` and `cpu-q8` (int8) exceed the q8 parity gate on this model (max |dp| on near-tie questions), so they are used only with `--allow-q8`,
-with a printed warning. `gpu-w8g` is weight-only int8 as well; its parity is still being measured, it is not behind `--allow-q8`, and it
-always prints a note saying that it stores int8 weights.
+with a printed warning. `gpu-w8g` is weight-only int8 (MLP only) and stays within the q8 gate against its float twin (runner/cuda/README.md,
+"Pascal"); it is not behind `--allow-q8` and always prints a note saying that it stores int8 weights.
 A model that fits neither is refused with the numbers and what would fit, before any weights are loaded.
 
 Only public downloads, without login, unless $HF_TOKEN is set (the Sepal repositories are gated: accept the terms on the Hub first).
@@ -41,7 +41,7 @@ SIMT_PROFILES = ("gpu-bf16", "gpu-w8g")          # float32 arithmetic on ordinar
 TENSOR_PROFILES = ("gpu-f16", "gpu-q8w")         # binary16 tensor-core kernels: compute capability 8.0 and later
 GPU_PROFILES = TENSOR_PROFILES + SIMT_PROFILES
 SIMT_CALL_TOKENS = (2048, 1024)                  # the float32 path takes about 174 KB of device memory per call token: 2048 unless that does not fit
-SIMT_WEIGHT_RATIO = {"gpu-bf16": 1.0, "gpu-w8g": 0.517}   # device weights / bf16 trunk bytes as stored (4B: 6.65 GiB measured; int8 + scales 3.69e9 computed)
+SIMT_WEIGHT_RATIO = {"gpu-bf16": 1.0, "gpu-w8g": 0.693}   # device weights / bf16 trunk bytes as stored (4B: 6.65 GiB measured; MLP int8 + scales, the rest bf16: 4.95e9 computed)
 SIMT_CALL_BYTES = 174 * 1024                     # activation buffers per call token at 4B (hidden 2560)
 
 
@@ -377,8 +377,9 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
                 notes.append("WARNING: gpu-q8w serves int8 weights; on this model it exceeds the documented q8 gate (max |dp| 0.12 to 0.14 on SEC-dev and LONG-LOG, "
                              "1.1% flips on LONG-LOG). Use it only where gpu-f16 does not fit and answers near 0.5 may flip.")
             if profile == "gpu-w8g":
-                notes.append("gpu-w8g stores int8 weights (one float32 scale per group of 128 input values; activations, keys, values and states stay float32). "
-                             "Its parity against the float profiles is still being measured; gpu-bf16 is the float profile and needs about "
+                notes.append("gpu-w8g stores int8 weights for the MLP (one float32 scale per group of 128 input values; the other matrices bfloat16; "
+                             "activations, keys, values and states float32). On long logs it moves answers near 0.5 by up to about 0.05 against the "
+                             "fp32 model (gpu-bf16: 0.03); gpu-bf16 needs about "
                              f"{sum(gpu_need(shape, 'gpu-bf16', 4096, 1024)) / GIB:.1f} GiB of VRAM for this model at a 4096-token window.")
             if plan.window < model_window:
                 notes.append(f"context limited to {plan.window} tokens by free VRAM (the model's window is {model_window}); longer requests get 422")
