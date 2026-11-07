@@ -1789,7 +1789,7 @@ Which matrices are int8 in `gpu-w8g` (`EngineOptions::int8_group`, profile key `
 
 **Measured on a GTX 1080 Ti 11 GB** (vast.ai instance 59465749: driver 580.178.04, the `nvidia/cuda:12.6.3-devel-ubuntu22.04` image,
 CUDA 12.6, cuBLAS 12.6, built with the `pascal` preset; i5-8500, 31 GB; 2026-11-07; raw files in Sepal `reports/runner-gpu-pascal/box1080ti/`).
-`ctest --preset pascal` on the card: every suite that applies passes; the scan suites (`cuda_deltanet_*`) are skipped because the scan
+`ctest --preset pascal` on the card: 35 of 35 suites that apply pass; the scan suites (`cuda_deltanet_*`) are skipped because the scan
 does not fit a Pascal block at head dim 128, and the tensor-core suites are not built for sm_61.
 
 Speed, one request per call (bench.py, the same encoded workloads as on the 3060). The trunk budget on the 11 GB card is 9.2 GB (9.4 GB did
@@ -1799,7 +1799,7 @@ not open next to the CUDA context, cuBLAS and the head; total VRAM in use 11.0 G
 | Profile | t1k tok/s, p50 | t16k tok/s, p50 | TOOL n60 tok/s, p50 | LONG-LOG n12 tok/s |
 |---|---|---|---|---|
 | gpu-bf16 | 900, 1.07 s | 578, 27.4 s | 672, 3.3 s | 580 (all 12 fit, 24.6k tokens the longest) |
-| gpu-w8g | | | 713, 3.0 s | 609 |
+| gpu-w8g | 976, 0.98 s | 608, 26.1 s | 713, 3.0 s | 609 |
 | gpu-w8g, 8 GB budget | 967, 0.99 s | 578, 27.5 s | 743, 2.8 s (3 of 60 requests over the window: refused) | |
 | cpu-bf16, 6 cores of a Ryzen 5 7600X (for scale) | 167 | 141 | 151 | |
 
