@@ -12,8 +12,9 @@ group of 128 input values; 70% of the weight memory), else `cpu-bf16`. `gpu-bf16
 card, but on a card with tensor cores `gpu-f16` is about four times faster. The compute capability comes from `nvidia-smi`; a driver too old
 to report it counts as unknown, and unknown is treated as a modern card.
 `gpu-q8w` and `cpu-q8` (int8) exceed the q8 parity gate on this model (max |dp| on near-tie questions), so they are used only with `--allow-q8`,
-with a printed warning. `gpu-w8g` is weight-only int8 (MLP only) and stays within the q8 gate against its float twin (runner/cuda/README.md,
-"Pascal"); it is not behind `--allow-q8` and always prints a note saying that it stores int8 weights.
+with a printed warning. `gpu-w8g` is weight-only int8 (MLP only): against its float twin it moves near-tie answers by up to 0.07 (SEC-dev) and
+0.05 (LONG-LOG) with no flips (runner/cuda/README.md, "Pascal"); it is the 8 GB Pascal choice (owner decision), not behind `--allow-q8`, and
+always prints a note saying that it stores int8 weights.
 A model that fits neither is refused with the numbers and what would fit, before any weights are loaded.
 
 Only public downloads, without login, unless $HF_TOKEN is set (the Sepal repositories are gated: accept the terms on the Hub first).
@@ -378,8 +379,8 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
                              "1.1% flips on LONG-LOG). Use it only where gpu-f16 does not fit and answers near 0.5 may flip.")
             if profile == "gpu-w8g":
                 notes.append("gpu-w8g stores int8 weights for the MLP (one float32 scale per group of 128 input values; the other matrices bfloat16; "
-                             "activations, keys, values and states float32). On long logs it moves answers near 0.5 by up to about 0.05 against the "
-                             "fp32 model (gpu-bf16: 0.03); gpu-bf16 needs about "
+                             "activations, keys, values and states float32). Against gpu-bf16 it moves answers near 0.5 by up to 0.07 (SEC-dev) and 0.05 "
+                             "(LONG-LOG), above the q8 gate's 0.05, with no flip in 712 questions; gpu-bf16 needs about "
                              f"{sum(gpu_need(shape, 'gpu-bf16', 4096, 1024)) / GIB:.1f} GiB of VRAM for this model at a 4096-token window.")
             if plan.window < model_window:
                 notes.append(f"context limited to {plan.window} tokens by free VRAM (the model's window is {model_window}); longer requests get 422")
