@@ -764,3 +764,66 @@ Machine-checked (all of 11.1 to 11.3 except the items marked prose): every theor
 Prose only: the correspondence between the models and the `.cu` files (checked by review, files were being written); every fp32 or fp16 error claim (delta-rule
 `T` accuracy, `fl(s q)` rounding, accumulation error); the bf16 bound `2^-8`; the comparison and the typical-size estimate in 11.3 (c); the 16 x 16 block inverse of the
 tensor-core kernel is not modelled (any chunk size and any exact inverse are covered).
+
+## 12. GpuTrack: split-K/V fp32 flash attention (2026-11-07)
+
+File `GpuTrack/GpuTrack/AttnSplit.lean` (core Lean, no Mathlib, no `sorry`; `#print axioms` shows only `propext`, `Classical.choice`, `Quot.sound`).
+Model: one query row, one output dimension (the other dimensions are independent: same `m` and `l`, their own `acc`). The row's keys are cut into consecutive chunks
+of a fixed size `c` counted from key 0 (last chunk may be short); each chunk is reduced tile by tile (fixed `T`, counted from the chunk start) by the online step;
+the chunk partials are combined by a fixed binary tree (`pairUp`: 0+1, 2+3, ..., odd last carried, repeat; `treeFold`). Causal masking: key `j` visible iff `j <= ctx + t`.
+
+### 12.1 Exact layer (equalities in an `ExpField`, exact arithmetic)
+The `ExpField` class is copied from `ExactTrack/OnlineSoftmax.lean` with the same laws plus two more: `add_comm` and `max_comm` (OnlineSoftmax assumes neither; they are needed only for
+`merge_comm`; associativity, identity and the homomorphism use only the OnlineSoftmax laws). Both hold in `Real`.
+- `merge_assoc`, `merge_none_left`, `merge_none_right`, `merge_comm`: the partial state `Option (m, l, acc)` is a commutative monoid (`none` = empty = the kernel's `m = -inf, l = 0, acc = 0`).
+- `stOf_append`: `stOf (a ++ b) = merge (stOf a) (stOf b)` (homomorphism); `stOf` = (max score, `Σ exp(s-m)`, `Σ exp(s-m) v`).
+- `stepTile_eq`: the kernel's online step over a tile is `merge` with the tile's state (empty tile = no-op, first tile initialises).
+- `chunkSt_eq`: any tile size `T > 0` gives the state of the chunk. `treeMerge_eq_foldl`: tree = left fold. `treeMerge_stOf`, `treeMerge_chunkSt`: any partition into chunks, any tile size, fixed tree = `stOf` of the concatenation.
+- `rowState_eq`, `rowState_indep`: for every `c > 0`, `T > 0` the row state is `stOf` of the whole chain, so every chunk size and tile size gives the same exact value.
+- `rowOut_eq_softmax`, `partition_eq_softmax`: `acc / l` equals the two-pass softmax-weighted sum `softmax` (restated from OnlineSoftmax), for the fixed chunking and for any partition.
+- Causal: `maskedTile_eq` (masked keys inside a tile contribute the identity; online result = state of the visible keys), `tileSt_eq` / `chunkMasked_eq` (a wholly masked tile or chunk is replaced by `none`; the result is `stOf` of the filtered chunk),
+  `chunkMasked_of_masked`, `rowMasked_eq` (tree over chunks with skipped chunks = `stOf` of the visible keys). Positional form: `chunks_take` (chunks of the visible prefix `take v` = launched chunks `i < ceil(v/c)`, last one cut at `v`),
+  `not_launched` (chunks `i >= ceil(v/c)` are empty), `numChunks_visible` (the launched count is `ceil(v/c)`).
+
+### 12.2 Order layer (syntactic, holds for fp32)
+Exact equalities above do NOT hold in fp32 (`merge` is not associative there). What carries over is order-determinism: `Tr` is the syntax of the operations (`step s tile`, `comb a b`, `empty`), `Interp` any evaluator.
+- `canonTr chain c T v`: canonical tree, built from the chain data `chain j` (j < v), the visible length `v`, chunk size `c`, tile size `T` only. `canon_leaves`: it has `ceil(v/c)` chunk leaves. `canonTr_congr`: it depends only on `chain j` for `j < v`.
+- `eval_canon`, `canon_exact`: under the exact evaluator `semI` it equals `rowState` and `stOf` of the visible chain (so the canonical tree is the one analysed in 12.1).
+- `Launch` (`nq` tokens, `H` heads, `R` rows per block, `grid`), `Launch.row_pos` (every row `(q, h)` decodes from its `(block, lane)` back to itself), `Launch.row_in_grid`.
+- `sched`: the reduce step reads the workspace slots `0 .. ceil(v/c) - 1` in chunk order and applies the fixed tree; the split blocks are modelled by an arbitrary write log `(chunk index, partial)` (any number of splits, any chunk-to-split or chunk-to-block assignment, any write order), `LogOk` says each entry is the right chunk partial and every chunk is written.
+- `sched_eq_canon`: the tree the scheduler builds equals `canonTr`. `batch_invariant`: for two launches of any shape (different `nq`, `R`, `grid`, split structure), same head, same absolute position, same chain data for keys `0 .. t`, the two trees are syntactically equal, so the two results are bit-identical under any evaluator.
+
+### 12.3 What is and is not claimed
+- Exact: the schedule computes the softmax-weighted sum, for any chunk size, tile size, partition, causal limit (12.1). This is value correctness in exact arithmetic only.
+- Only order-determinism (12.2): the fp32 result of a row is a function of (chain, position, `c`, `T`) alone, not of the launch. It says nothing about how far the fp32 result is from the exact value.
+- Not modelled: what `exp`, `fma`, the `-inf` handling and the fp32 `max` really compute; that a masked key adds exactly `+0` in fp32 (true for `exp(-inf) = 0`, not proved); `__syncthreads` and shared-memory placement; the correspondence between the models and the `.cu` file (by review); the vector dimension (applied componentwise).
+
+### 12.4 The kernel (runner/cuda/src/kernels_attention.cu, `attention_f32_split_kernel`, `attention_f32_merge_kernel`)
+Correspondence (by review): chunk size `c` = `kSplitChunk` = 2048 keys counted from the chain's first key; tile size `T` = 8 keys counted from the chunk start
+(2048 is a multiple of 8, so tiles never straddle chunks); the per-chunk state is the online step over the tiles; the merge kernel combines the partials of a
+token by exactly `pairUp`/`treeFold` (built left to right by a binary-counter stack: its node at level `k` covers chunks `[i 2^k, (i+1) 2^k)` cut at `n`; the
+incomplete blocks left at the end merge right to left, which is what the carried odd nodes of `pairUp` do). A token whose keys fit one chunk is finished by the
+chunk block (`treeFold` of one leaf is the leaf: no operation). fp32 `merge(x, y)` and `merge(y, x)` give the same bits (fp32 `max` and `+` commute), so only the
+tree's shape matters, which matches `merge_comm` being a law of the model and not an extra assumption on the evaluator. The query-tile window of a launch (the cap on
+the workspace) changes only where a partial is stored, i.e. the write log of `sched`.
+
+Masked keys and skipped tiles in fp32 (prose; not machine-checked): a masked score is `-inf`, `ex2(-inf - m) = +0` and `l + 0 = l`, `fma(0, v, o) = o` for finite `v` (keys and
+values past the chain's end are stored as zeros, so `v` is finite); a tile in which a row sees nothing has row maximum `-inf`, so `m_new = m_run` and the code sets the
+rescale factor to exactly `1.0` (it does not call `ex2(0)`), and `o * 1 = o`. So a tile a row cannot see leaves its state's bits unchanged, and the bits do not depend
+on how many such tiles the block walks: the fp32 counterpart of `maskedTile_eq` / `chunkMasked_eq`. A row that has seen nothing yet uses `m = 0` for the exponent
+(so `p = ex2(-inf) = 0`, no NaN from `-inf - -inf`).
+
+fp32 error of the fast exp path. The split kernel scales scores into the base-2 domain, `x = fl(s * c2)` with `c2 = fl(scale * log2 e)` (one rounding of the constant,
+relative `2^-24`, and one of the product, relative `2^-24`), subtracts the running maximum `d = fl(x - m)` (exact when `x` and `m` are within a factor of 2 of each
+other by Sterbenz, otherwise relative `2^-24`), and takes `p = ex2.approx.ftz.f32(d)`. PTX ISA documents `ex2.approx.f32` with a maximum relative error of `2^-22`
+over its full range; the `split` test suite (`exp2_fast_path_error`) measures the PC's 3060 against float64 `exp2` at every multiple of `2^-12` in `[-126, 0]` and
+checks `<= 2^-21` (the measured value is in the ctest log, `[measured] ex2.approx...`). Results below `2^-126` flush to zero (ftz); such a probability is below
+`2^-126` of the row's largest one and its contribution to `l >= 1` is below the fp32 unit roundoff. Per probability the relative error is therefore at most about
+`2^-22 + |d| ln 2 (2^-23 + 2^-24)` (the argument roundings move `2^d` by `ln 2 * |d| * rel`), i.e. below `2^-21` for `|d| <= 1` and below about `30 * 2^-24` at `|d| = 16`,
+where the probability itself is `2^-16`; weighted by `p`, the error of `l` and of `acc` stays within a few units of `2^-22` relative. The accurate `expf` of the first
+kernel is within 2 ulp. The rescale factors `2^(m_old - m_new)` carry the same relative error and multiply the whole accumulated state, so at most one such error per
+tile in which the maximum moves (the maximum moves O(log n) times on random-order scores, at most once per tile). The merge kernel's factors `2^(m_i - M)` add one more
+such error per tree level (`ceil(log2 n_chunks)` levels: 3 at 16k keys). `acc / l` divides out any common relative error of the factors that multiply both `acc` and `l`;
+what remains is the per-probability error, which enters `acc / l` as a convex reweighting of the values: relative weight changes of at most a few `2^-22`, so
+`|o - o_exact| <= few * 2^-22 * max |v|`, comparable to the fp32 accumulation error of a 2048-term dot product (`gamma_n ~ n 2^-24` worst case, `sqrt(n) 2^-24` typical).
+The ctest suites check the kernel against the float32 reference at the existing tolerance (scaled difference `<= 1e-5`); the measured values are in the ctest log.

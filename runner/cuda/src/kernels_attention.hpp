@@ -42,7 +42,10 @@
 // softmax. It needs head_dim 16, 64, 128 or 256 and a group size heads / kv_heads of 1, 2, 4, 8 or 16 (sm_80 and up).
 // `TiledF32` is the same walk in float32 on the ordinary cores (the Pascal profiles): 64 query rows of one KV group per
 // block, two rows per thread over 32 head dimensions held in registers, keys 16 at a time, head_dim 16, 32, 64, 128 or 256;
-// it takes F32 keys and values only.
+// it takes F32 keys and values only. At head_dim 256 TiledF32 runs, by default, a second float32 kernel (F32Kernel::Split, below):
+// four query rows per thread over 16 dimensions, scores reduce-scattered across a half-warp, keys 8 at a time double-buffered in
+// shared memory, exp2 on the fast path, and the keys of a row cut into fixed chunks of 2,048 counted from the chain's first key,
+// each chunk one block, the chunks' partial states merged by a fixed pairwise tree in a second launch (proofs/GpuTrack/GpuTrack/AttnSplit.lean).
 // Alignment the tiled kernel relies on (cp.async, 16 bytes): segment pointers and the q buffer are 16-byte
 // aligned and the q row stride is a multiple of 8 elements.
 #pragma once
@@ -83,6 +86,27 @@ void set_tiled_kernel(TiledKernel kernel);
 /// Back to the environment's choice.
 void reset_tiled_kernel();
 
+/// Which float32 kernel the TiledF32 path runs at head_dim 256 (other head sizes always take the first). Chosen once per process by
+/// the environment variable SEPAL_ATTENTION_F32_KERNEL (v1, v2); unset means Split (v2). The two give different bits; each is
+/// deterministic and batch-invariant on its own.
+enum class F32Kernel : int {
+    First = 0, ///< v1: two query rows per thread over 32 dimensions, keys 16 at a time, the whole chain in one block
+    Split = 1, ///< v2: four rows per thread over 16 dimensions, keys 8 at a time, chunks of 2,048 keys merged by a fixed tree
+};
+F32Kernel f32_kernel_choice();
+/// Overrides the environment's choice for the rest of the process (tests and measurement tools).
+void set_f32_kernel(F32Kernel kernel);
+/// Back to the environment's choice.
+void reset_f32_kernel();
+/// Test hooks of the split kernel: the keys per chunk (a multiple of 8; 0 = the fixed 2,048) and the cap on the device workspace
+/// of chunk partials in bytes (0 = the default 32 MiB; a launch whose partials do not fit runs in windows of query tiles). The
+/// chunk size changes the bits; the cap does not.
+void set_f32_split_limits(std::uint32_t chunk_keys, std::size_t workspace_cap_bytes);
+/// Frees the split kernel's workspace (it is allocated on first use and grows to the largest launch, up to the cap).
+void release_f32_split_workspace();
+/// out[i] = 2^in[i] by the split kernel's fast exp2 (ex2.approx.ftz.f32), device arrays of n floats: for the test of its error.
+void attention_ex2_probe(const float* in, float* out, std::uint32_t n, cudaStream_t stream);
+
 /// The attention geometry, read from the model configuration.
 struct AttentionShape {
     std::uint32_t heads;       ///< query heads
@@ -121,6 +145,10 @@ struct AttentionRows {
     const std::uint32_t* run_rows;
     std::uint32_t run_count;
     std::uint32_t max_row_tokens;
+    /// The most keys a token of the rows that run sees (its context plus its row up to it: the largest context + length), a host
+    /// value that sizes the float32 split kernel's chunk grid. 0 = not given: that kernel then reads it back from the device
+    /// tables, which synchronises the stream.
+    std::uint32_t max_row_keys = 0;
 };
 
 /// A band of columns of a float32 matrix: element (token, c) is at data[token * stride + c].

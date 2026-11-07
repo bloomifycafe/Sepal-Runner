@@ -1529,6 +1529,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
         }
     }
     std::size_t segment_total = 0;
+    std::uint32_t max_row_keys = 0; // the most keys a token sees (context + row), for the float32 split attention kernel
     if (attn_layers != 0) {
         char* const heap = pools->kv_memory.data();
         std::vector<const KvBlock*> chain;
@@ -1546,6 +1547,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                     segments[a].push_back(KvSegment{keys, keys + per_layer, b->tokens, before});
                     before += b->tokens;
                 }
+                max_row_keys = std::max(max_row_keys, before);
             }
             segment_total += chain.size();
         }
@@ -1569,6 +1571,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     std::vector<AttentionRowDesc> descs_u;
     std::vector<KvSegment> segs_u;
     std::size_t padded_u = 0;
+    std::uint32_t max_row_keys_u = 0;
     if (prune) {
         struct Item {
             std::uint32_t pos;
@@ -1609,6 +1612,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                 for (const KvBlock* b : chain) segment_of(b, 0, b->tokens);
                 if (o > 0) segment_of(plan[r].kv.get(), 0, u32(o));
                 segment_of(plan[r].kv.get(), o, 1);
+                max_row_keys_u = std::max(max_row_keys_u, before);
                 descs_u.push_back(AttentionRowDesc{u32(first), u32(segs_u.size() - first), u32(plan[r].start_position + o), 1});
             }
             check_attention_rows(spans_u, descs_u, segs_u);
@@ -1723,8 +1727,8 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             // The last layer (always a full-attention layer) for the rows that are read out; see "the last layer" above.
             const std::size_t ru = upos.size();
             const AttentionRows full_rows{d_spans, d_descs, reinterpret_cast<const KvSegment*>(tables + off_segments[w.kind_index]),
-                                          nullptr, u32(rows.size()), max_row_tokens};
-            const AttentionRows u_rows{d_spans_u, d_descs_u, d_segs_u, nullptr, u32(ru), 1};
+                                          nullptr, u32(rows.size()), max_row_tokens, max_row_keys};
+            const AttentionRows u_rows{d_spans_u, d_descs_u, d_segs_u, nullptr, u32(ru), 1, max_row_keys_u};
             // Keys and values of every token here; queries and gates of the read-out tokens further down. In strict mode the
             // unpruned pass runs these same two multiplies (see the last layer below), so pruning changes no bit.
             const char* w_kv = w.mixer_in != nullptr ? static_cast<const char*>(w.mixer_in) + 2 * attn_width * H * elem_bytes : nullptr;
@@ -1883,7 +1887,7 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
                 Phase phase(*this, &PhaseTimes::attention_ms);
                 const AttentionRows ar{d_spans, d_descs,
                                        reinterpret_cast<const KvSegment*>(tables + off_segments[w.kind_index]), nullptr,
-                                       u32(rows.size()), max_row_tokens};
+                                       u32(rows.size()), max_row_tokens, max_row_keys};
                 const FloatBand q_gate{p, p_width};
                 const FloatBand k_band{p + 2 * attn_width, p_width};
                 const FloatBand v_band{p + 2 * attn_width + attn_kv_width, p_width};

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include "device.hpp"
 #include <string>
@@ -831,6 +832,398 @@ __global__ void __launch_bounds__(f32_threads<HD>(), 1) attention_f32_tiled_kern
     }
 }
 
+// ---- the float32 split kernel (F32 keys and values, head_dim 256, every architecture from sm_61 up) ----
+// The first float32 kernel gives each key or value it reads from shared memory to two query rows only, so it is bound by the
+// shared-memory pipe at a quarter of the cores' rate (Pascal: 32 words per clock per SM against 128 multiply-adds), and it
+// all-reduces every score across eight lanes and then runs the softmax eight times over. This one:
+//   * A block is 64 query rows (one KV group of 64 / group tokens) and 8 warps. A half-warp owns four rows; lane s of it holds the
+//     four rows' queries and outputs over the 16 dimensions 4s + 64i + c (i, c < 4), so each float4 it reads from shared memory
+//     feeds 16 multiply-adds and a quarter-warp's eight float4 fall in 32 different banks.
+//   * Keys 8 at a time. The 16 lanes' partial scores (4 rows x 8 keys) are reduce-scattered over the half-warp (masks 8, 4, 2, 1:
+//     30 shuffles instead of 128 for an all-reduce); lane s ends with row s / 4, keys 2 (s % 4) and 2 (s % 4) + 1, does the
+//     softmax for those two (exp2 on the fast path, ex2.approx), and the probabilities and rescale factors go back to the 16 lanes
+//     by 36 shuffles for P V. Each lane keeps its own share of the row sum; the four shares are added by a fixed butterfly at the end.
+//   * Two shared buffers of 8 keys and 8 values (32 KB): tile k + 1 is stored from registers while tile k is multiplied and
+//     tile k + 2 is fetched from global memory, one barrier per tile.
+//   * Split K/V: the keys of a row are cut into chunks of kSplitChunk counted from the chain's first key (the last may be short),
+//     and each (query tile, chunk) is its own block, so a short call over a long cache still fills the card. A token whose
+//     visible keys fit in one chunk is finished by its block. Otherwise each chunk's block writes its partial state (m, l, acc:
+//     the running maximum in the base-2 domain, the sum of the probabilities, the weighted values) to a workspace and a second
+//     launch merges the partials by a fixed pairwise tree over the chunk index (merge: M = max(m1, m2), l = l1 2^(m1 - M) + l2 2^(m2 - M), acc likewise).
+// Every score, sum and product runs in an order that depends on the key's index in its row's chain and on nothing else (the tiles
+// and chunks are counted from the chain's first key; a tile a row cannot see leaves its state's bits as they were: the rescale
+// factor is exactly 1 and the probabilities exactly 0), so a token's bits depend on its own chain only: not on its call, its
+// block, the other rows, the window of tiles, or the grid. proofs/GpuTrack/GpuTrack/AttnSplit.lean proves the merge is a monoid,
+// that the chunked fold equals softmax attention for any chunking, that skipped tiles and chunks drop only zero-weight terms, and
+// that the operation tree of a token does not depend on the launch.
+
+constexpr unsigned kSplitThreads = 256;
+constexpr unsigned kSplitRows = 64;
+constexpr unsigned kSplitKeys = 8;
+constexpr int kSplitHD = 256;
+constexpr std::uint32_t kSplitChunk = 2048;
+constexpr unsigned kSplitSlot = kSplitHD + 4; // floats per partial: acc[256], m, l, two pad (16-byte aligned slots)
+
+struct SplitF32Params {
+    AttentionRows rows;
+    std::uint32_t heads;
+    std::uint32_t kv_heads;
+    std::uint32_t group_log2;
+    float scale_log2; // scale * log2(e)
+    const float* q;
+    std::size_t q_stride;
+    FloatBand gate;
+    void* out;
+    std::size_t out_stride;
+    float* part;             // the chunk partials of this window, or null when every token fits one chunk
+    std::uint32_t chunk;     // keys per chunk
+    std::uint32_t chunks;    // chunk slots per (token, head): ceil(max_row_keys / chunk)
+    std::uint32_t tile0;     // the window's first query tile
+    std::uint32_t win_tiles; // query tiles in the window
+};
+
+// 2^x on the special-function unit. PTX ISA: ex2.approx.f32 has a maximum relative error of 2^-22 over the full range (ftz: results
+// below 2^-126 are zero). The test suite `exp2` measures it against float64. ex2(-inf) = +0.
+__device__ inline float ex2_fast(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ inline std::uint32_t split_chunks_of(std::uint32_t visible, std::uint32_t chunk) { return (visible + chunk - 1) / chunk; }
+
+// The output's row stride and base need not be 16-byte aligned: four scalar stores.
+template <class TOut>
+__device__ inline void store4(TOut* dst, float4 v) {
+    dst[0] = from_float<TOut>(v.x);
+    dst[1] = from_float<TOut>(v.y);
+    dst[2] = from_float<TOut>(v.z);
+    dst[3] = from_float<TOut>(v.w);
+}
+
+template <class TOut>
+__global__ void __launch_bounds__(kSplitThreads, 1) attention_f32_split_kernel(const SplitF32Params p) {
+    __shared__ __align__(16) float Ks[2][kSplitKeys][kSplitHD];
+    __shared__ __align__(16) float Vs[2][kSplitKeys][kSplitHD];
+
+    const std::uint32_t row = run_row(p.rows, blockIdx.z);
+    const RowSpan span = p.rows.spans[row];
+    const std::uint32_t lg = p.group_log2;
+    const std::uint32_t group = 1u << lg;
+    const std::uint32_t tpt = kSplitRows >> lg; // tokens per query tile
+    const std::uint32_t tile = p.tile0 + blockIdx.x / p.chunks;
+    const std::uint32_t chunk = blockIdx.x % p.chunks;
+    const std::uint32_t tok0 = tile * tpt;
+    if (tok0 >= span.length) return;
+    const AttentionRowDesc desc = p.rows.descs[row];
+    const std::uint32_t ctx = context_tokens(p.rows.segments, desc);
+    const std::uint32_t n_tok = min(tpt, span.length - tok0);
+    const std::uint32_t block_visible = ctx + tok0 + n_tok; // keys the block's last token sees
+    const std::uint32_t key_begin = chunk * p.chunk;
+    if (key_begin >= block_visible) return;
+    const std::uint32_t key_end = min(key_begin + p.chunk, block_visible);
+    const std::uint32_t tiles = (key_end - key_begin + kSplitKeys - 1) / kSplitKeys;
+    const std::size_t kv_width = static_cast<std::size_t>(p.kv_heads) * kSplitHD;
+    const unsigned kvh = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned hbase = lane & 16u; // the half-warp's first lane
+    const unsigned s = lane & 15u;
+    const unsigned rbase = warp * 8 + (lane >> 4) * 4; // the half-warp's first query row in the block
+
+    // Row r of this half-warp (r < 4) is block row rbase + r: token tok0 + (row >> lg), head kvh * group + (row & (group - 1)).
+    // The row whose softmax this lane runs (row s / 4 of the four) and the keys it sees.
+    const unsigned own = rbase + (s >> 2);
+    const std::uint32_t own_t = tok0 + (own >> lg);
+    const std::uint32_t own_visible = own_t < span.length ? ctx + own_t + 1 : 0;
+
+    // Queries: q[r][4 i + c] is dimension 4 s + 64 i + c of row r.
+    float q[4][16];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const unsigned qrow = rbase + static_cast<unsigned>(r);
+        const std::uint32_t tr = tok0 + (qrow >> lg);
+        const bool live = tr < span.length;
+        const std::uint32_t hr = kvh * group + (qrow & (group - 1));
+        const float* src = p.q + (static_cast<std::size_t>(span.offset) + (live ? tr : 0)) * p.q_stride +
+                           static_cast<std::size_t>(hr) * kSplitHD + 4 * s;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (live) v = *reinterpret_cast<const float4*>(src + 64 * i);
+            q[r][4 * i] = v.x;
+            q[r][4 * i + 1] = v.y;
+            q[r][4 * i + 2] = v.z;
+            q[r][4 * i + 3] = v.w;
+        }
+    }
+    float o[4][16];
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int i = 0; i < 16; ++i) o[r][i] = 0.0f;
+    float m_run = neg_inf(); // the own row's running maximum (base-2 domain), the same in the row's four lanes
+    float l_run = 0.0f;      // this lane's share of the own row's sum
+
+    // Tile fetch: keys (tid / 64) and (tid / 64) + 4 of the tile, float4 (tid % 64) of each, keys and values.
+    float4 kr[2], vr[2];
+    const auto fetch = [&](std::uint32_t key0) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const std::uint32_t j = key0 + (tid >> 6) + 4u * static_cast<unsigned>(e);
+            kr[e] = vr[e] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (j < key_end) {
+                std::uint32_t local;
+                const KvSegment* seg = locate_key(p.rows.segments, desc, j, local);
+                const std::size_t at = static_cast<std::size_t>(local) * kv_width + static_cast<std::size_t>(kvh) * kSplitHD + 4 * (tid & 63u);
+                kr[e] = *reinterpret_cast<const float4*>(static_cast<const float*>(seg->keys) + at);
+                vr[e] = *reinterpret_cast<const float4*>(static_cast<const float*>(seg->values) + at);
+            }
+        }
+    };
+    const auto stage = [&](int b) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const unsigned j = (tid >> 6) + 4u * static_cast<unsigned>(e);
+            *reinterpret_cast<float4*>(&Ks[b][j][4 * (tid & 63u)]) = kr[e];
+            *reinterpret_cast<float4*>(&Vs[b][j][4 * (tid & 63u)]) = vr[e];
+        }
+    };
+
+    fetch(key_begin);
+    stage(0);
+    if (tiles > 1) fetch(key_begin + kSplitKeys);
+    __syncthreads();
+
+    const unsigned b8 = (s >> 3) & 1u, b4 = (s >> 2) & 1u, b2 = (s >> 1) & 1u, b1 = s & 1u;
+    for (std::uint32_t kt = 0; kt < tiles; ++kt) {
+        const int b = static_cast<int>(kt & 1u);
+        const std::uint32_t key0 = key_begin + kt * kSplitKeys;
+
+        // Partial scores over this lane's 16 dimensions: one fmaf chain per (row, key) in dimension order.
+        float sp[4][8];
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) sp[r][j] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 k4 = *reinterpret_cast<const float4*>(&Ks[b][j][4 * s + 64 * i]);
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    sp[r][j] = __fmaf_rn(q[r][4 * i], k4.x, sp[r][j]);
+                    sp[r][j] = __fmaf_rn(q[r][4 * i + 1], k4.y, sp[r][j]);
+                    sp[r][j] = __fmaf_rn(q[r][4 * i + 2], k4.z, sp[r][j]);
+                    sp[r][j] = __fmaf_rn(q[r][4 * i + 3], k4.w, sp[r][j]);
+                }
+            }
+        }
+
+        // The next tile goes into the other buffer (read during the previous tile, which every thread has finished: the barrier
+        // ending that tile), and the one after it is fetched.
+        if (kt + 1 < tiles) {
+            stage(b ^ 1);
+            if (kt + 2 < tiles) fetch(key0 + 2 * kSplitKeys);
+        }
+
+        // Reduce-scatter over the half-warp. Mask 8 splits the rows {0,1} / {2,3}, mask 4 row parity, mask 2 keys 0-3 / 4-7,
+        // mask 1 keys {0,1,4,5} / {2,3,6,7}; a lane keeps the half its mask bit selects and adds its partner's partial of it.
+        float a1[2][8];
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float send = b8 ? sp[r][j] : sp[r + 2][j];
+                const float keep = b8 ? sp[r + 2][j] : sp[r][j];
+                a1[r][j] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, 8));
+            }
+        float a2[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float send = b4 ? a1[0][j] : a1[1][j];
+            const float keep = b4 ? a1[1][j] : a1[0][j];
+            a2[j] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, 4));
+        }
+        float a3[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float send = b2 ? a2[j] : a2[j + 4];
+            const float keep = b2 ? a2[j + 4] : a2[j];
+            a3[j] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, 2));
+        }
+        float a4[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float send = b1 ? a3[j] : a3[j + 2];
+            const float keep = b1 ? a3[j + 2] : a3[j];
+            a4[j] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, 1));
+        }
+        // This lane now holds the full scores of its own row for keys key0 + 2 (s % 4) and key0 + 2 (s % 4) + 1.
+        const std::uint32_t kj = key0 + 2 * (s & 3u);
+        const float x0 = kj < own_visible ? __fmul_rn(a4[0], p.scale_log2) : neg_inf();
+        const float x1 = kj + 1 < own_visible ? __fmul_rn(a4[1], p.scale_log2) : neg_inf();
+        float mx = fmaxf(x0, x1);
+        mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 2));
+        const float m_new = fmaxf(m_run, mx);
+        const float m_use = m_new == neg_inf() ? 0.0f : m_new; // a row that has seen nothing yet: p = 2^-inf = 0
+        const float alpha = m_new == m_run ? 1.0f : ex2_fast(m_run - m_use); // 0 on the first visible tile
+        const float p0 = ex2_fast(x0 - m_use);
+        const float p1 = ex2_fast(x1 - m_use);
+        l_run = __fadd_rn(__fmul_rn(l_run, alpha), __fadd_rn(p0, p1));
+        m_run = m_new;
+
+        // Back to the 16 lanes: the rescale factors of the four rows, then (key by key) their probabilities.
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const float al = __shfl_sync(0xFFFFFFFFu, alpha, hbase + 4 * r);
+            if (al != 1.0f) {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) o[r][i] = __fmul_rn(o[r][i], al);
+            }
+        }
+        // O += P V: one fmaf chain per output over the keys in order.
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float pj[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) pj[r] = __shfl_sync(0xFFFFFFFFu, (j & 1) ? p1 : p0, hbase + 4 * r + (j >> 1));
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 v4 = *reinterpret_cast<const float4*>(&Vs[b][j][4 * s + 64 * i]);
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    o[r][4 * i] = __fmaf_rn(pj[r], v4.x, o[r][4 * i]);
+                    o[r][4 * i + 1] = __fmaf_rn(pj[r], v4.y, o[r][4 * i + 1]);
+                    o[r][4 * i + 2] = __fmaf_rn(pj[r], v4.z, o[r][4 * i + 2]);
+                    o[r][4 * i + 3] = __fmaf_rn(pj[r], v4.w, o[r][4 * i + 3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // The own row's sum: its four lanes' shares by a fixed butterfly (the same bits in the four).
+    float l_row = __fadd_rn(l_run, __shfl_xor_sync(0xFFFFFFFFu, l_run, 1));
+    l_row = __fadd_rn(l_row, __shfl_xor_sync(0xFFFFFFFFu, l_row, 2));
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const float l_r = __shfl_sync(0xFFFFFFFFu, l_row, hbase + 4 * r);
+        const float m_r = __shfl_sync(0xFFFFFFFFu, m_run, hbase + 4 * r);
+        const unsigned qrow = rbase + static_cast<unsigned>(r);
+        const std::uint32_t tr = tok0 + (qrow >> lg);
+        if (tr >= span.length) continue;
+        const std::uint32_t hr = kvh * group + (qrow & (group - 1));
+        const std::uint32_t visible = ctx + tr + 1;
+        const std::uint32_t n_chunks = split_chunks_of(visible, p.chunk);
+        if (chunk >= n_chunks) continue; // the row sees no key of this chunk
+        const std::size_t token = static_cast<std::size_t>(span.offset) + tr;
+        if (n_chunks == 1) {
+            TOut* const out = static_cast<TOut*>(p.out) + token * p.out_stride + static_cast<std::size_t>(hr) * kSplitHD + 4 * s;
+            const float* const gate = p.gate.data + token * p.gate.stride + static_cast<std::size_t>(hr) * 2 * kSplitHD + kSplitHD + 4 * s;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float4 v;
+                v.x = __fmul_rn(__fdiv_rn(o[r][4 * i], l_r), sigmoid_stable(gate[64 * i]));
+                v.y = __fmul_rn(__fdiv_rn(o[r][4 * i + 1], l_r), sigmoid_stable(gate[64 * i + 1]));
+                v.z = __fmul_rn(__fdiv_rn(o[r][4 * i + 2], l_r), sigmoid_stable(gate[64 * i + 2]));
+                v.w = __fmul_rn(__fdiv_rn(o[r][4 * i + 3], l_r), sigmoid_stable(gate[64 * i + 3]));
+                store4<TOut>(out + 64 * i, v);
+            }
+        } else {
+            const std::size_t wt = static_cast<std::size_t>(tr) - static_cast<std::size_t>(p.tile0) * tpt; // token in the window
+            const std::size_t slot =
+                ((static_cast<std::size_t>(blockIdx.z) * p.win_tiles * tpt + wt) * p.heads + hr) * p.chunks + chunk;
+            float* const dst = p.part + slot * kSplitSlot;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                *reinterpret_cast<float4*>(dst + 4 * s + 64 * i) =
+                    make_float4(o[r][4 * i], o[r][4 * i + 1], o[r][4 * i + 2], o[r][4 * i + 3]);
+            }
+            if (s == 0) {
+                dst[kSplitHD] = m_r;
+                dst[kSplitHD + 1] = l_r;
+            }
+        }
+    }
+}
+
+// The merge of the chunk partials of one (token, head): a block of 256 threads, one per dimension, each combining the partials by the
+// same fixed tree (every thread computes the same maxima and sums, so they agree bit for bit), then normalising and gating as the split
+// kernel does for a token that fits one chunk.
+template <class TOut>
+__global__ void __launch_bounds__(kSplitHD) attention_f32_merge_kernel(const SplitF32Params p) {
+    const std::uint32_t row = run_row(p.rows, blockIdx.z);
+    const RowSpan span = p.rows.spans[row];
+    const std::uint32_t tpt = kSplitRows >> p.group_log2;
+    const std::uint32_t wt = blockIdx.x;
+    const std::uint32_t t = p.tile0 * tpt + wt;
+    if (t >= span.length) return;
+    const AttentionRowDesc desc = p.rows.descs[row];
+    const std::uint32_t visible = context_tokens(p.rows.segments, desc) + t + 1;
+    const std::uint32_t n_chunks = split_chunks_of(visible, p.chunk);
+    if (n_chunks <= 1) return;
+    const std::uint32_t head = blockIdx.y;
+    const unsigned d = threadIdx.x;
+    const float* src = p.part + ((static_cast<std::size_t>(blockIdx.z) * p.win_tiles * tpt + wt) * p.heads + head) * p.chunks * kSplitSlot;
+    // The tree of AttnSplit.lean (`pairUp` / `treeFold`): partials 0+1, 2+3, ..., an odd last one carried, repeated. Its node at
+    // level k covers the chunks [i 2^k, (i + 1) 2^k) cut at n_chunks, so a binary-counter stack builds it left to right (two
+    // complete neighbours of equal size merge as soon as the right one is complete) and the incomplete blocks left at the end merge
+    // right to left. merge(x, y) and merge(y, x) give the same bits (max and + commute), so only the tree's shape matters.
+    // Every chunk below n_chunks holds at least one visible key, so every maximum is finite.
+    constexpr int kDepth = 32;
+    float sm[kDepth], sl[kDepth], sa[kDepth];
+    std::uint32_t ssize[kDepth];
+    int top = 0;
+    const auto merge = [](float& m, float& l, float& acc, float m2, float l2, float acc2) {
+        const float mn = fmaxf(m, m2);
+        const float f1 = m == mn ? 1.0f : ex2_fast(m - mn);
+        const float f2 = m2 == mn ? 1.0f : ex2_fast(m2 - mn);
+        l = __fadd_rn(__fmul_rn(l, f1), __fmul_rn(l2, f2));
+        acc = __fadd_rn(__fmul_rn(acc, f1), __fmul_rn(acc2, f2));
+        m = mn;
+    };
+    for (std::uint32_t c = 0; c < n_chunks; ++c, src += kSplitSlot) {
+        sm[top] = src[kSplitHD];
+        sl[top] = src[kSplitHD + 1];
+        sa[top] = src[d];
+        ssize[top] = 1;
+        ++top;
+        while (top >= 2 && ssize[top - 1] == ssize[top - 2]) {
+            merge(sm[top - 2], sl[top - 2], sa[top - 2], sm[top - 1], sl[top - 1], sa[top - 1]);
+            ssize[top - 2] *= 2;
+            --top;
+        }
+    }
+    while (top >= 2) {
+        merge(sm[top - 2], sl[top - 2], sa[top - 2], sm[top - 1], sl[top - 1], sa[top - 1]);
+        --top;
+    }
+    const float l = sl[0], acc = sa[0];
+    const std::size_t token = static_cast<std::size_t>(span.offset) + t;
+    const float gate = p.gate.data[token * p.gate.stride + static_cast<std::size_t>(head) * 2 * kSplitHD + kSplitHD + d];
+    static_cast<TOut*>(p.out)[token * p.out_stride + static_cast<std::size_t>(head) * kSplitHD + d] =
+        from_float<TOut>(__fmul_rn(__fdiv_rn(acc, l), sigmoid_stable(gate)));
+}
+
+// The most keys a token of the running rows sees, for a launch whose host did not give it.
+__global__ void attention_max_keys_kernel(const AttentionRows rows, std::uint32_t* result) {
+    for (std::uint32_t i = threadIdx.x; i < rows.run_count; i += blockDim.x) {
+        const std::uint32_t row = run_row(rows, i);
+        const std::uint32_t keys = context_tokens(rows.segments, rows.descs[row]) + rows.spans[row].length;
+        atomicMax(result, keys);
+    }
+}
+
+// exp2 on the fast path against float64, for the test suite: out[i] = ex2_fast(in[i]).
+__global__ void attention_ex2_probe_kernel(const float* in, float* out, std::uint32_t n) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ex2_fast(in[i]);
+}
+
 // ---- the second tiled kernel (F16 keys and values, head_dim 64/128/256) ----
 // The same arithmetic contract as attention_tiled_kernel (key tiles of 32 counted from the chain's first token, an
 // online softmax in float32 registers in the base-2 domain, P rounded to binary16, tiles a row cannot see contribute
@@ -1232,6 +1625,119 @@ TiledKernel tiled_kernel_choice() {
     return choice;
 }
 
+namespace {
+std::atomic<int> g_f32_override{-1};
+std::atomic<std::uint32_t> g_split_chunk{0};
+std::atomic<std::size_t> g_split_cap{0};
+constexpr std::size_t kSplitDefaultCap = std::size_t{32} << 20;
+
+// The split kernel's device workspace: the chunk partials of one window (and four bytes for the read-back of max_row_keys).
+struct SplitWorkspace {
+    std::mutex mutex;
+    float* data = nullptr;
+    std::size_t bytes = 0;
+    float* ensure(std::size_t need) {
+        if (need > bytes) {
+            if (data != nullptr) check(cudaFree(data), "cudaFree (attention split workspace)");
+            data = nullptr;
+            bytes = 0;
+            check(cudaMalloc(&data, need), "cudaMalloc (attention split workspace)");
+            bytes = need;
+        }
+        return data;
+    }
+    void release() {
+        if (data != nullptr) cudaFree(data);
+        data = nullptr;
+        bytes = 0;
+    }
+};
+SplitWorkspace& split_workspace() {
+    static SplitWorkspace w;
+    return w;
+}
+} // namespace
+
+void set_f32_kernel(F32Kernel kernel) { g_f32_override.store(static_cast<int>(kernel)); }
+void reset_f32_kernel() { g_f32_override.store(-1); }
+void set_f32_split_limits(std::uint32_t chunk_keys, std::size_t workspace_cap_bytes) {
+    if (chunk_keys % kSplitKeys != 0) throw std::invalid_argument("set_f32_split_limits: the chunk must be a multiple of 8 keys");
+    g_split_chunk.store(chunk_keys);
+    g_split_cap.store(workspace_cap_bytes);
+}
+void release_f32_split_workspace() {
+    SplitWorkspace& w = split_workspace();
+    std::lock_guard<std::mutex> lock(w.mutex);
+    w.release();
+}
+
+F32Kernel f32_kernel_choice() {
+    if (const int o = g_f32_override.load(); o >= 0) return static_cast<F32Kernel>(o);
+    // SEPAL_ATTENTION_F32_KERNEL=v1 | v2; read once per process. Unset: v2.
+    static const F32Kernel choice = [] {
+        const char* v = std::getenv("SEPAL_ATTENTION_F32_KERNEL");
+        if (v == nullptr || *v == '\0') return F32Kernel::Split;
+        const std::string s(v);
+        if (s == "v1") return F32Kernel::First;
+        if (s == "v2") return F32Kernel::Split;
+        throw std::invalid_argument("SEPAL_ATTENTION_F32_KERNEL must be v1 or v2, not " + s);
+    }();
+    return choice;
+}
+
+namespace {
+
+template <class TOut>
+void launch_f32_split(SplitF32Params p, const AttentionShape& shape, std::uint32_t lg, cudaStream_t stream) {
+    const AttentionRows& rows = p.rows;
+    SplitWorkspace& ws = split_workspace();
+    std::lock_guard<std::mutex> lock(ws.mutex);
+    std::uint32_t max_keys = rows.max_row_keys;
+    if (max_keys == 0) {
+        auto* d = reinterpret_cast<std::uint32_t*>(ws.ensure(sizeof(std::uint32_t)));
+        check(cudaMemsetAsync(d, 0, sizeof(std::uint32_t), stream), "cudaMemsetAsync");
+        attention_max_keys_kernel<<<1, 256, 0, stream>>>(rows, d);
+        check(cudaGetLastError(), "attention_max_keys_kernel launch");
+        check(cudaMemcpyAsync(&max_keys, d, sizeof max_keys, cudaMemcpyDeviceToHost, stream), "cudaMemcpyAsync");
+        check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    }
+    const std::uint32_t chunk = g_split_chunk.load() != 0 ? g_split_chunk.load() : kSplitChunk;
+    const std::uint32_t tpt = kSplitRows >> lg;
+    const std::uint32_t tiles = (rows.max_row_tokens + tpt - 1) / tpt;
+    p.chunk = chunk;
+    p.chunks = std::max<std::uint32_t>(1, (max_keys + chunk - 1) / chunk);
+    if (p.chunks == 1) { // every token fits one chunk: one launch, no partials
+        p.part = nullptr;
+        p.tile0 = 0;
+        p.win_tiles = tiles;
+        attention_f32_split_kernel<TOut><<<dim3(tiles, shape.kv_heads, rows.run_count), dim3(kSplitThreads), 0, stream>>>(p);
+        check(cudaGetLastError(), "attention_f32_split_kernel launch");
+        return;
+    }
+    // Windows of query tiles whose partials fit the cap (at least one tile). The window changes where a partial is stored, not a bit.
+    const std::size_t cap = g_split_cap.load() != 0 ? g_split_cap.load() : kSplitDefaultCap;
+    const std::size_t per_tile = static_cast<std::size_t>(rows.run_count) * tpt * shape.heads * p.chunks * kSplitSlot * sizeof(float);
+    const std::uint32_t win = static_cast<std::uint32_t>(std::clamp<std::size_t>(cap / per_tile, 1, tiles));
+    p.part = ws.ensure(per_tile * win);
+    p.win_tiles = win;
+    for (std::uint32_t tile0 = 0; tile0 < tiles; tile0 += win) {
+        p.tile0 = tile0;
+        const std::uint32_t n = std::min(win, tiles - tile0);
+        attention_f32_split_kernel<TOut><<<dim3(n * p.chunks, shape.kv_heads, rows.run_count), dim3(kSplitThreads), 0, stream>>>(p);
+        check(cudaGetLastError(), "attention_f32_split_kernel launch");
+        attention_f32_merge_kernel<TOut><<<dim3(n * tpt, shape.heads, rows.run_count), dim3(kSplitHD), 0, stream>>>(p);
+        check(cudaGetLastError(), "attention_f32_merge_kernel launch");
+    }
+}
+
+} // namespace
+
+void attention_ex2_probe(const float* in, float* out, std::uint32_t n, cudaStream_t stream) {
+    if (n == 0) return;
+    attention_ex2_probe_kernel<<<(n + 255) / 256, 256, 0, stream>>>(in, out, n);
+    check(cudaGetLastError(), "attention_ex2_probe_kernel launch");
+}
+
 bool attention_tiled_supported(const AttentionShape& shape, AttnElem kv_type) {
     std::uint32_t lg = 0;
     if (kv_type != AttnElem::F16 || shape.kv_heads == 0 || shape.heads % shape.kv_heads != 0) return false;
@@ -1313,6 +1819,22 @@ AttentionPath launch_attention(const AttentionShape& shape, const AttentionRows&
         p.gate = gate;
         p.out = out.data;
         p.out_stride = out.stride;
+        if (shape.head_dim == static_cast<std::uint32_t>(kSplitHD) && f32_kernel_choice() == F32Kernel::Split) {
+            SplitF32Params sp{};
+            sp.rows = rows;
+            sp.heads = shape.heads;
+            sp.kv_heads = shape.kv_heads;
+            sp.group_log2 = lg;
+            sp.scale_log2 = static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(shape.head_dim)));
+            sp.q = p.q;
+            sp.q_stride = q.stride;
+            sp.gate = gate;
+            sp.out = out.data;
+            sp.out_stride = out.stride;
+            if (out_type == AttnElem::F16) launch_f32_split<__half>(sp, shape, lg, stream);
+            else launch_f32_split<float>(sp, shape, lg, stream);
+            return used;
+        }
         const unsigned tokens_per_tile = kF32Rows >> lg;
         const unsigned max_tiles = (rows.max_row_tokens + tokens_per_tile - 1) / tokens_per_tile;
         if (out_type == AttnElem::F16) dispatch_f32_tiled<__half>(p, max_tiles, shape, rows.run_count, stream);
