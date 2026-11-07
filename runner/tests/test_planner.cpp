@@ -299,6 +299,109 @@ SEPAL_TEST(planner, malformed_requests_throw) {
     CHECK_THROWS(make_plan(req), std::invalid_argument);
 }
 
+SEPAL_TEST(planner, pascal_profiles_weights_at_4b) {
+    const ModelConfig c = preset("4b");
+    const ParamCounts n = count_params(c);
+    const PrecisionProfile bf16 = profile("gpu-bf16");
+    const PrecisionProfile w8g = profile("gpu-w8g");
+    const std::uint64_t bf16_bytes = trunk_weight_bytes(c, bf16);
+    const std::uint64_t w8g_bytes = trunk_weight_bytes(c, w8g);
+
+    CHECK(w8g_bytes < bf16_bytes);
+    CHECK(bf16_bytes < 2 * w8g_bytes);
+    // gpu-w8g: the CUDA library's computed 3.69e9 bytes at 4B (int8 bytes + 3.1% scales + the small tensors), within 2%.
+    CHECK_NEAR(static_cast<double>(w8g_bytes), 3.69e9, 0.02 * 3.69e9);
+    // gpu-bf16: every matrix at 2 bytes, the small tensors at 4; 6.65 GiB measured on the device.
+    CHECK_NEAR(static_cast<double>(bf16_bytes) / (1024.0 * 1024.0 * 1024.0), 6.65, 0.02);
+
+    // Exact by hand. The DeltaNet in_proj_b and in_proj_a (2 x hidden x value heads per layer) stay bfloat16 in gpu-w8g;
+    // the other classes are int8. Every input width at 4B is a multiple of 128, so the float32 scales are
+    // (int8 values / 128) x 4 bytes.
+    const std::uint64_t gates = c.num_deltanet_layers() * 2 * c.hidden_size * c.dn_value_heads;
+    const std::uint64_t int8_values = n.mlp + n.mixer_proj + (n.dn_sensitive - gates);
+    CHECK_EQ(bf16_bytes, 2 * (n.mlp + n.mixer_proj + n.dn_sensitive) + 4 * n.small);
+    CHECK_EQ(w8g_bytes, int8_values + 4 * (int8_values / 128) + 2 * gates + 4 * n.small);
+    CHECK_EQ(int8_values % 128, 0u);
+    CHECK_EQ(w8g.scale_group, 128u);
+    CHECK_EQ(bf16.scale_group, 0u);
+
+    // The scales are the only difference from the same classes without them; the existing profiles count none.
+    PrecisionProfile no_scales = w8g;
+    no_scales.scale_group = 0;
+    CHECK_EQ(w8g_bytes - trunk_weight_bytes(c, no_scales), 4 * (int8_values / 128));
+    CHECK_EQ(profile("gpu-q8w").scale_group, 0u);
+    CHECK(!profile("gpu-q8w").dn_out_proj.has_value());
+
+    // The other presets keep the order: 8-bit with scales is smaller than bfloat16 and more than half of it.
+    for (const char* name : {"0.8b", "2b", "9b"}) {
+        const ModelConfig other = preset(name);
+        CHECK(trunk_weight_bytes(other, w8g) < trunk_weight_bytes(other, bf16));
+        CHECK(trunk_weight_bytes(other, bf16) < 2 * trunk_weight_bytes(other, w8g));
+    }
+}
+
+SEPAL_TEST(planner, group_scales_round_up_per_row) {
+    // The test geometry has input widths that are not multiples of 128, so each row needs ceil(width / 128) scales.
+    const ModelConfig c = tiny_test_config();
+    const PrecisionProfile w8g = profile("gpu-w8g");
+    PrecisionProfile no_scales = w8g;
+    no_scales.scale_group = 0;
+    const std::uint64_t h = c.hidden_size;
+    const std::uint64_t i = c.intermediate_size;
+    const auto rows_x_groups = [](std::uint64_t rows, std::uint64_t inputs) { return rows * ((inputs + 127) / 128); };
+    const std::uint64_t expected =
+        c.num_layers * (2 * rows_x_groups(i, h) + rows_x_groups(h, i)) +
+        c.num_attention_layers() * (rows_x_groups(c.attn_in_proj_width(), h) + rows_x_groups(h, c.attn_width())) +
+        c.num_deltanet_layers() * (rows_x_groups(c.dn_conv_dim(), h) + rows_x_groups(c.dn_value_dim(), h) +
+                                   rows_x_groups(h, c.dn_value_dim()));
+    CHECK_EQ(trunk_weight_bytes(c, w8g) - trunk_weight_bytes(c, no_scales), 4 * expected);
+    const ParamCounts n = count_params(c);
+    const std::uint64_t gates = c.num_deltanet_layers() * 2 * h * c.dn_value_heads;
+    CHECK(expected > (n.mlp + n.mixer_proj + (n.dn_sensitive - gates)) / 128); // rounding up gives more than the plain division
+}
+
+SEPAL_TEST(planner, pascal_profiles_state_embedding_and_budgets) {
+    const ModelConfig c = preset("4b");
+    // K/V is float32: 2 x 8 layers x ... = 65,536 bytes a token at 4B against 32,768 in binary16; the state is float32 as before.
+    for (const char* id : {"gpu-bf16", "gpu-w8g"}) {
+        const PrecisionProfile p = profile(id);
+        CHECK(p.kv == DType::F32);
+        CHECK(p.recurrent_state == DType::F32 && p.conv_tail == DType::F32 && p.small == DType::F32);
+        CHECK_EQ(snapshot_bytes(c, p, 600), 600ull * 65536ull + 50331648ull + 2359296ull);
+    }
+    CHECK(profile("gpu-bf16").mlp == DType::BF16 && profile("gpu-bf16").embedding == DType::BF16);
+    CHECK(profile("gpu-w8g").mlp == DType::I8 && profile("gpu-w8g").mixer_proj == DType::I8);
+    CHECK(profile("gpu-w8g").dn_out_proj == DType::I8 && profile("gpu-w8g").dn_sensitive == DType::BF16);
+
+    // The embedding table (bfloat16, 248,320 x 2,560) stays on the host unless the request says otherwise.
+    for (const char* id : {"gpu-bf16", "gpu-w8g"}) {
+        const PlanRequest req = request("4b", id, 24 * kGiB);
+        const PlanResult result = make_plan(req);
+        CHECK(is_plan(result));
+        if (!is_plan(result)) continue;
+        check_plan_invariants(req, plan_of(result));
+        CHECK_EQ(plan_of(result).embedding_bytes, 0u);
+        CHECK_EQ(plan_of(result).embedding_host_bytes, 248320ull * 2560ull * 2ull);
+    }
+
+    // An 8 GiB card with 1 GiB held back (a Pascal desktop card): bfloat16 weights leave too little for the 4,096-token
+    // pass, the int8 profile plans. On 11 GiB, bfloat16 plans.
+    PlanRequest eight = request("4b", "gpu-bf16", 8 * kGiB);
+    eight.reserve_bytes = kGiB;
+    const PlanResult bf16_eight = make_plan(eight);
+    CHECK(!is_plan(bf16_eight));
+    if (!is_plan(bf16_eight)) CHECK(refusal_of(bf16_eight).knob == Knob::TokenBudget);
+    eight.profile = profile("gpu-w8g");
+    const PlanResult w8g_eight = make_plan(eight);
+    CHECK(is_plan(w8g_eight));
+    if (is_plan(w8g_eight)) check_plan_invariants(eight, plan_of(w8g_eight));
+    PlanRequest eleven = request("4b", "gpu-bf16", 11 * kGiB);
+    eleven.reserve_bytes = kGiB;
+    const PlanResult bf16_eleven = make_plan(eleven);
+    CHECK(is_plan(bf16_eleven));
+    if (is_plan(bf16_eleven)) check_plan_invariants(eleven, plan_of(bf16_eleven));
+}
+
 SEPAL_TEST(planner, format_bytes_and_knob_names) {
     CHECK_EQ(format_bytes(1000000000ull), "1.00 GB (0.93 GiB)");
     CHECK_EQ(format_bytes(8 * kGiB), "8.59 GB (8.00 GiB)");

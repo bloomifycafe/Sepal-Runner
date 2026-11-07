@@ -4,8 +4,16 @@
     sepal serve E:\\models\\Sepal-4B                    # a local checkpoint directory (the one holding sepal.json)
     sepal serve BlossomsAI/Sepal-0.8B --dry-run      # print the plan and exit
 
-Profiles chosen automatically: `gpu-f16` on a CUDA card with 12 GB and up when the plan fits, otherwise `cpu-bf16`. `gpu-q8w` and `cpu-q8`
-(int8) exceed the q8 parity gate on this model (max |dp| on near-tie questions), so they are used only with `--allow-q8`, with a printed warning.
+Profiles chosen automatically: on a CUDA card of compute capability 8.0 or later (RTX 30xx and newer, A100), `gpu-f16` on 12 GB and up when
+the plan fits, otherwise `cpu-bf16`. On a card below 8.0 (Pascal: GTX 10xx, Tesla P40; Volta and Turing too) the binary16 profiles `gpu-f16`
+and `gpu-q8w` cannot run (they need tensor-core kernels) and are refused by name; `auto` takes `gpu-bf16` (bfloat16 weights, float32
+arithmetic on ordinary CUDA cores) when its plan fits, else `gpu-w8g` (the same arithmetic over int8 weights with a float32 scale per group of
+128 input values, about half the weight memory), else `cpu-bf16`. `gpu-bf16` and `gpu-w8g` can also be asked for with `--profile` on any CUDA
+card, but on a card with tensor cores `gpu-f16` is about four times faster. The compute capability comes from `nvidia-smi`; a driver too old
+to report it counts as unknown, and unknown is treated as a modern card.
+`gpu-q8w` and `cpu-q8` (int8) exceed the q8 parity gate on this model (max |dp| on near-tie questions), so they are used only with `--allow-q8`,
+with a printed warning. `gpu-w8g` is weight-only int8 as well; its parity is still being measured, it is not behind `--allow-q8`, and it
+always prints a note saying that it stores int8 weights.
 A model that fits neither is refused with the numbers and what would fit, before any weights are loaded.
 
 Only public downloads, without login, unless $HF_TOKEN is set (the Sepal repositories are gated: accept the terms on the Hub first).
@@ -29,6 +37,12 @@ MIB = 1 << 20
 HUB_ORG = "BlossomsAI"
 WINDOWS = (24576, 16384, 12288, 8192, 4096)      # context windows tried, largest first
 CALL_TOKENS = (12288, 8192, 4096, 2048, 1024)    # GPU max_call_tokens tried, largest first
+SIMT_PROFILES = ("gpu-bf16", "gpu-w8g")          # float32 arithmetic on ordinary CUDA cores: any card from compute capability 6.1
+TENSOR_PROFILES = ("gpu-f16", "gpu-q8w")         # binary16 tensor-core kernels: compute capability 8.0 and later
+GPU_PROFILES = TENSOR_PROFILES + SIMT_PROFILES
+SIMT_CALL_TOKENS = (2048, 1024)                  # the float32 path takes about 174 KB of device memory per call token: 2048 unless that does not fit
+SIMT_WEIGHT_RATIO = {"gpu-bf16": 1.0, "gpu-w8g": 0.517}   # device weights / bf16 trunk bytes as stored (4B: 6.65 GiB measured; int8 + scales 3.69e9 computed)
+SIMT_CALL_BYTES = 174 * 1024                     # activation buffers per call token at 4B (hidden 2560)
 
 
 class Refusal(SystemExit):
@@ -46,9 +60,11 @@ class Hardware:
     gpu_name: str | None = None
     vram_total: int = 0
     vram_free: int = 0
+    compute_cap: float | None = None     # CUDA compute capability (6.1, 8.6, ...); None = unknown, which is treated as a modern card
 
     def describe(self) -> str:
-        gpu = f"{self.gpu_name} {self.vram_total / GIB:.1f} GiB ({self.vram_free / GIB:.1f} GiB free)" if self.gpu_name else "no CUDA GPU"
+        cc = f", compute capability {self.compute_cap:.1f}" if self.compute_cap is not None else ""
+        gpu = f"{self.gpu_name} {self.vram_total / GIB:.1f} GiB ({self.vram_free / GIB:.1f} GiB free{cc})" if self.gpu_name else "no CUDA GPU"
         return f"{self.cores} cores / {self.threads} threads, RAM {self.ram_total / GIB:.1f} GiB ({self.ram_free / GIB:.1f} GiB free), {gpu}"
 
 
@@ -88,20 +104,55 @@ def _physical_cores(threads: int) -> int:
         return max(1, threads // 2) if threads > 2 else threads
 
 
+def parse_gpu_line(line: str) -> tuple[str, int, int, float | None]:
+    """(name, total MiB, free MiB, compute capability or None) from one `nvidia-smi --format=csv,noheader,nounits` line.
+
+    The line has `name,total,free` or, from drivers that know the field, `name,total,free,compute_cap`. A compute capability that is
+    missing or not a number ([N/A]) is None. Raises ValueError for a line that is neither.
+    """
+    parts = [x.strip() for x in line.split(",")]
+    if len(parts) < 3:
+        raise ValueError(f"not an nvidia-smi GPU line: {line!r}")
+    cc: float | None = None
+    if len(parts) >= 4:
+        try:
+            cc = float(parts[-1])
+        except ValueError:
+            cc = None
+        else:
+            cc = cc if cc > 0 else None
+        parts = parts[:-1]
+    name = ",".join(parts[:-2])
+    return name, int(parts[-2]), int(parts[-1]), cc
+
+
+def _query_gpu(smi: str) -> tuple[str, int, int, float | None] | None:
+    """The first GPU, asking for compute_cap first and again without it when the driver does not know the field."""
+    for fields in ("name,memory.total,memory.free,compute_cap", "name,memory.total,memory.free"):
+        try:
+            run = subprocess.run([smi, f"--query-gpu={fields}", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = run.stdout.strip().splitlines()
+        if run.returncode != 0 or not lines:
+            continue
+        try:
+            return parse_gpu_line(lines[0])
+        except ValueError:
+            continue
+    return None
+
+
 def detect_hardware() -> Hardware:
     threads = os.cpu_count() or 1
     total, free = _memory()
     hw = Hardware(cores=_physical_cores(threads), threads=threads, ram_total=total, ram_free=free)
     smi = shutil.which("nvidia-smi")
     if smi:
-        try:
-            out = subprocess.run([smi, "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"], capture_output=True,
-                                 text=True, timeout=10).stdout.strip().splitlines()
-            if out:
-                name, t, f = [x.strip() for x in out[0].split(",")]
-                hw.gpu_name, hw.vram_total, hw.vram_free = name, int(t) * MIB, int(f) * MIB
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
+        gpu = _query_gpu(smi)
+        if gpu:
+            name, t, f, cc = gpu
+            hw.gpu_name, hw.vram_total, hw.vram_free, hw.compute_cap = name, t * MIB, f * MIB, cc
     return hw
 
 
@@ -165,11 +216,16 @@ class GpuPlan:
 
 
 def gpu_need(shape: Shape, profile: str, window: int, call_tokens: int) -> tuple[int, int]:
-    """(budget bytes the engine needs, bytes outside its budget: CUDA context and the Clef head)."""
-    ratio = 1.178 if profile == "gpu-f16" else 0.68
+    """(budget bytes the engine needs, bytes outside its budget: CUDA context and the Clef head).
+
+    gpu-bf16 / gpu-w8g keep the embedding table in host memory, hold keys and values in float32 (twice the binary16 profiles' bytes) and
+    their activation buffers are float32; the DeltaNet state slot is float32 in every profile.
+    """
+    simt = profile in SIMT_PROFILES
+    ratio = SIMT_WEIGHT_RATIO[profile] if simt else 1.178 if profile == "gpu-f16" else 0.68
     weights = ratio * shape.trunk_bytes
-    buffers = call_tokens * 0.179 * MIB * shape.hidden / 2560
-    kv = 1.15 * window * shape.kv_bytes_per_token
+    buffers = call_tokens * (SIMT_CALL_BYTES / MIB if simt else 0.179) * MIB * shape.hidden / 2560
+    kv = 1.15 * window * shape.kv_bytes_per_token * (2 if simt else 1)
     need = weights + buffers + kv + 4 * shape.slot_bytes + 64 * MIB
     outside = 1.2 * GIB + 0.6 * GIB * shape.trunk_bytes / 7.14e9
     return int(need), int(outside)
@@ -178,7 +234,7 @@ def gpu_need(shape: Shape, profile: str, window: int, call_tokens: int) -> tuple
 def plan_gpu(shape: Shape, hw: Hardware, profile: str, model_window: int) -> GpuPlan | None:
     avail = hw.vram_free - int(0.3 * GIB)
     for window in [w for w in WINDOWS if w <= model_window] or [model_window]:
-        for calls in CALL_TOKENS:
+        for calls in (SIMT_CALL_TOKENS if profile in SIMT_PROFILES else CALL_TOKENS):
             if calls > 2 * window:
                 continue
             need, outside = gpu_need(shape, profile, window, calls)
@@ -286,8 +342,15 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     notes: list[str] = []
     cpu_lib, gpu_lib = find_library("cpu", args.lib), find_library("cuda", args.lib)
     choice = args.profile
-    wants_gpu = choice in ("auto", "gpu-f16", "gpu-q8w") and hw.gpu_name and gpu_lib
-    if choice in ("gpu-f16", "gpu-q8w") and not wants_gpu:
+    wants_gpu = choice in ("auto",) + GPU_PROFILES and hw.gpu_name and gpu_lib
+    # Below compute capability 8.0 (Pascal, Volta, Turing) the binary16 profiles have no kernels; an unknown capability counts as a modern card.
+    pre_ampere = bool(hw.gpu_name) and hw.compute_cap is not None and hw.compute_cap < 8.0
+    if choice in TENSOR_PROFILES and pre_ampere:
+        raise Refusal(f"{choice} needs tensor cores (compute capability 8.0 or later) and {hw.gpu_name} is compute capability {hw.compute_cap:.1f}; "
+                      f"use gpu-bf16 (bfloat16 weights, float32 arithmetic; about {sum(gpu_need(shape, 'gpu-bf16', 4096, 1024)) / GIB:.1f} GiB of VRAM for this model "
+                      f"with a 4096-token window) or gpu-w8g (int8 weights with a float32 scale per 128 values; about {sum(gpu_need(shape, 'gpu-w8g', 4096, 1024)) / GIB:.1f} GiB), "
+                      f"or leave --profile on auto")
+    if choice in GPU_PROFILES and not wants_gpu:
         raise Refusal(f"{choice} needs a CUDA GPU with nvidia-smi and the sepal_runner_cuda library; this machine has: {hw.describe()}"
                       f"{'' if gpu_lib else ' (library not found)'}")
     if choice == "cpu-q8" and not args.allow_q8w:
@@ -295,9 +358,13 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     if choice == "gpu-q8w" and not args.allow_q8w:
         raise Refusal("gpu-q8w fails the q8 parity gate on this model (max |dp| 0.12 to 0.14 against 0.05, 1.1% flips on LONG-LOG); add --allow-q8 to serve it anyway")
     gpu_fail = ""
-    if wants_gpu and choice in ("auto", "gpu-f16", "gpu-q8w"):
+    if wants_gpu and choice in ("auto",) + GPU_PROFILES:
         tried = []
-        for profile in ([choice] if choice != "auto" else ["gpu-f16"]) + (["gpu-q8w"] if (args.allow_q8w and choice in ("auto", "gpu-f16")) else []):
+        if choice == "auto":
+            candidates = list(SIMT_PROFILES) if pre_ampere else ["gpu-f16"] + (["gpu-q8w"] if args.allow_q8w else [])
+        else:
+            candidates = [choice] + (["gpu-q8w"] if (args.allow_q8w and choice == "gpu-f16") else [])
+        for profile in candidates:
             if profile == "gpu-f16" and hw.vram_total < 11 * GIB:
                 tried.append(f"gpu-f16 is only used on 12 GB cards and up (this one has {hw.vram_total / GIB:.1f} GiB)")
                 continue
@@ -309,14 +376,18 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
             if profile == "gpu-q8w":
                 notes.append("WARNING: gpu-q8w serves int8 weights; on this model it exceeds the documented q8 gate (max |dp| 0.12 to 0.14 on SEC-dev and LONG-LOG, "
                              "1.1% flips on LONG-LOG). Use it only where gpu-f16 does not fit and answers near 0.5 may flip.")
+            if profile == "gpu-w8g":
+                notes.append("gpu-w8g stores int8 weights (one float32 scale per group of 128 input values; activations, keys, values and states stay float32). "
+                             "Its parity against the float profiles is still being measured; gpu-bf16 is the float profile and needs about "
+                             f"{sum(gpu_need(shape, 'gpu-bf16', 4096, 1024)) / GIB:.1f} GiB of VRAM for this model at a 4096-token window.")
             if plan.window < model_window:
                 notes.append(f"context limited to {plan.window} tokens by free VRAM (the model's window is {model_window}); longer requests get 422")
-            if plan.window < model_window or plan.profile == "gpu-q8w":
-                pass
             opts = {"max_call_tokens": plan.max_call_tokens, "trunk_budget_mib": plan.budget_mib, "prefix_cache": plan.prefix_cache}
             return Plan(profile, gpu_lib, plan.window, {**opts, "threads": min(4, hw.cores)}, notes,
                         f"about {plan.footprint / GIB:.1f} GiB of VRAM and {(shape.trunk_bytes * 1.7) / GIB:.1f} GiB of RAM at load")
         gpu_fail = "; ".join(tried)
+        if choice == "gpu-bf16":
+            gpu_fail += f"; gpu-w8g (int8 weights) needs about {sum(gpu_need(shape, 'gpu-w8g', 4096, 1024)) / GIB:.1f} GiB"
         if choice != "auto":
             raise Refusal(f"{choice} does not fit: {gpu_fail}")
         notes.append(f"GPU not used: {gpu_fail}")
@@ -350,7 +421,7 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
         small += f" The smaller Sepal-0.8B needs about {cpu_need(Shape(int(1.0e9), 1024, 12288, 20 * MIB), 8192) / GIB:.1f} GiB."
     raise Refusal(f"this model does not fit on this machine: cpu-bf16 needs about {need / GIB:.1f} GiB of free RAM (4096-token window), "
                   f"{budget / GIB:.1f} GiB are available" + (f"; {gpu_fail}" if gpu_fail else "") + "." + small +
-                  " What would fit: 16 GiB of RAM for 4B on CPU, or a 12 GB CUDA card for gpu-f16.")
+                  " What would fit: 16 GiB of RAM for 4B on CPU, a 12 GB CUDA card for gpu-f16, or an 8 GB CUDA card (GTX 10xx or later) for gpu-w8g.")
 
 
 # ---------------------------------------------------------------- main
@@ -405,7 +476,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--api-key", default=os.environ.get("SEPAL_API_KEY"), help="required for a non-loopback --host")
-    p.add_argument("--profile", default="auto", choices=["auto", "cpu-bf16", "gpu-f16", "gpu-q8w", "cpu-q8"])
+    p.add_argument("--profile", default="auto", choices=["auto", "cpu-bf16", "gpu-f16", "gpu-q8w", "gpu-bf16", "gpu-w8g", "cpu-q8"],
+                   help="auto: gpu-f16 on a 12 GB card of compute capability 8.0+, gpu-bf16 / gpu-w8g on older cards (Pascal), else cpu-bf16")
     p.add_argument("--allow-q8", "--allow-q8w", dest="allow_q8w", action="store_true",
                    help="allow the int8 profiles (gpu-q8w, cpu-q8; they exceed the parity gate on this model) when the float profile does not fit")
     p.add_argument("--base", help="a local base model directory instead of fetching the pinned one")

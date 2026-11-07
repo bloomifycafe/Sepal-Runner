@@ -15,7 +15,10 @@ namespace {
 void usage(std::ostream& out) {
     out << "usage: sepal-info <preset> [options]\n"
            "  <preset>               0.8b | 2b | 4b | 9b\n"
-           "  --weights <profile>    w16 | w8 | gpu-f16 | gpu-q8w | cpu-q8   (default w16)\n"
+           "  --weights <profile>    w16 | w8 | gpu-f16 | gpu-q8w | cpu-q8 | gpu-bf16 | gpu-w8g   (default w16)\n"
+           "                         gpu-bf16, gpu-w8g: float32 arithmetic for cards without tensor cores (Pascal);\n"
+           "                         bfloat16 / int8 weights (a float32 scale per 128 values), float32 K/V and state,\n"
+           "                         the embedding table in host memory\n"
            "  --budget-gib <x>       device memory available, in GiB         (default 12)\n"
            "  --reserve-gib <x>      memory held back from the budget         (default 0)\n"
            "  --tokens <n>           token budget of one pass                 (default 4096)\n"
@@ -98,8 +101,9 @@ int run(int argc, char** argv) {
     }
     const auto profile = sepal::find_profile(profile_id);
     if (!profile) {
-        std::cerr << "sepal-info: unknown profile '" << profile_id
-                  << "' (expected w16, w8, gpu-f16, gpu-q8w or cpu-q8)\n";
+        std::string known;
+        for (const sepal::PrecisionProfile& p : sepal::precision_profiles()) known += (known.empty() ? "" : ", ") + p.id;
+        std::cerr << "sepal-info: unknown profile '" << profile_id << "' (expected one of: " << known << ")\n";
         return 1;
     }
 
@@ -140,8 +144,14 @@ int run(int argc, char** argv) {
               << format_bytes(request.reserve_bytes) << "\n"
               << "  token budget " << request.token_budget << ", rows " << request.max_rows << ", "
               << request.min_snapshots << " snapshot(s) of " << request.min_snapshot_tokens << " state tokens\n"
-              << "  trunk weights under this profile: "
-              << format_bytes(sepal::trunk_weight_bytes(cfg, *profile)) << "\n";
+              << "  trunk weights under this profile: " << format_bytes(sepal::trunk_weight_bytes(cfg, *profile))
+              << (profile->scale_group != 0 ? " (with a float32 scale per " + std::to_string(profile->scale_group) +
+                                                  " values of every int8 matrix)"
+                                            : std::string())
+              << "\n"
+              << "  K/V per state token under this profile: "
+              << with_commas(sepal::kv_bytes_per_token(cfg, profile->kv)) << " bytes (" << sepal::name_of(profile->kv)
+              << ")\n";
 
     const sepal::PlanResult result = sepal::make_plan(request);
     if (const auto* refusal = std::get_if<sepal::Refusal>(&result)) {
