@@ -4,15 +4,21 @@
 
 ### 2026-11-07: Pascal GPUs (GTX 10xx, Tesla P40): float32 SIMT profiles gpu-bf16 and gpu-w8g, Lean GpuTrack
 
-Measured on the RTX 3060 (the Pascal box measurements are in the Sepal repository, `reports/runner-gpu-pascal/`, when run). Details:
-`runner/cuda/README.md`, "Pascal".
+Measured on the RTX 3060 and on a GTX 1080 Ti (vast.ai, CUDA 12.6); raw files in the Sepal repository, `reports/runner-gpu-pascal/`.
+Details: `runner/cuda/README.md`, "Pascal".
+
+- GTX 1080 Ti: gpu-bf16 900 tok/s at 1k tokens (p50 1.07 s), 578 at 16k, 672 on TOOL, 580 on LONG-LOG (24.6k-token records fit at a 9.2 GB
+  trunk budget); gpu-w8g at an 8 GB card's budget 967 / 578 / 743. Same logits as the 3060 to 9.5e-7 (|dp| <= 1.7e-7, no flips). The SIMT
+  multiply at 86-90% of cuBLAS 12 SGEMM (bf16), 101-109% (w8g). The float32 attention is 45% of a 16k request there: next to speed up.
+- The DeltaNet scan cannot launch on Pascal at head dim 128 (66 KB of shared memory, 48 KB per block): gpu-bf16 / gpu-w8g run the float32
+  chunked kernels on every card, the scan suites are skipped on such a card.
 
 - New profiles `gpu-bf16` (bfloat16 weights) and `gpu-w8g` (MLP weights int8 with a float32 scale per 128 input values, the rest
   bfloat16): float32 arithmetic on the ordinary CUDA cores, no tensor cores, compute capability 6.1 and up. `sepal serve` picks them on
   cards below 8.0 (bf16 when it fits, else w8g); `gpu-f16` / `gpu-q8w` are refused there. Embedding kept in host memory (1.27 GB).
 - Kernels: a float32 SIMT multiply reading bf16 or int8-group weights (fused SwiGLU and residual add; 99-101% of cuBLAS SGEMM on the
   3060; bit-exact against a host emulation of its schedule), float32 flash attention (`AttentionPath::TiledF32`), a float32 chunked (WY)
-  Gated DeltaNet (opt-in: not faster than the scan on 28 SMs). All batch-invariant.
+  Gated DeltaNet (the Pascal profiles' DeltaNet; 0.6-0.8x the scan's speed on the 3060, 3% of a call). All batch-invariant.
 - Speed (3060, one request per call): gpu-bf16 917 tok/s at 1k tokens, 752 at 16k, 818 on TOOL; gpu-w8g the same within 2%; gpu-f16
   4,180 / 3,300 / 3,670; cpu-bf16 (6 cores) 167 / 141 / 151.
 - Parity: gpu-bf16 within the gpu-f16 gate on SEC-dev n300 (0.023 / p99 0.0087 / 0 flips against the PyTorch rows) and TOOL n60 (0.0096),
@@ -20,8 +26,7 @@ Measured on the RTX 3060 (the Pascal box measurements are in the Sepal repositor
   questions, accuracy unchanged, max |dp| against gpu-bf16 0.070 (SEC-dev), 0.053 (LONG-LOG), 0.009 (TOOL): over the q8 row's 0.05 on
   single near-tie questions. int8 in the DeltaNet and attention projections moved LONG-LOG to 0.10-0.14 (1 flip), hence MLP-only.
 - Tried and not kept: TiledF32 attention with 32 query rows per block and keys staged 64 dimensions at a time (8k request 1.74 s of
-  attention) and with one row per thread over 64 dimensions (1.83 s); kept: two rows per thread over 32 dimensions (1.35 s). The float32
-  chunked DeltaNet as default (0.83x the scan). gpu-w8g with the design's int8 column (3.93 GB, LONG-LOG 0.143 / 1 flip against fp32), with
+  attention) and with one row per thread over 64 dimensions (1.83 s); kept: two rows per thread over 32 dimensions (1.35 s). gpu-w8g with the design's int8 column (3.93 GB, LONG-LOG 0.143 / 1 flip against fp32), with
   everything int8 (SEC-dev 0.040 / p99 0.0125 against the rows), with attention also bfloat16 (SEC-dev 0.051).
 - Build: tensor-core code compiled only into sm_80+ images (`SEPAL_TENSOR_CORES`); preset `pascal` (Linux, CUDA 12, sm_61); the whole CUDA
   project builds with CUDA 12.6 for sm_61;86 (CI job `cuda-compile`). `gpu_parity.cpp` builds under MSVC /WX again.

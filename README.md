@@ -52,7 +52,8 @@ Long log: about 15.9k tokens, 32 questions. Source: `runs/box-results/full15-4b/
 | CPU 2 cores / 8 GB | cpu-bf16 | does not load (needs 7.8 GiB) | | |
 | GPU 12 GB + 4 threads | gpu-f16 | 0.23 / 0.24 s (4.2 alerts/s at p95 <= 1 s) | 4.8 s | VRAM +11.1 GB |
 | GPU 8 GB | gpu-q8w (`--allow-q8`) | 0.36 s | not for states over about 7k tokens | VRAM +7.7 GB |
-| GPU 12 GB, the Pascal profile on the RTX 3060 | gpu-bf16 | 1.05 / 1.07 s (917 tok/s) | 21.1 s (752 tok/s) | weights 6.65 GiB, embedding on the host |
+| GPU 11 GB Pascal (GTX 1080 Ti) | gpu-bf16 | 1.07 / 1.08 s (900 tok/s) | 27.4 s (578 tok/s) | VRAM 11.0 GB (9.2 GB trunk budget) |
+| GPU 8 GB Pascal (1080 Ti at an 8 GB card's budget) | gpu-w8g | 0.99 s (967 tok/s) | 27.5 s (578 tok/s) | VRAM 8.2 GB, about 16k tokens of context |
 
 Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass on
 SEC-dev and TOOL. On the LONG-LOG sample every CPU path, `cpu-f32` included, is above the max and p99 gates against the reference rows (max |dp|

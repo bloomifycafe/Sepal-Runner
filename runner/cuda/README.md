@@ -1692,9 +1692,13 @@ float32 multiply of the dequantised matrix, bit for bit (`proofs/GpuTrack`, `Gro
   `proofs/GpuTrack/GpuTrack/DeltaRule.lean` proves equal to the token recurrence (decay ratios `exp(G_i - G_j)` from the in-chunk prefix sum of
   log decays, `T` by forward substitution, `W`, `U`, then the serial `Y = U - W S0`, `out`, `S_end` per chunk). Against the scan: worst relative
   rms 4.2e-7 (outputs) and 7.2e-7 (states) over rows of 1 to 4096 tokens; bit-identical across runs, layouts and alone vs in a wave
-  (`cuda_deltanet_chunked_f32_*`). It is not faster than the scan on a 28-SM card (RTX 3060, one row of 16384 tokens, per layer: scan
-  21.1 ms, chunked 25.3 ms; 2048 tokens: 2.67 vs 3.21 ms), so `DeltaNetMode::Auto` keeps the scan on the float32 path and `Chunked`
-  selects it (`deltanet: chunked`).
+  (`cuda_deltanet_chunked_f32_*`). It is what `gpu-bf16` and `gpu-w8g` run (`DeltaNetMode::Auto` with BF16 / Int8Group storage), on
+  every card: the scan takes 66,304 bytes of shared memory per block at head dim 128 and a Pascal block may have 48 KB, so the scan
+  cannot launch there at the 4B geometry (found on the GTX 1080 Ti: `cudaFuncSetAttribute` refused), and one DeltaNet kernel on every card
+  keeps the profiles' bits the same on Pascal and Ampere. It costs a little speed where the scan does run (RTX 3060, per layer, one row of
+  16384 tokens: scan 21.1 ms, chunked 25.3 ms; 8 x 2048: 13.3 vs 23.0; 32 x 512: 12.7 vs 23.1; the DeltaNet is 3% of a 4B call), and
+  about 93 KB of workspace per call token. Waves with more chunks than the workspace holds are cut into groups of rows. The log decay
+  is clamped at -110 (exp is 0 in float32 below -103.97, so no decay changes) so that `exp(G_i - G_j)` never meets `-inf - -inf`.
 - The rest (embedding gather, norms, residuals, readout, the DeltaNet scan and conv tail, the Clef head) already avoided sm_80 features;
   `launch_embed` now also takes bfloat16 tables (exact widening) and the engine can keep the table in host memory
   (`EngineOptions::host_embedding`: rows gathered on the host into a pinned buffer, one upload per call, the same bits).
@@ -1720,8 +1724,10 @@ bfloat16); the embedding (1.27 GB as bfloat16) stays in host memory. Keys and va
 DeltaNet state slot is 50.3 MiB; the call buffers take about 174 KB per call token, so `GpuDecisionEngine` picks `max_call_tokens` 2048 below
 10 GiB free (4096 from 10 GiB, 16384 from 20 GiB), and these profiles take 8 state slots (plus one per prefix-cache entry) instead of 40% of
 the pool budget, so the keys and values get the rest. An 11 GB card (1080 Ti) holds `gpu-bf16` with room for the keys and values of a
-24k-token request; an 8 GB card (1070, 1080) needs `gpu-w8g`, and with its MLP-only int8 set keeps keys and values for about 16k tokens
-(the t16k workload ran at a 6.4 GB trunk budget with calls of 1024; the design's int8 column, 3.93 GB, would leave room for 24k).
+24k-token request (measured on the 1080 Ti at a 9.2 GB trunk budget); an 8 GB card (1070, 1080) needs `gpu-w8g`, and with its MLP-only
+int8 set keeps keys and values for about 16k tokens (measured: the t16k workload at a 6.4 GB trunk budget with calls of 1024 tokens).
+`sepal serve` falls back to the wider int8 set (`w8g_int8` = mlp, dn_in, attn_in, attn_out; 3.93 GB) when the MLP-only set does not fit,
+for instance an 8 GB card that also drives a display. The float32 chunked DeltaNet adds about 93 KB of workspace per call token.
 
 **Tests** (any card from sm_61): `cuda_simt_*` (the multiply: host-emulation bit-exactness, invariance, fused epilogues, the quantiser and the
 bfloat16 rounding against host emulations, refusals), `cuda_attention_*` with the `f32/tiled` variant, `cuda_deltanet_chunked_f32_*`,
@@ -1731,8 +1737,9 @@ on the weights as the engine stores them: largest |difference| of the read-out h
 branch in one call; the chunked DeltaNet 4.1e-5 from the reference; host embedding bit-identical to the device table). Full CUDA ctest on
 the RTX 3060: 100 of 100.
 
-**Measured on the RTX 3060 12 GB** (Ampere stands in for Pascal here: same 28 SMs, float32 SIMT only; 2026-11-07, Windows, CUDA 13.1,
-driver 591.86 class; Sepal-4B F15-s0; the GPU was shared with another worker during part of the parity runs, which costs time, not bits).
+**Measured on the RTX 3060 12 GB** (2026-11-07, Windows, CUDA 13.1; Sepal-4B F15-s0). The parity rows below are from the final kernels
+(DeltaNet on the float32 chunked kernels); the speed rows from the same kernels with the DeltaNet scan, which the 3060 can run (the
+DeltaNet is 3% of a call).
 Harness and raw files: Sepal `reports/runner-gpu-pascal/` (`harness/`, `pc/`).
 
 Speed, one request per call, `max_call_tokens` 2048 (bench.py on the encoded workloads; the CPU rows are the same harness, 6 cores):
@@ -1780,7 +1787,31 @@ Which matrices are int8 in `gpu-w8g` (`EngineOptions::int8_group`, profile key `
 
 (The last set on SEC-dev: 0.034 / 0.011 / 0 against the rows, 0.047 against gpu-bf16; with the DeltaNet `out_proj` int8 too, 0.040 / 0.0125.)
 
-**Bit identity across cards.** Every kernel of these profiles is deterministic and batch-invariant (one fixed reduction order per output,
-no atomics, no split over k), so the same build input gives the same bits on any card of any architecture as long as the call cutting
-(`max_call_tokens`) is the same: the DeltaNet scan restarts its decay scale at a call boundary. The 3060's logits of the TOOL and LONG-LOG
-samples are kept as float32 bit patterns (`pc/dump_*`) for the Pascal comparison (`harness/compare_bits.py`).
+**Measured on a GTX 1080 Ti 11 GB** (vast.ai instance 59465749: driver 580.178.04, the `nvidia/cuda:12.6.3-devel-ubuntu22.04` image,
+CUDA 12.6, cuBLAS 12.6, built with the `pascal` preset; i5-8500, 31 GB; 2026-11-07; raw files in Sepal `reports/runner-gpu-pascal/box1080ti/`).
+`ctest --preset pascal` on the card: every suite that applies passes; the scan suites (`cuda_deltanet_*`) are skipped because the scan
+does not fit a Pascal block at head dim 128, and the tensor-core suites are not built for sm_61.
+
+Speed, one request per call (bench.py, the same encoded workloads as on the 3060). The trunk budget on the 11 GB card is 9.2 GB (9.4 GB did
+not open next to the CUDA context, cuBLAS and the head; total VRAM in use 11.0 GB); "8 GB" runs `gpu-w8g` at the budget of an 8 GB card
+(6.4 GB trunk, calls of 1024 tokens, 8.2 GB in use):
+
+| Profile | t1k tok/s, p50 | t16k tok/s, p50 | TOOL n60 tok/s, p50 | LONG-LOG n12 tok/s |
+|---|---|---|---|---|
+| gpu-bf16 | 900, 1.07 s | 578, 27.4 s | 672, 3.3 s | 580 (all 12 fit, 24.6k tokens the longest) |
+| gpu-w8g | | | 713, 3.0 s | 609 |
+| gpu-w8g, 8 GB budget | 967, 0.99 s | 578, 27.5 s | 743, 2.8 s (3 of 60 requests over the window: refused) | |
+| cpu-bf16, 6 cores of a Ryzen 5 7600X (for scale) | 167 | 141 | 151 | |
+
+The SIMT multiply against cuBLAS 12 SGEMM on the card (`sepal-cuda-simt-bench`, float32 weights for cuBLAS, the six 4B shapes, T = 1024 /
+2048 / 4096): bf16 at 86 / 87 / 90% of SGEMM's speed, w8g at 101 / 104 / 109% (it moves a quarter of the weight bytes); about 9 TFLOP/s on
+the out projections. Where the time goes (`sepal-cuda-simt-profile`, w8g, one 16,384-token request in calls of 2048): multiplies 14.3 s,
+attention 12.2 s, DeltaNet 0.76 s of 27.3 s. On Pascal the float32 attention runs at about 1.4 TFLOP/s at long context (half its rate on the
+3060) and is the next thing to speed up for long logs; at 1k tokens it is 5% of the call.
+
+Bit identity with the RTX 3060 (the same workloads and calls; `harness/compare_bits.py`, `compare_bits_dp.py`): not bit-identical, at the
+float32 ulp level: largest |dlogit| 9.5e-7 on TOOL n60 and LONG-LOG n12 for both profiles, largest |dp| 5.8e-8 (TOOL) and 1.3e-7
+(LONG-LOG) for gpu-bf16, 6.5e-8 and 1.7e-7 for gpu-w8g, no flips in 280 questions. Every trunk kernel of these profiles has one fixed
+order of operations per output; the difference comes from what the two builds do not share (CUDA 12.6 against 13.1 device libraries for
+`expf` / `log1pf`, cuBLAS 12 against 13 in the Clef head), not isolated further. At five orders of magnitude below the gates, the PC's
+SEC-dev parity holds for the Pascal card.
