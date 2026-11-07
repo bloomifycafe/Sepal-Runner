@@ -522,6 +522,12 @@ int main(int argc, char** argv) {
         int status = 0;
         for (const Named& geo : geos) {
             if (!deltanet_chunked_f32_supported(geo.g)) { std::cerr << "geometry not supported\n"; return 2; }
+            if (!sepal::cuda::deltanet_scan_fits_device(geo.g)) {
+                // Pascal: the scan (the reference here) needs more shared memory per block than the card has at this head size.
+                std::printf("== %s: skipped, the scan kernel needs %zu bytes of shared memory per block, more than this device allows\n", geo.name,
+                            sepal::cuda::deltanet_scan_shared_bytes(geo.g.value_head_dim));
+                continue;
+            }
             status |= run_geometry(geo, lengths, seed, opt, identity, tol, bench);
         }
         std::printf(status == 0 ? "PASS\n" : "FAIL\n");

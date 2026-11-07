@@ -187,7 +187,8 @@ target_link_libraries(sepal-cuda-deltanet-bench PRIVATE sepal_cuda_deltanet_kern
 
 foreach(suite stages growth geometry continuation waves invariance edge storage)
   add_test(NAME cuda_deltanet_${suite} COMMAND sepal_cuda_kernel_deltanet_tests ${suite})
-  set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900)
+  # Skipped (not passed) on a card whose blocks cannot hold the scan's shared memory at the real head size (Pascal).
+  set_tests_properties(cuda_deltanet_${suite} PROPERTIES TIMEOUT 900 SKIP_REGULAR_EXPRESSION "SKIPPED: the scan kernel")
 endforeach()
 
 # ---- attention kernels (full-attention mixer: norm, RoPE, K/V storage, attention, gate) ----

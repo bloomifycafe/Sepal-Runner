@@ -1251,6 +1251,10 @@ SEPAL_TEST(chains, indexed_segments_give_the_bits_of_scanned_segments) {
 SEPAL_TEST(chains, second_tiled_kernel_gives_the_bits_of_the_first) {
     // v2 (8 warps, 128 query rows, separate key and value buffers) keeps v1's tiles and order of additions: the same bits.
     const Variant tiled{AttnElem::F16, AttentionPath::Tiled, "f16/tiled"};
+    if (!sepal::cuda::device_has_tensor_cores()) {
+        std::printf("  skipped: no tensor cores on this device (the tiled kernels need compute capability 8.0)\n");
+        return;
+    }
     for (const Geometry* g : {&preset("0.8b"), &preset("4b")}) {
         const Pool pool(*g, 400, 191);
         const NormWeights weights = make_weights(*g, 192);

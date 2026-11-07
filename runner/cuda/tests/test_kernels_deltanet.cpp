@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -27,6 +28,26 @@
 #include "sepal/config.hpp"
 #include "sepal/ref/deltanet.hpp"
 #include "test.hpp"
+
+namespace {
+// The scan kernel at the real head size (128) takes 66 KB of shared memory per block: more than a Pascal card allows (48 KB). There the
+// whole suite is skipped (the Pascal profiles run the float32 chunked kernels, tested by cuda_deltanet_chunked_f32_*, and the engine
+// suites run the scan at small sizes); CTest shows it as skipped (SKIP_REGULAR_EXPRESSION).
+const bool g_scan_fits_or_exit = [] {
+    sepal::cuda::DeltaNetGeometry g;
+    g.key_heads = 16;
+    g.value_heads = 32;
+    g.key_head_dim = 128;
+    g.value_head_dim = 128;
+    g.conv_kernel = 4;
+    if (!sepal::cuda::deltanet_scan_fits_device(g)) {
+        std::printf("SKIPPED: the scan kernel needs %zu bytes of shared memory per block at head dim 128; this device allows less (Pascal)\n",
+                    sepal::cuda::deltanet_scan_shared_bytes(128));
+        std::exit(0);
+    }
+    return true;
+}();
+} // namespace
 
 namespace {
 
