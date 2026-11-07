@@ -719,6 +719,27 @@ POST /v1/systemone
 | K/V | fp16 | fp16; int8 opt-in | fp16 |
 | Clef head | fp32 (stored bf16, scalars fp32; upcasting is exact) | fp32 | fp32 |
 
+Cards without tensor cores (Pascal: GTX 10xx, Tesla P40, compute capability 6.1; added 2026-11-07). Binary16 arithmetic runs at 1/64 of the
+float32 rate there and `mma.sync` / `ldmatrix` / `cp.async` do not exist, so `gpu-f16` and `gpu-q8w` are refused below compute capability 8.0 and
+two float32 profiles take their place (`runner/cuda/README.md`, "Pascal"; the serve CLI picks them automatically on such a card):
+
+| Class | `gpu-bf16` (>= 11 GB) | `gpu-w8g` (8 GB) |
+|---|---|---|
+| Embedding | bf16, host memory (rows uploaded per call) | same |
+| MLP gate / up / down | bf16 stored, fp32 compute | int8, one fp32 scale per row and 128 input values (max abs / 127), dequantised to fp32 in the multiply; activations fp32 |
+| Attention q/k/v/o, DeltaNet `in_proj_qkv / z`, `out_proj`, `in_proj_a / b` | bf16, fp32 compute | bf16, fp32 compute (int8 selectable per group: `w8g_int8`) |
+| `A_log`, `dt_bias`, norms, conv | fp32 | fp32 |
+| Recurrent state, K/V | fp32 (K/V twice the bytes of `gpu-f16`) | fp32 |
+| Clef head | fp32 | fp32 |
+
+Both multiply on the engine's own float32 SIMT kernel (one fused multiply-add chain per output, batch-invariant, no cuBLAS). `gpu-bf16` is held
+to the `gpu-f16` row of the gate table in section 14 (it is the float twin of `cpu-bf16`); `gpu-w8g` to the `cpu-q8` row against its float twin
+`gpu-bf16` (it quantises weights only, never activations). Why only the MLP is int8 by default: on LONG-LOG against the fp32 forward, int8 in
+the DeltaNet input projections and the attention projections moved answers near 0.5 by 0.10 to 0.14 (one flip in 162), the MLP alone by 0.048
+(none); `runner/cuda/README.md`, "Pascal", has the table. Against `gpu-bf16`, MLP-only `gpu-w8g` is at 0.070 (SEC-dev n300), 0.053 (LONG-LOG
+n12) and 0.009 (TOOL n60) max |dp|, p99 0.010 / 0.039 / 0.0003, no flips in 712 questions, accuracy unchanged: the flips and accuracy
+conditions of the row hold, the max |dp| one does not (0.05), on single near-tie questions.
+
 Accumulation on `gpu-f16`. Operands are fp16 everywhere in that column; what the tensor cores add the products into is a
 separate choice, and the GPU engine's default makes it fp16 for the four groups of matrix multiplies (MLP gate/up, MLP down,
 the input projections, the output projections), which runs the multiplies at twice the fp32-accumulate rate on a GeForce card.
@@ -739,6 +760,8 @@ not counted (below 0.1% of an 8-bit matrix, per the planner's header).
 | `w16`: every weight at 16 bits (arithmetic only, not a served profile) | 1.00 | 2.75 | 7.14 | 13.84 |
 | `gpu-f16` | 1.00 | 2.75 | 7.14 | 13.84 |
 | `gpu-q8w`, `cpu-q8` | 0.54 | 1.45 | 3.83 | 7.33 |
+| `gpu-bf16` (Pascal, float32 arithmetic) | 1.00 | 2.75 | 7.14 | 13.84 |
+| `gpu-w8g` (Pascal, MLP int8 per group of 128 + float32 scales, the rest bf16) | 0.74 | 1.87 | 4.95 | 9.16 |
 | `w8`: every weight at 8 bits (arithmetic only, not a served profile) | 0.50 | 1.37 | 3.57 | 6.92 |
 
 The gap between the last two rows is the DeltaNet `out_proj` and `in_proj_a / b` kept at 16 bits and the small
@@ -925,8 +948,8 @@ RoPE layout; the `1/sqrt(dk)` scale; the output-gate activation (section 3.8).
 | Profile | max \|dp\| | Flips | Other |
 |---|---|---|---|
 | fp32 | <= 1e-4 | 0 | none |
-| `gpu-f16` | <= 0.03 (p99 <= 0.01) | <= 0.5% | dECE <= 0.002 |
-| `cpu-q8` vs its float twin | <= 0.05 | <= 1% | vs the fp32 model: accuracy >= -0.5 pp, dECE <= 0.005 |
+| `gpu-f16`; `gpu-bf16` (Pascal) | <= 0.03 (p99 <= 0.01) | <= 0.5% | dECE <= 0.002 |
+| `cpu-q8` vs its float twin; `gpu-w8g` (Pascal) vs `gpu-bf16` | <= 0.05 | <= 1% | vs the fp32 model: accuracy >= -0.5 pp, dECE <= 0.005 |
 
 These gates are design targets set before the 2026-10-13 decision; the metric (probability difference at the same question) is unchanged by it. The design record sets no row for `gpu-q8w`; provisionally it is held to the `cpu-q8` row until R4 registers its own.
 Reference tolerances, measured elsewhere by Kev: fp32 paths agree below 1e-4 (`kev@5e42a7a:tests/test_model.py:70-87`,

@@ -1,4 +1,5 @@
-// The CUDA library's profiles (sepal_runner_cuda): gpu-f16 and gpu-f32 on GpuDecisionEngine.
+// The CUDA library's profiles (sepal_runner_cuda) on GpuDecisionEngine: gpu-f16, gpu-q8w, gpu-f32, their strict forms, and the
+// float32 SIMT profiles gpu-bf16 and gpu-w8g (Pascal and later).
 #include "sepal/cuda/gpu_decision_engine.hpp"
 #include "sepal/engine.hpp"
 
@@ -17,7 +18,11 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
         else if (key == "max_call_tokens") g.max_call_tokens = static_cast<std::size_t>(value.as_uint());
         else if (key == "trunk_budget_mib") g.trunk_budget_bytes = static_cast<std::size_t>(value.as_uint()) << 20;
         else if (key == "prefix_entries") g.prefix_entries = static_cast<std::size_t>(value.as_uint());
-        else if (key == "deltanet") {
+        else if (key == "w8g_int8") { // gpu-w8g: which matrices are int8, a comma list of mlp, dn_in, dn_out, attn_in, attn_out (the rest bfloat16)
+            const std::string& v = value.as_string();
+            const auto has = [&](const char* name) { return ("," + v + ",").find("," + std::string(name) + ",") != std::string::npos; };
+            g.int8_group = cuda::Int8GroupSelect{has("mlp"), has("dn_in"), has("dn_out"), has("attn_in"), has("attn_out")};
+        } else if (key == "deltanet") {
             const std::string& mode = value.as_string();
             if (mode == "scan") g.deltanet = cuda::DeltaNetMode::Scan;
             else if (mode == "auto") g.deltanet = cuda::DeltaNetMode::Auto;
@@ -36,12 +41,14 @@ std::unique_ptr<DecisionEngine> make_gpu(const EngineOptions& o, const char* pro
 } // namespace
 
 void register_backend_profiles() {
-    const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries", "deltanet"};
+    const std::vector<std::string> keys = {"prefix_cache", "max_call_tokens", "trunk_budget_mib", "prefix_entries", "deltanet", "w8g_int8"};
     register_profile({"gpu-f16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16"); }});
     register_profile({"gpu-q8w", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-q8w"); }});
     register_profile({"gpu-f16-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f16-strict"); }});
     register_profile({"gpu-f32-strict", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32-strict"); }});
     register_profile({"gpu-f32", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-f32"); }});
+    register_profile({"gpu-bf16", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-bf16"); }});
+    register_profile({"gpu-w8g", "cuda", keys, [](const EngineOptions& o) { return make_gpu(o, "gpu-w8g"); }});
 }
 
 } // namespace sepal

@@ -37,7 +37,41 @@
 
 #include <cuda_runtime.h>
 
+// Tensor-core code (mma.sync, ldmatrix, cp.async, wmma) is compiled only into the sm_80-and-later images of a fat binary; an older
+// image (sm_61, sm_75) gets __trap() in its place. The host never launches such a kernel on an older card: the binary16
+// profiles are refused below compute capability 8.0 (gpu_decision_engine.cpp), and the float32 path uses the SIMT kernels.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#define SEPAL_TENSOR_CORES 1
+#else
+#define SEPAL_TENSOR_CORES 0
+#endif
+
 namespace sepal::cuda {
+
+/// Whether the current device can run the tensor-core kernels: compute capability 8.0 or later AND this build holds an
+/// image with them (SEPAL_CUDA_TC_IMAGE, set by CMakeLists.txt when an architecture of 80 or more is built; a Pascal-only
+/// build JIT-compiled on a newer card has only the traps). Cached per device.
+inline bool device_has_tensor_cores() {
+#if defined(SEPAL_CUDA_TC_IMAGE) && SEPAL_CUDA_TC_IMAGE == 0
+    return false;
+#else
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    static int cache[64] = {}; // 0 unknown, 1 no, 2 yes (a benign race: every writer writes the same value)
+    if (device >= 0 && device < 64 && cache[device] != 0) return cache[device] == 2;
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    const bool yes = major >= 8;
+    if (device >= 0 && device < 64) cache[device] = yes ? 2 : 1;
+    return yes;
+#endif
+}
 
 /// One row of a pass: tokens [offset, offset + length) of the flat token list.
 struct RowSpan {

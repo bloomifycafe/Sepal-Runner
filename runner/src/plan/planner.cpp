@@ -61,6 +61,25 @@ const std::vector<PrecisionProfile>& precision_profiles() {
         cpu.id = "cpu-q8";
         cpu.embedding = DType::I8;
         v.push_back(cpu);
+
+        // The Pascal profiles (sepal_runner_cuda, float32 arithmetic on ordinary CUDA cores): the embedding table
+        // stays in host memory, K/V and the recurrent state are float32, small tensors float32.
+        PrecisionProfile bf16;
+        bf16.id = "gpu-bf16";
+        bf16.embedding = DType::BF16;
+        bf16.mlp = DType::BF16;
+        bf16.mixer_proj = DType::BF16;
+        bf16.dn_sensitive = DType::BF16;
+        bf16.kv = DType::F32;
+        v.push_back(bf16);
+
+        PrecisionProfile w8g = bf16;
+        w8g.id = "gpu-w8g";
+        w8g.mlp = DType::I8;              // the default int8 set of the CUDA engine (Int8GroupSelect): the MLP only;
+        w8g.mixer_proj = DType::BF16;     // the attention and DeltaNet projections stay bfloat16 (long-log accuracy,
+        w8g.dn_sensitive = DType::BF16;   // runner/cuda/README.md, "Pascal")
+        w8g.scale_group = 128;
+        v.push_back(w8g);
         return v;
     }();
     return all;
@@ -73,10 +92,41 @@ std::optional<PrecisionProfile> find_profile(std::string_view id) {
     return std::nullopt;
 }
 
+namespace {
+
+// Float32 scales of the int8 matrices of a profile with scale_group > 0: one per row and group of input values, so
+// rows x ceil(input / group) for each matrix. Unlike the per-channel scales the other int8 profiles carry (below 0.1%
+// of an 8-bit matrix, not counted), groups of 128 add 3.1% and are counted. Zero when scale_group is 0.
+std::uint64_t group_scale_count(const ModelConfig& cfg, const PrecisionProfile& profile) {
+    const std::uint64_t group = profile.scale_group;
+    if (group == 0) return 0;
+    const auto scales = [group](std::uint64_t rows, std::uint64_t inputs) { return rows * ((inputs + group - 1) / group); };
+    const std::uint64_t h = cfg.hidden_size;
+    const std::uint64_t n_attn = cfg.num_attention_layers();
+    const std::uint64_t n_dn = cfg.num_deltanet_layers();
+    std::uint64_t count = 0;
+    if (profile.mlp == DType::I8) { // gate and up [I, H], down [H, I]
+        count += cfg.num_layers * (2 * scales(cfg.intermediate_size, h) + scales(h, cfg.intermediate_size));
+    }
+    if (profile.mixer_proj == DType::I8) { // attention q/k/v and o; DeltaNet in_proj_qkv and in_proj_z
+        count += n_attn * (scales(cfg.attn_in_proj_width(), h) + scales(h, cfg.attn_width()));
+        count += n_dn * (scales(cfg.dn_conv_dim(), h) + scales(cfg.dn_value_dim(), h));
+    }
+    if (profile.dn_out_proj.value_or(profile.dn_sensitive) == DType::I8) count += n_dn * scales(h, cfg.dn_value_dim());
+    if (profile.dn_sensitive == DType::I8) count += n_dn * 2 * scales(cfg.dn_value_heads, h); // in_proj_b, in_proj_a
+    return count;
+}
+
+} // namespace
+
 std::uint64_t trunk_weight_bytes(const ModelConfig& cfg, const PrecisionProfile& profile) {
     const ParamCounts n = count_params(cfg);
+    // count_params folds out_proj, in_proj_b and in_proj_a into dn_sensitive; a profile may type out_proj on its own.
+    const std::uint64_t dn_gates = cfg.num_deltanet_layers() * 2 * cfg.hidden_size * cfg.dn_value_heads; // in_proj_b, in_proj_a
+    const std::uint64_t dn_out = n.dn_sensitive - dn_gates;
     return n.mlp * bytes_of(profile.mlp) + n.mixer_proj * bytes_of(profile.mixer_proj) +
-           n.dn_sensitive * bytes_of(profile.dn_sensitive) + n.small * bytes_of(profile.small);
+           dn_gates * bytes_of(profile.dn_sensitive) + dn_out * bytes_of(profile.dn_out_proj.value_or(profile.dn_sensitive)) +
+           n.small * bytes_of(profile.small) + group_scale_count(cfg, profile) * bytes_of(DType::F32);
 }
 
 std::uint64_t snapshot_bytes(const ModelConfig& cfg, const PrecisionProfile& profile, std::uint64_t state_tokens) {

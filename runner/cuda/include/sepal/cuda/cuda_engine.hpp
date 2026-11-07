@@ -173,15 +173,56 @@ enum class MultiplyPath {
 /// (src/kernels_deltanet_chunked.cu) cut a row into chunks of 64 tokens and use the tensor cores: a long row gets several times faster on a big
 /// card, but they cost more per token than the scan when the card is already full of rows, and their numbers are not bit-exact (binary16
 /// operands, float32 accumulation; a row continued from a snapshot is not the uncut row bit for bit). Float16 path, natural mode only.
+/// On the float32 path the float32 chunked kernels (src/kernels_deltanet_chunked_f32.cu: the same WY form on the ordinary cores,
+/// proofs/GpuTrack/GpuTrack/DeltaRule.lean; within 1e-6 of the scan's rms) run when `Chunked` is asked for, by default (`Auto`) for
+/// the BF16 / Int8Group storage (the Pascal profiles: the same DeltaNet arithmetic on every card), and wherever the scan does not fit
+/// a block's shared memory (Pascal at value head dim 128). Otherwise `Auto` keeps the scan, which is quicker on the 28-SM cards
+/// measured (RTX 3060: scan 21 ms, chunked 25 ms per layer for one row of 16384 tokens; runner/cuda/README.md, "Pascal").
 enum class DeltaNetMode {
     Scan,    ///< always the scan kernel
     Auto,    ///< per wave of a call: the chunked kernels when a cost model says they are quicker, else the scan
     Chunked, ///< the chunked kernels for every wave they take (tests, measurements)
 };
 
+/// How the float32 path stores its matrix weights (the four multiply groups; norms, convolution and gates stay float32).
+///   Float32    float32; cuBLAS multiplies (the parity profile gpu-f32), or the engine's own float32 kernel when
+///              multiply_path is Invariant.
+///   BF16       bfloat16 (the float32 merge rounded once to nearest even), widened to float32 in the multiply kernel; the
+///              embedding table is bfloat16 too (profile gpu-bf16).
+///   Int8Group  int8 with one float32 scale per row and group of 128 values of the inner dimension (scale = max |w| / 127,
+///              round to nearest even), dequantised to float32 in the multiply kernel; the DeltaNet's in_proj_b / in_proj_a
+///              rows stay bfloat16, the embedding table is bfloat16 (profile gpu-w8g).
+/// BF16 and Int8Group multiply on the engine's own float32 SIMT kernel (src/gemm_simt_kernels.hpp): no tensor cores, so
+/// they run on every card from Pascal (sm_61) up; batch-invariant by construction (strict mode pads nothing); the MLP's
+/// SwiGLU and the residual additions after the output and down projections are fused into the multiplies. Activations,
+/// keys, values and states stay float32 (attention: AttentionPath::TiledF32). Precision::F32 only.
+enum class WeightStorage { Float32 = 0, BF16 = 1, Int8Group = 2 };
+
+/// With WeightStorage::Int8Group: which matrices are int8 (the others stay bfloat16; the DeltaNet in_proj_b / in_proj_a always do).
+/// The default is the MLP only (gate, up, down: 63% of the trunk's weights). Measured on Sepal-4B, LONG-LOG n12 against cpu-f32
+/// (the fp32 truth), max |dp| / flips of 162: MLP only 0.048 / 0; MLP and attention 0.101 / 1; MLP, attention and the DeltaNet input
+/// projections (the int8 column of docs/RUNNER.md section 11) 0.143 / 1; gpu-bf16 0.032 / 0 (runner/cuda/README.md, "Pascal").
+/// The other sets trade that accuracy on long logs for memory (3.7 GiB of weights instead of 4.6 at 4B).
+struct Int8GroupSelect {
+    bool mlp = true;       // gate, up, down
+    bool dn_in = false;    // DeltaNet in_proj_qkv, in_proj_z
+    bool dn_out = false;   // DeltaNet out_proj
+    bool attn_in = false;  // attention q (with its gate), k, v
+    bool attn_out = false; // attention o_proj
+};
+
 struct EngineOptions {
     int device = 0;
     Precision precision = Precision::F16;
+    /// Float32 path only: see WeightStorage.
+    WeightStorage weight_storage = WeightStorage::Float32;
+    /// WeightStorage::Int8Group only: see Int8GroupSelect.
+    Int8GroupSelect int8_group;
+    /// When set, the embedding table stays in host memory: a call gathers its tokens' rows on the host through this function
+    /// (float32, the values the table holds) into a pinned buffer and uploads them, and the device holds no table (at 4B that
+    /// saves 1.27 GB as bfloat16, 2.5 GB as float32). The bits are those of the device gather of the same values. Called from
+    /// `run` only, under the engine's call lock, once per token of the call.
+    std::function<void(std::uint32_t token, float* out)> host_embedding;
     /// Device memory the engine may take altogether, weights included. 0 sizes the pools for `pool_snapshots` snapshots (see
     /// there) within 85% of the memory free at creation.
     std::size_t memory_budget_bytes = 0;
@@ -198,7 +239,7 @@ struct EngineOptions {
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;
-    /// Float16 path, natural mode (gemm_rows 0) only; strict mode and the float32 path always scan. See DeltaNetMode.
+    /// See DeltaNetMode: the float16 path in natural mode only (strict mode scans); the float32 path in either mode.
     DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Float16 path only: keep the per-channel statistics of the activations of the four multiply groups while calls run
     /// (CudaEngine::activation_stats). Calibration for Int8Smoothing; slows a call down. Off by default.

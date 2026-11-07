@@ -5,8 +5,8 @@
 //   sepal_cuda_kernel_attention_tests <suite>      one of: stages, geometry, continuation, shared_context,
 //                                                  causality, invariance, positions, rope_exact, tables
 //
-// Three variants of the device path are tested everywhere: F32 keys and values with the plain kernel, F16 with the
-// plain kernel, and F16 with the tiled tensor-core kernel. Lines starting with "  [measured]" are the record the
+// Four variants of the device path are tested everywhere: F32 keys and values with the plain kernel, F16 with the
+// plain kernel, F16 with the tiled tensor-core kernel, and F32 with the tiled float32 kernel of the Pascal profiles. Lines starting with "  [measured]" are the record the
 // report quotes. The matrix multiplies that feed the mixer are not under test: the tests fill the q, k and v
 // bands of a "multiply output" with random numbers.
 
@@ -150,11 +150,24 @@ struct Variant {
     AttentionPath path;
     const char* name;
 };
+// On a card without tensor cores (Pascal) the f16/tiled variant is left out: the other three run everywhere.
 const std::vector<Variant>& variants() {
-    static const std::vector<Variant> v = {{AttnElem::F32, AttentionPath::Reference, "f32/plain"},
-                                           {AttnElem::F16, AttentionPath::Reference, "f16/plain"},
-                                           {AttnElem::F16, AttentionPath::Tiled, "f16/tiled"}};
+    static const std::vector<Variant> v = [] {
+        std::vector<Variant> all = {{AttnElem::F32, AttentionPath::Reference, "f32/plain"},
+                                    {AttnElem::F16, AttentionPath::Reference, "f16/plain"},
+                                    {AttnElem::F16, AttentionPath::Tiled, "f16/tiled"},
+                                    {AttnElem::F32, AttentionPath::TiledF32, "f32/tiled"}};
+        if (!sepal::cuda::device_has_tensor_cores()) all.erase(all.begin() + 2);
+        return all;
+    }();
     return v;
+}
+// The variants that read binary16 keys and values (f16/plain, and f16/tiled where it runs).
+std::vector<const Variant*> f16_variants() {
+    std::vector<const Variant*> out;
+    for (const Variant& v : variants())
+        if (v.kv == AttnElem::F16) out.push_back(&v);
+    return out;
 }
 
 // ---- random inputs ----
@@ -1238,6 +1251,10 @@ SEPAL_TEST(chains, indexed_segments_give_the_bits_of_scanned_segments) {
 SEPAL_TEST(chains, second_tiled_kernel_gives_the_bits_of_the_first) {
     // v2 (8 warps, 128 query rows, separate key and value buffers) keeps v1's tiles and order of additions: the same bits.
     const Variant tiled{AttnElem::F16, AttentionPath::Tiled, "f16/tiled"};
+    if (!sepal::cuda::device_has_tensor_cores()) {
+        std::printf("  skipped: no tensor cores on this device (the tiled kernels need compute capability 8.0)\n");
+        return;
+    }
     for (const Geometry* g : {&preset("0.8b"), &preset("4b")}) {
         const Pool pool(*g, 400, 191);
         const NormWeights weights = make_weights(*g, 192);
@@ -1293,16 +1310,18 @@ SEPAL_TEST(tables, unsupported_geometry_and_paths) {
         CHECK(result.used == AttentionPath::Reference);
         check_against_reference(g.name.c_str(), autov, result.rows[0], ref.row(0), nullptr, false, false);
         const Variant tiled{AttnElem::F16, AttentionPath::Tiled, "f16/tiled"};
-        CHECK_THROWS(run_device(g, pool, weights, rows, tiled), std::invalid_argument);
+        CHECK_THROWS(run_device(g, pool, weights, rows, tiled), std::invalid_argument); // also without tensor cores
     }
     {
         const Geometry& g = tiny();
         const Pool pool(g, 100, 124);
         const NormWeights weights = make_weights(g, 125);
         std::vector<RowPlan> rows = {make_row(iota_ids(0, 40), 0, nullptr)};
-        CHECK(run_device(g, pool, weights, rows, {AttnElem::F16, AttentionPath::Auto, "f16/auto"}).used == AttentionPath::Tiled);
-        CHECK(run_device(g, pool, weights, rows, {AttnElem::F32, AttentionPath::Auto, "f32/auto"}).used == AttentionPath::Reference);
+        const bool tc = sepal::cuda::device_has_tensor_cores();
+        CHECK(run_device(g, pool, weights, rows, {AttnElem::F16, AttentionPath::Auto, "f16/auto"}).used == (tc ? AttentionPath::Tiled : AttentionPath::Reference));
+        CHECK(run_device(g, pool, weights, rows, {AttnElem::F32, AttentionPath::Auto, "f32/auto"}).used == AttentionPath::TiledF32);
         CHECK_THROWS(run_device(g, pool, weights, rows, {AttnElem::F32, AttentionPath::Tiled, "f32/tiled"}), std::invalid_argument);
+        CHECK_THROWS(run_device(g, pool, weights, rows, {AttnElem::F16, AttentionPath::TiledF32, "f16/tiledf32"}), std::invalid_argument);
     }
     AttentionShape bad{7, 2, 64, 16, 1e7, 1e-6};
     CHECK_THROWS(sepal::cuda::launch_attention_prepare(bad, AttentionRows{}, AttnElem::F32, {}, {}, {}, nullptr, nullptr, {}, nullptr),
@@ -1346,7 +1365,7 @@ SEPAL_TEST(tables, subset_zero_length_strides_and_output_type) {
             CHECK(all_finite(full.rows[4].out));
         }
         // A float32 output from float16 keys and values holds exactly what the float16 output rounds.
-        for (const Variant* variant : {&variants()[1], &variants()[2]}) {
+        for (const Variant* variant : f16_variants()) {
             PassOptions wide;
             wide.use_out_override = true;
             wide.out_type_override = AttnElem::F32;

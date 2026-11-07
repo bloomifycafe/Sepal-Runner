@@ -26,21 +26,33 @@ struct PrecisionProfile {
     DType embedding = DType::F16;       // host memory unless PlanRequest::embedding_on_device
     DType mlp = DType::F16;             // gate, up, down
     DType mixer_proj = DType::F16;      // attention q/k/v/o; DeltaNet in_proj_qkv and in_proj_z
-    DType dn_sensitive = DType::F16;    // DeltaNet out_proj, in_proj_a, in_proj_b
+    DType dn_sensitive = DType::F16;    // DeltaNet out_proj, in_proj_a, in_proj_b (out_proj only unless dn_out_proj is set)
     DType small = DType::F32;           // norms, conv, A_log, dt_bias
     DType recurrent_state = DType::F32; // S in a stored snapshot
     DType conv_tail = DType::F32;       // conv tail in a stored snapshot
     DType kv = DType::F16;              // attention K and V
     DType head = DType::F32;            // pointer head
+    /// When set, the DeltaNet out_proj has this type and dn_sensitive covers in_proj_a and in_proj_b alone
+    /// (gpu-w8g: out_proj is int8 with the other mixer projections, the two small gate projections stay bfloat16).
+    std::optional<DType> dn_out_proj;
+    /// 0: no scales are counted (per-channel scales are below 0.1% of an 8-bit matrix). N > 0: every int8 matrix carries
+    /// one float32 scale per row and group of N input values, and trunk_weight_bytes counts them (3.1% at N = 128).
+    std::uint32_t scale_group = 0;
 };
 
 /// "w16" and "w8": every trunk weight at 2 or 1 bytes, the arithmetic behind the design's weight figures.
 /// "gpu-f16", "gpu-q8w", "cpu-q8": the profiles of docs/RUNNER.md section 11, where some classes stay wider.
+/// "gpu-bf16", "gpu-w8g": the float32 arithmetic profiles of the CUDA library for cards without tensor cores
+/// (Pascal, compute capability 6.x, and later). gpu-bf16 stores the matrices as bfloat16; gpu-w8g stores the MLP and
+/// the mixer input and output projections as int8 with a float32 scale per 128 input values (DeltaNet in_proj_a /
+/// in_proj_b stay bfloat16). Both keep the embedding table in host memory and hold K/V and the recurrent state in
+/// float32.
 const std::vector<PrecisionProfile>& precision_profiles();
 std::optional<PrecisionProfile> find_profile(std::string_view id);
 
 /// Bytes of the trunk weights (every non-embedding parameter) under a profile.
-/// Per-channel quantisation scales are not counted; they are below 0.1% of an 8-bit matrix.
+/// Per-channel quantisation scales are not counted; they are below 0.1% of an 8-bit matrix. Per-group scales
+/// (PrecisionProfile::scale_group > 0) are counted, rows x ceil(input values / group) float32 values per int8 matrix.
 std::uint64_t trunk_weight_bytes(const ModelConfig& cfg, const PrecisionProfile& profile);
 
 /// Bytes one stored snapshot of `state_tokens` tokens occupies: K/V for every token, plus the recurrent state

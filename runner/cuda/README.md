@@ -82,7 +82,8 @@ from `runner/` with `add_subdirectory(.. sepal_core_build)` and switches the eng
 to the parent project. Warnings are errors for the C++ (`/W4 /WX`) and for the CUDA source (`-Werror=all-warnings`
 and `/W4 /WX` for the host pass).
 
-The CMake file has a branch for Linux. It has never been run.
+The CMake file has a branch for Linux: it builds with CUDA 12.6 in the `nvidia/cuda:12.6.3-devel-ubuntu22.04` container for sm_61 and sm_86
+(the `cuda-compile` CI job; the `pascal` preset, section "Pascal" below).
 
 ## The provider
 
@@ -1653,3 +1654,164 @@ times of the default and the fastest opt-in are in the reports folder (`F-defaul
 - Nsight Compute could not be used on the box (no access to the performance counters in the container); profiling is by phase timing.
 - Not attempted for lack of time: occupancy of the chunked DeltaNet state kernel (one 100 KB block per SM, 128 blocks for one row
   run in 5 waves of a serial chain), CUDA Graphs for the layer sequence, int8 group weights (left for after the Pascal PR).
+
+## Pascal: the float32 SIMT profiles `gpu-bf16` and `gpu-w8g` (2026-11-07)
+
+GTX 10xx cards and the Tesla P40 (compute capability 6.1) run binary16 arithmetic at 1/64 of the float32 rate and have no tensor cores;
+`mma.sync`, `ldmatrix` and `cp.async` do not exist there. Everything binary16 in this engine is therefore out, and two profiles do the
+whole trunk in float32 on the ordinary cores instead:
+
+| Profile | Matrix weights | Embedding | Activations, keys/values, states | Arithmetic |
+|---|---|---|---|---|
+| `gpu-bf16` | bfloat16 (the float32 LoRA merge rounded once, nearest even) | host memory | float32 | float32 FMA |
+| `gpu-w8g` | the MLP (gate, up, down: 63% of the weights) int8, one float32 scale per row and group of 128 input values (scale = max abs / 127, round to nearest even); every other matrix bfloat16 (`EngineOptions::int8_group`, profile key `w8g_int8` for other sets; table below) | host memory | float32 | float32 FMA |
+
+Both are `Precision::F32` with `EngineOptions::weight_storage` = `BF16` / `Int8Group`, selectable on any card; the binary16 profiles are now
+refused below compute capability 8.0 (and in a build without an sm_80 image) with a message that names these two. `gpu-w8g` is weight-only
+int8: the weights are dequantised to float32 as a tile goes to shared memory (one rounded product `q * s` per weight), so the multiply is the
+float32 multiply of the dequantised matrix, bit for bit (`proofs/GpuTrack`, `GroupQuant.lean`).
+
+**The kernels.**
+
+- `src/gemm_simt_kernels.{hpp,cu}`: `Y = epilogue(X W^T)`, X float32, W float32 / bfloat16 / int8 + scales. Tiles of 128 tokens x 128
+  outputs x 16 k (64 x 128 and 32 x 128 for short calls), 256 threads with 8 x 8 outputs each, X and the widened weights staged transposed
+  in two shared buffers (the next tile is fetched into registers during the current one), 16-byte global loads (8-byte for int8, so every
+  thread converts the same number of weights; the int8-to-float conversion is an exact `2^23` magic-number subtraction), at most 128
+  registers so that two blocks share an SM. Epilogues: store; residual add in place (`x += out_proj(a)`, `x += down(a)`, the same float32
+  addition as `launch_add_rms_norm`); SwiGLU fused into the gate/up multiply (gate and up rows interleaved in blocks of 64 at load, so a
+  thread holds a gate column and its up column; the formula of `launch_swiglu`). Each output is one `fmaf` chain over k in order:
+  bit-identical to a host emulation of that chain (`simt_exact`), and across the three tile shapes, batch sizes and a row's place in the
+  batch (`simt_invariance`).
+- `src/kernels_attention.cu`, `AttentionPath::TiledF32` (chosen by `Auto` for float32 keys and values): flash attention in float32. A block
+  takes 64 query rows of one KV group (16 tokens x 4 heads at 4B, so the group's heads share every key and value it loads), two rows per
+  thread over 32 head dimensions in registers, keys in tiles of 16 counted from the chain's first token (next tile fetched during the
+  current one), causal skip past the block's last visible key, online softmax per row; the 8 slices of a score are added by a fixed
+  butterfly. A tile a row cannot see leaves its bits unchanged, so a token's result depends on its own chain only (`invariance`,
+  `causality`, `continuation` suites run it as a fourth variant).
+- `src/kernels_deltanet_chunked_f32.{hpp,cu}`: the chunked (WY) Gated DeltaNet in float32 on the ordinary cores, the formulation
+  `proofs/GpuTrack/GpuTrack/DeltaRule.lean` proves equal to the token recurrence (decay ratios `exp(G_i - G_j)` from the in-chunk prefix sum of
+  log decays, `T` by forward substitution, `W`, `U`, then the serial `Y = U - W S0`, `out`, `S_end` per chunk). Against the scan: worst relative
+  rms 4.2e-7 (outputs) and 7.2e-7 (states) over rows of 1 to 4096 tokens; bit-identical across runs, layouts and alone vs in a wave
+  (`cuda_deltanet_chunked_f32_*`). It is what `gpu-bf16` and `gpu-w8g` run (`DeltaNetMode::Auto` with BF16 / Int8Group storage), on
+  every card: the scan takes 66,304 bytes of shared memory per block at head dim 128 and a Pascal block may have 48 KB, so the scan
+  cannot launch there at the 4B geometry (found on the GTX 1080 Ti: `cudaFuncSetAttribute` refused), and one DeltaNet kernel on every card
+  keeps the profiles' bits the same on Pascal and Ampere. It costs a little speed where the scan does run (RTX 3060, per layer, one row of
+  16384 tokens: scan 21.1 ms, chunked 25.3 ms; 8 x 2048: 13.3 vs 23.0; 32 x 512: 12.7 vs 23.1; the DeltaNet is 3% of a 4B call), and
+  about 93 KB of workspace per call token. Waves with more chunks than the workspace holds are cut into groups of rows. The log decay
+  is clamped at -110 (exp is 0 in float32 below -103.97, so no decay changes) so that `exp(G_i - G_j)` never meets `-inf - -inf`.
+- The rest (embedding gather, norms, residuals, readout, the DeltaNet scan and conv tail, the Clef head) already avoided sm_80 features;
+  `launch_embed` now also takes bfloat16 tables (exact widening) and the engine can keep the table in host memory
+  (`EngineOptions::host_embedding`: rows gathered on the host into a pinned buffer, one upload per call, the same bits).
+- Tensor-core code is compiled only into images of architectures 80 and up (`SEPAL_TENSOR_CORES`, `src/device.hpp`); an sm_61 or sm_75
+  image holds traps in its place, and `device_has_tensor_cores()` (compute capability and a build with an sm_80 image) gates every path
+  that would reach them. Tests that need tensor cores are registered only when such an image is built.
+
+**Building for Pascal.** CUDA 13 cannot target sm_61 and cuBLAS 13 dropped it; the CUDA 12 pip wheels on Windows have no `nvcc`. The
+Pascal build is therefore Linux with a CUDA 12 toolkit (tested: the `nvidia/cuda:12.6.3-devel-ubuntu22.04` image), cuBLAS 12 from the
+same toolkit (the Clef head and the float32 parity profile use it; the new profiles' trunk does not call cuBLAS):
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+cd runner/cuda && cmake --preset pascal && cmake --build --preset pascal && ctest --preset pascal
+```
+
+The `pascal` preset sets `CMAKE_CUDA_ARCHITECTURES=61`, `SEPAL_CUDA_ROOT=$CUDA_HOME`; any architecture list works (`"61;86"` builds both
+images). The Windows build (`release`, CUDA 13, sm_86) is unchanged. Tools: `sepal-cuda-simt-bench` (the SIMT multiply against cuBLAS
+SGEMM on the 4B shapes), `sepal-cuda-simt-profile` (phase times of the SIMT engine on a checkpoint), `sepal-cuda-chunk-check-f32`.
+
+**Memory at 4B.** Weights on the device: `gpu-bf16` 6.65 GiB, `gpu-w8g` 4.61 GiB (the MLP as int8 bytes and 3.1% of scales, the rest
+bfloat16); the embedding (1.27 GB as bfloat16) stays in host memory. Keys and values are float32: 64 KiB per token of context (twice the binary16 profiles); a
+DeltaNet state slot is 50.3 MiB; the call buffers take about 174 KB per call token, so `GpuDecisionEngine` picks `max_call_tokens` 2048 below
+10 GiB free (4096 from 10 GiB, 16384 from 20 GiB), and these profiles take 8 state slots (plus one per prefix-cache entry) instead of 40% of
+the pool budget, so the keys and values get the rest. An 11 GB card (1080 Ti) holds `gpu-bf16` with room for the keys and values of a
+24k-token request (measured on the 1080 Ti at a 9.2 GB trunk budget); an 8 GB card (1070, 1080) needs `gpu-w8g`, and with its MLP-only
+int8 set keeps keys and values for about 16k tokens (measured: the t16k workload at a 6.4 GB trunk budget with calls of 1024 tokens).
+`sepal serve` falls back to the wider int8 set (`w8g_int8` = mlp, dn_in, attn_in, attn_out; 3.93 GB) when the MLP-only set does not fit,
+for instance an 8 GB card that also drives a display. The float32 chunked DeltaNet adds about 93 KB of workspace per call token.
+
+**Tests** (any card from sm_61): `cuda_simt_*` (the multiply: host-emulation bit-exactness, invariance, fused epilogues, the quantiser and the
+bfloat16 rounding against host emulations, refusals), `cuda_attention_*` with the `f32/tiled` variant, `cuda_deltanet_chunked_f32_*`,
+`cuda_engine_engine_simt` (the engine on a 256-wide geometry with random weights against the CPU reference executor over random request DAGs,
+on the weights as the engine stores them: largest |difference| of the read-out hidden states 4.0e-5 (bf16), 5.0e-5 (int8 group), 6.4e-5
+(float32 weights); rows bit-identical alone, in a batch, reversed, in strict mode, and a branch from a stored snapshot against the same
+branch in one call; the chunked DeltaNet 4.1e-5 from the reference; host embedding bit-identical to the device table). Full CUDA ctest on
+the RTX 3060: 100 of 100.
+
+**Measured on the RTX 3060 12 GB** (2026-11-07, Windows, CUDA 13.1; Sepal-4B F15-s0). The parity rows below are from the final kernels
+(DeltaNet on the float32 chunked kernels); the speed rows from the same kernels with the DeltaNet scan, which the 3060 can run (the
+DeltaNet is 3% of a call).
+Harness and raw files: Sepal `reports/runner-gpu-pascal/` (`harness/`, `pc/`).
+
+Speed, one request per call, `max_call_tokens` 2048 (bench.py on the encoded workloads; the CPU rows are the same harness, 6 cores):
+
+| Profile | t1k (911 tokens) tok/s, p50 | t16k (15.8k tokens) tok/s, p50 | TOOL n60 (4.6k mean) tok/s, p50 | LONG-LOG n12 (10k mean) tok/s |
+|---|---|---|---|---|
+| gpu-bf16 | 917, 1.05 s | 752, 21.1 s | 818, 3.0 s | 755 |
+| gpu-w8g (12 GB budget) | 920, 1.05 s | 741, 21.4 s | 806, 3.1 s | 744 |
+| gpu-w8g (8 GB budget: 6.4 GB trunk, calls of 1024) | 923, 1.05 s | 730, 21.8 s | | |
+| gpu-f16 (tensor cores, for reference) | 4,180, 0.23 s | 3,300, 4.8 s | 3,670 | |
+| cpu-bf16, 6 cores | 167 | 141 | 151 | |
+
+Where the time goes (`sepal-cuda-simt-profile`, gpu-bf16, one 8192-token request in calls of 2048): multiplies 7.8 s, attention 1.35 s,
+DeltaNet 0.28 s, elementwise 0.04 s of 10.0 s. The multiplies run at the SIMT kernel's 7.5 to 8 TFLOP/s, which is cuBLAS SGEMM's speed
+on this card (`sepal-cuda-simt-bench`, T = 2048, the six 4B shapes: bf16 at 99 to 101% of `cublasSgemm` on float32 weights, w8g at 99%);
+int8 weights do not run faster than bf16 here because the multiply is compute-bound, they only take less memory.
+
+Parity, question by question (`harness/parity_dump.py`, `compare_dumps.py`; max |dp| / p99 / flips at T = 1 over every option of every
+question; seeded samples of the dev panels, SEC-dev on this PC only):
+
+| | SEC-dev n300 (432 q) | TOOL n60 (118 q) | LONG-LOG n12 (162 q) |
+|---|---|---|---|
+| gpu-bf16 vs PyTorch rows | 0.023 / 0.0087 / 0 | 0.0096 / 0.0003 / 0 | 0.049 / 0.030 / 1 |
+| gpu-bf16 vs cpu-bf16 | 0.021 / 0.0042 / 0 | 0.0033 / 0.0001 / 0 | 0.032 / 0.014 / 1 |
+| gpu-bf16 vs cpu-f32 (the fp32 forward) | | | 0.032 / 0.011 / 0 |
+| cpu-bf16 vs cpu-f32 | | | 0.064 / 0.022 / 1 |
+| gpu-w8g vs gpu-bf16 (its float twin) | 0.070 / 0.010 / 0 | 0.009 / 0.0003 / 0 | 0.053 / 0.039 / 0 |
+| gpu-w8g vs PyTorch rows | 0.047 / 0.014 / 0 | 0.008 / 0.0005 / 0 | 0.073 / 0.058 / 1 |
+| gpu-w8g vs cpu-f32 | | | 0.048 / 0.044 / 0 |
+
+Accuracy is the reference's on every panel for both profiles (95.6% SEC-dev, 97.5% TOOL, 78.4% LONG-LOG). The LONG-LOG reference rows are
+bf16 autocast and fail the gate against the fp32 forward themselves (docs/PARITY-LONGLOG.md; `cpu-f32` is 0.048 / 1 flip from them here), so
+LONG-LOG is judged against `cpu-f32`: there `gpu-bf16` is twice as close as `cpu-bf16`. `gpu-bf16` passes the `gpu-f16` row of
+docs/RUNNER.md section 14 on SEC-dev and TOOL and against the fp32 forward on LONG-LOG (max 0.032 against 0.03, p99 0.011 against 0.01,
+no flip: at the gate, like every bf16 path on long logs). `gpu-w8g` keeps every answer (no flip in 712 questions) but moves single near-tie
+questions by up to 0.070 against its float twin, over the 0.05 of the `cpu-q8` row (the int8 profiles before it: 0.12 to 0.14).
+
+Which matrices are int8 in `gpu-w8g` (`EngineOptions::int8_group`, profile key `w8g_int8`), LONG-LOG n12 against cpu-f32, and 4B weights:
+
+| int8 set | max / p99 / flips | weights |
+|---|---|---|
+| MLP (default) | 0.048 / 0.044 / 0 | 4.95 GB |
+| MLP, attention q/k/v/o | 0.101 / 0.069 / 1 | 4.66 GB |
+| MLP, attention, DeltaNet `in_proj_qkv / z` (the design's int8 column) | 0.143 / 0.063 / 1 | 3.93 GB |
+
+(The last set on SEC-dev: 0.034 / 0.011 / 0 against the rows, 0.047 against gpu-bf16; with the DeltaNet `out_proj` int8 too, 0.040 / 0.0125.)
+
+**Measured on a GTX 1080 Ti 11 GB** (vast.ai instance 59465749: driver 580.178.04, the `nvidia/cuda:12.6.3-devel-ubuntu22.04` image,
+CUDA 12.6, cuBLAS 12.6, built with the `pascal` preset; i5-8500, 31 GB; 2026-11-07; raw files in Sepal `reports/runner-gpu-pascal/box1080ti/`).
+`ctest --preset pascal` on the card: 35 of 35 suites that apply pass; the scan suites (`cuda_deltanet_*`) are skipped because the scan
+does not fit a Pascal block at head dim 128, and the tensor-core suites are not built for sm_61.
+
+Speed, one request per call (bench.py, the same encoded workloads as on the 3060). The trunk budget on the 11 GB card is 9.2 GB (9.4 GB did
+not open next to the CUDA context, cuBLAS and the head; total VRAM in use 11.0 GB); "8 GB" runs `gpu-w8g` at the budget of an 8 GB card
+(6.4 GB trunk, calls of 1024 tokens, 8.2 GB in use):
+
+| Profile | t1k tok/s, p50 | t16k tok/s, p50 | TOOL n60 tok/s, p50 | LONG-LOG n12 tok/s |
+|---|---|---|---|---|
+| gpu-bf16 | 900, 1.07 s | 578, 27.4 s | 672, 3.3 s | 580 (all 12 fit, 24.6k tokens the longest) |
+| gpu-w8g | 976, 0.98 s | 608, 26.1 s | 713, 3.0 s | 609 |
+| gpu-w8g, 8 GB budget | 967, 0.99 s | 578, 27.5 s | 743, 2.8 s (3 of 60 requests over the window: refused) | |
+| cpu-bf16, 6 cores of a Ryzen 5 7600X (for scale) | 167 | 141 | 151 | |
+
+The SIMT multiply against cuBLAS 12 SGEMM on the card (`sepal-cuda-simt-bench`, float32 weights for cuBLAS, the six 4B shapes, T = 1024 /
+2048 / 4096): bf16 at 86 / 87 / 90% of SGEMM's speed, w8g at 101 / 104 / 109% (it moves a quarter of the weight bytes); about 9 TFLOP/s on
+the out projections. Where the time goes (`sepal-cuda-simt-profile`, w8g, one 16,384-token request in calls of 2048): multiplies 14.3 s,
+attention 12.2 s, DeltaNet 0.76 s of 27.3 s. On Pascal the float32 attention runs at about 1.4 TFLOP/s at long context (half its rate on the
+3060) and is the next thing to speed up for long logs; at 1k tokens it is 5% of the call.
+
+Bit identity with the RTX 3060 (the same workloads and calls; `harness/compare_bits.py`, `compare_bits_dp.py`): not bit-identical, at the
+float32 ulp level: largest |dlogit| 9.5e-7 on TOOL n60 and LONG-LOG n12 for both profiles, largest |dp| 5.8e-8 (TOOL) and 1.3e-7
+(LONG-LOG) for gpu-bf16, 6.5e-8 and 1.7e-7 for gpu-w8g, no flips in 280 questions. Every trunk kernel of these profiles has one fixed
+order of operations per output; the difference comes from what the two builds do not share (CUDA 12.6 against 13.1 device libraries for
+`expf` / `log1pf`, cuBLAS 12 against 13 in the Clef head), not isolated further. At five orders of magnitude below the gates, the PC's
+SEC-dev parity holds for the Pascal card.

@@ -27,6 +27,10 @@ gated, so accept their terms on the Hub first, or point it at a directory you al
   prefix-state cache sized from the spare RAM. Next to another engine on the same server, give it its own cores with `--cpus 8-19`
   (one thread per physical core, pinned; see [runner/README.md](runner/README.md#running-next-to-another-engine-for-example-strata-on-the-same-server));
   `--cpu-isa` forces a kernel set (`avx2-tuned` is chosen automatically on AVX2 CPUs without AVX-512, and a set the CPU lacks is refused).
+- On a card without tensor cores (compute capability below 8.0: Pascal GTX 10xx and Tesla P40, also Volta and Turing) `gpu-f16` and `gpu-q8w`
+  are refused and `auto` picks `gpu-bf16` (bfloat16 weights, float32 arithmetic on the ordinary CUDA cores) when it fits, else `gpu-w8g` (the
+  same with the MLP weights int8, one float32 scale per 128 input values). Both can be asked for on any card; on Ampere and newer `gpu-f16`
+  is about 4.5 times faster. See [runner/cuda/README.md](runner/cuda/README.md#pascal-the-float32-simt-profiles-gpu-bf16-and-gpu-w8g-2026-11-07).
 - `gpu-q8w` and `cpu-q8` (int8) only with `--allow-q8`, with a printed warning: on this model they exceed the q8 parity gate (see below).
 - A model that fits neither is refused before anything is loaded, with the numbers and what would fit.
 
@@ -48,6 +52,8 @@ Long log: about 15.9k tokens, 32 questions. Source: `runs/box-results/full15-4b/
 | CPU 2 cores / 8 GB | cpu-bf16 | does not load (needs 7.8 GiB) | | |
 | GPU 12 GB + 4 threads | gpu-f16 | 0.23 / 0.24 s (4.2 alerts/s at p95 <= 1 s) | 4.8 s | VRAM +11.1 GB |
 | GPU 8 GB | gpu-q8w (`--allow-q8`) | 0.36 s | not for states over about 7k tokens | VRAM +7.7 GB |
+| GPU 11 GB Pascal (GTX 1080 Ti) | gpu-bf16 | 1.07 / 1.08 s (900 tok/s) | 27.4 s (578 tok/s) | VRAM 11.0 GB (9.2 GB trunk budget) |
+| GPU 8 GB Pascal (1080 Ti at an 8 GB card's budget) | gpu-w8g | 0.99 s (967 tok/s) | 27.5 s (578 tok/s) | VRAM 8.2 GB, about 16k tokens of context |
 
 Parity against the PyTorch reference rows (SEC-dev, TOOL, LONG-LOG samples; gates in docs/RUNNER.md section 14): `cpu-bf16` and `gpu-f16` pass on
 SEC-dev and TOOL. On the LONG-LOG sample every CPU path, `cpu-f32` included, is above the max and p99 gates against the reference rows (max |dp|

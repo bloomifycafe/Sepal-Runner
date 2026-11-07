@@ -613,3 +613,154 @@ only within this tolerance. This section is prose; the constants (`c`, counting 
   applies with `b = 128` (`B = 128` key tiles at 16k): N = 127 + 3 + 127*5 = 765 roundings for the worst-case term, bound about 9e-5 V
   (prose, not machine-checked). Measured on random 16k inputs: both kernels within 2e-7 of a float64 softmax (Tiled 9.8e-8, Flash 1.8e-7 on 12 sampled
   rows x 16 heads; sepal-cpu-attn-bench on the Broadwell box).
+
+---
+
+## 11. GpuTrack: Pascal SIMT kernels (2026-11-07)
+
+Lake project `proofs/GpuTrack/` (`lakefile.toml`, `lean-toolchain` = `leanprover/lean4:v4.36.0-rc2`, core Lean only, no Mathlib, no
+dependency on `ExactTrack`). Build, from a clean checkout: [T]
+
+```
+cd Sepal-Runner/proofs/GpuTrack
+lake build        # Windows here: set ELAN_HOME=E:\MYCOMPANY\BlumSOC\ref\lean\_elan first, put %ELAN_HOME%\bin on PATH
+```
+
+Clean build 3.2 s (4 modules, Windows, toolchain already installed); `ExactTrack` 2.1 s. No `sorry`, no `admit`, no `axiom`; `#print axioms` on the
+main theorems shows only `propext`, `Classical.choice`, `Quot.sound` (core). [T] CI job `lean-proofs` (`.github/workflows/ci.yml`, ubuntu-22.04)
+installs elan with `--default-toolchain none` and runs `lake build` in `proofs/ExactTrack` and `proofs/GpuTrack`; elan downloads the toolchain
+named by each `lean-toolchain`, so the run time is dominated by that download, not by the proofs.
+
+Ring tactics: core's `Lean.Grind.CommRing` class and the `grind` ring solver work on an abstract commutative ring (`DeltaRule`, `GroupQuant` (a)).
+`Sum.lean` defines `sum n f = f 0 + ... + f (n-1)` for `f : Nat -> α` and proves the sum lemmas used (linearity, swap `sum_comm`, split, extend by
+zeros, Kronecker delta `sum_ite_eq`, blocks `sum_blocks`). Vectors and matrices are total functions `Nat -> α`, `Nat -> Nat -> α`; ranges appear only in
+sums, so there are no bounds proofs.
+
+What the proofs are about: three kernel files in `runner/cuda/src/` that the runner's Pascal backend adds: `gemm_simt_kernels.cu` (fp32 SIMT GEMM, plain,
+fused SwiGLU, dequantising int8), `kernels_attention.cu` (f32 tiled path) and `kernels_deltanet_chunked_f32.cu` (f32 chunked delta rule). At the time
+of writing these files were still being written, so every statement below is about the design model, not about CUDA text; the correspondence between a
+model and a `.cu` file is by review (each model lists its assumptions under "Not modelled"). The existing tensor-core chunked kernel
+`kernels_deltanet_chunked.cu` uses the same algebra (`A = diag(beta) tril(K K^T gamma_i/gamma_j, -1)`, `T = (I+A)^-1`, `W`, `U`, `Y = U - W S0`,
+`out`, `S_end`), so `DeltaRule` also describes it.
+No new Lean module was asked for or written for the `kernels_attention.cu` f32 tiled path: the existing `ExactTrack/OnlineSoftmax.lean` (section 10.3)
+is the only machine-checked statement about online-softmax attention, over the reals; the fp32 error argument is the prose of section 10.4.
+
+### 11.1 `GpuTrack/DeltaRule.lean` (namespace `GpuTrack.DeltaRule`): chunkwise WY form equals the token recurrence
+
+Over an abstract commutative ring `α` (no division, so no nonzero hypotheses). Exact ring identities: fp32 or fp16 rounding is NOT modelled (the real
+kernels agree with the scan within a tolerance that is tested, not proved). `Gam i j = Π_{l=j+1..i} a_l` is a product, never `gamma_i / gamma_j`, so
+it stays correct when a decay product underflows. State is `S i j` (key `i`, value `j`); the value dimension `dv` is not named because the recurrence
+never sums over `j`: every statement holds for every column index.
+
+Definitions: `step` (one token: `S' = a S`, `corr_j = beta (v_j - Σ_i k_i S'_ij)`, `S_new = S' + k ⊗ corr`, the order of `delta_rule_update` in
+`runner/include/sepal/ref/deltanet.hpp`), `scanState` (state after `t` tokens), `scanOut` (token `t` reads the state after its own update),
+`Amat` (`A i j = beta_i Gam_ij (k_i . k_j)` for `j < i`, else 0), `Tmat` (forward substitution: `T i j = [i=j] - Σ_{j<=l<i} A i l T l j`, defined
+with a fuel counter `Tf`), `Wmat`, `Umat`, `Ymat` (`W = T diag(beta gamma) K`, `U = T diag(beta) V`, `Y = U - W S0`), `chunkOut`, `chunkEnd`.
+
+Theorems (all machine-checked):
+- `Tmat_eq`: `T` satisfies its defining forward-substitution equation (the fuel is irrelevant, `Tf_stable`). `Tmat_above`: `T i j = 0` for `j > i`.
+  `Tmat_diag`: `T i i = 1`.
+- `Tmat_mul_split` and `Tmat_mul`: `(I + A) T = I`: for `i < n` and every `j`, `Σ_{l<n} ([i=l] + A i l) T l j = [i=j]`, for any strictly lower
+  triangular `A` (hypothesis `A i l = 0` for `i <= l`).
+- `tri_unique`: if `x_i + Σ_{j<i} A i j x_j = 0` for all `i < n` then `x_i = 0` for all `i < n`.
+- `scanState_formula`: the scan state after `t` tokens is `gamma_{t-1} S0 + Σ_{j<t} Gam_{t-1,j} k_j ⊗ delta_j`, where `delta_j = beta_j (v_j - a_j S_{j-1}^T k_j)`.
+- `delta_eq`: the scan's `delta` solves `(I + A) delta = diag(beta) V - diag(beta gamma) K S0`. `Ymat_eq_TF`: `Y = T F` (`F` that right-hand side).
+  `Ymat_eq`: `(I + A) Y = F` on `[0, n)`. `delta_eq_Y`: `delta_j = Y_j` for every `j < n` (uniqueness of the forward substitution).
+- (a) `chunkOut_eq_scanOut`: for every `i < n` and every column, `out_i = gamma_i (q_i^T S0) + Σ_{j<=i} Gam_ij (q_i . k_j) Y_j` equals the scan output of
+  token `i` started from `S0`.
+- (b) `chunkEnd_eq_scanState`: `S_end` equals the scan state after the `n` tokens (also for `n = 0`, where it is `S0`); `chunkEnd_spec`: for `n >= 1`,
+  `gamma_{n-1} S0 + Σ_{j<n} Gam_{n-1,j} k_j ⊗ Y_j` equals the scan state after `n` tokens.
+- (c) `chunkedState` hands `S_end` of each chunk to the next; chunk `c` is tokens `c*C ..` of a row of `L` tokens, chunk length `min C (L - c*C)`.
+  `chunkedState_eq`: the state handed to chunk `c` is the scan state after `min (c*C) L` tokens (any `C >= 1`, last chunk shorter, chunks past the
+  end empty). `chunked_out_eq`: for every token `t < L` the output of local index `t % C` of chunk `t / C`, started from the handed state, equals the
+  scan output of token `t` of the whole row. `chunked_final`: after `numChunks L C = ⌈L/C⌉` chunks the state is the scan state after `L` tokens.
+- Sanity check (not part of the build): a `#eval` over `Int` with `dk = 3`, 5 tokens, arbitrary small data gave identical `chunkOut`/`scanOut`
+  and `chunkEnd`/`scanState` values, and `T` came out unit lower triangular and not trivial.
+
+Not modelled: rounding of any kind, the 64-token chunk size or the 16 x 16 block inverse of the tensor-core kernel (any `C` is covered), the
+conv/SiLU/L2-norm/gate/RMSNorm stages around the recurrence, the layout of `K`, `Q` in memory. The theorem says the chunk algorithm is the
+recurrence; it does not say the fp32 `T` computed by a given inversion order is accurate (that depends on `|A|`; prose only).
+
+### 11.2 `GpuTrack/GemmSchedule.lean` (namespace `GpuTrack.Gemm`): the SIMT GEMM schedule is deterministic
+
+Kernel for `Y[t, n] = Σ_k X[t, k] * Wd[n, k]`. `α` and `fma : α -> α -> α -> α` uninterpreted (no law, models fp32 fma bit for bit), `zero`.
+`wd : Nat -> Nat -> α` is the weight matrix as the fma sees it; it is the widened (bf16 to fp32) or dequantised value and may depend on `(n, k)`
+(`wdOf widen W` is the bf16 case `wd n k = widen (W n k)`). The reference `ref t n K` is `fma (X t k) (wd n k) acc` for `k = 0 .. K-1` from `zero`.
+
+Model: `tiled` (the k loop in tiles of `BK` in increasing order, accumulator carried across tiles); `loadTile` (block-local shared tile, global
+elements copied and widened once); `accTile`; `smemAt`/`pipeAcc` (double-buffered pipeline: tile 0 into slot 0, iteration `s` prefetches tile `s+1` into
+slot `s+1`, the compute of tile `s` reads slot `s` after that prefetch has landed, starting from garbage shared memory); `Launch` (grid `GT × GN`,
+blocks of `BM × BN`, `nthr` threads, `own bt bn tid` = any list of block-local cells of thread `tid`); `Launch.evs` (all writes, bounds-guarded);
+`applyEvs` (write events applied in a given order, last wins).
+
+Theorems (all machine-checked):
+- `tiled_eq_ref` / `tiled_full_eq_ref`: tiled accumulation equals `ref` when the tiles cover `K` (`K <= S*BK`; with `S = numTiles BK K = ⌈K/BK⌉`,
+  needs `BK >= 1`), for every `BK >= 1` and every `K`. `tileKs_eq_range'`: tile `s` is `[s*BK, min((s+1)*BK, K))`.
+- `pipeAcc_eq_ref` (and `pipeAcc_eq_tiled`): the double-buffered pipeline computes exactly `ref`, for any slot assignment `slot` with consecutive tiles
+  in different slots (`smem_after`; `slot s = s % 2` is `slot_mod_two`), whatever the initial shared memory holds.
+- `Launch.run_correct`: for a valid launch (`BM, BN >= 1`, `T <= GT*BM`, `N <= GN*BN`, every thread owns only cells of its block, every cell of every
+  block is owned by some thread) and every interleaving `evs` of its writes (`evs.Perm (L.evs cv)`), if every in-bounds block value `cv` equals the
+  target of its global cell, then each output `(t, n)` with `t < T`, `n < N` holds its target and no cell outside `T × N` is written.
+- `gemm_correct`: for every `BM, BN, BK >= 1`, every `K`, every valid launch (any thread assignment, any grid covering the output), every slot
+  assignment with consecutive tiles in different slots and every write interleaving, every output equals `e t n (ref t n K)` for an arbitrary epilogue
+  `e` (residual add `e t n acc = r t n + acc`, bf16 store, ...) bit for bit, and cells outside `T × N` keep their old content.
+  `gemm_correct_widen`: the same with `wd = wdOf widen W` (weights stored narrow, `widen` applied when the tile is copied).
+  `gemm_launches_agree`: two launches with different tile shapes, `BK`, thread assignments and interleavings produce the identical output map.
+  `gemm_oneCell_double_buffer`: the canonical instance (one cell per thread, `s % 2` slots, canonical write order).
+- `Launch.oneCell_valid`, `Launch.regTile_valid`: the two usual thread assignments are valid launches (one cell per thread row-major; a `TY × TX` thread
+  grid with `TM × TN` register tiles), so the hypotheses are satisfiable by real kernels.
+- Fused SwiGLU. `wdPack wg wu` is the matrix whose packed row `128 b + r` is gate row `64 b + r` and packed row `128 b + 64 + r` is up row `64 b + r`
+  (`r < 64`); `wdPack_gate`, `wdPack_up`. Layout: `packG f = 128 (f/64) + f%64` is injective (`packG_inj`), gate rows and up rows land on disjoint packed
+  rows (`packG_ne_up`, `packG_up_inj`), and for `I = 64 m` every packed row `< 2 I` is a gate or up row of some feature `< I` (`packed_covers`).
+  `fused_swiglu_correct`: with `L.BN = 64` features per block, a block tile of 128 packed columns (`n0 = 128 bb`), the thread owning `(dt, r)` accumulating
+  packed columns `r` and `r + 64` together (`fusedCell`) and `swiglu` uninterpreted, every output `out[t, f]` with `t < T`, `f < N` equals
+  `swiglu (ref gate row f) (ref up row f)` for every feature, every tiling, thread assignment and interleaving; nothing outside the output is written.
+  (`I` a multiple of 64 is needed for the layout lemma `packed_covers`; the equality itself holds for every `f` in the output range.)
+
+Not modelled (assumptions the CUDA code must meet): the accumulate is exactly one `fma(x, w, acc)` chain per output in increasing `k` from `+0`
+(no split-K, no several partial accumulators, no `float4` pairs added at the end); the k loop of the last tile stops at `K` (the model's tile
+length is `min BK (K - s*BK)`); if the kernel instead zero-pads and runs `fma(0, w, acc)` it equals `acc` bit for bit except when `acc = -0` (gives `+0`),
+so require `K mod BK = 0` or a bounded loop; `__syncthreads` placement and data races beyond the slot condition; bank conflicts; vector loads; what `fma`,
+`widen`, `swiglu` compute; the epilogue reads only `(t, n)` and the final accumulator (a residual `r[t, n]` is a function of `(t, n)`).
+
+### 11.3 `GpuTrack/GroupQuant.lean` (namespace `GpuTrack.GroupQuant`): group-int8 dequantised GEMM
+
+Format: int8 `q n k`, one scale `s n (k / g)` per group of `g` consecutive `k` (`g = 128`, `K = G * g`).
+- (a) `group_dequant_sum` (machine-checked, commutative ring `α`, `g >= 1`, `q` an integer embedded in `α`):
+  `Σ_{k < G*g} x_k (s_{k/g} q_k) = Σ_{grp < G} s_grp (Σ_{r < g} x_{grp g + r} q_{grp g + r})`. This is the exact-arithmetic identity behind "int dot per group,
+  scale once"; the dequantise-first kernel is NOT bit-identical to the grouped order in fp32 (different rounding), they agree only over the ring.
+- (b) `dequant mul ofInt q s g n k = mul (ofInt (q n k)) (s n (k / g))` is the weight the kernel builds when a tile goes to shared memory (`mul`, `ofInt`
+  uninterpreted). `loadTile_dequant`: the shared-tile element at `(dn, dk)` is the dequantised weight at its GLOBAL index `(n0 + dn, s*BK + dk)`, so `BK`
+  need not be a multiple of `g`. `quant_gemm_correct` (machine-checked, derived from `Gemm.gemm_correct` with `wd := dequant ...`): every output equals
+  `e t n (ref over the dequantised matrix)` bit for bit, for every `BM, BN, BK >= 1`, `K`, thread assignment, covering grid, slot assignment and write
+  interleaving. `quant_launches_agree`: two tilings give the identical output map. The dequantisation happens once per weight element, before any
+  accumulation, so it cannot depend on the tiling.
+- (c) Error bound. Machine-checked over `Int` (every weight, scale and activation is an integer in one common unit `u`; a real weight is `w u`): with
+  `clamp127 z = max (-127) (min 127 z)` and `quantRound w s = clamp127 (⌊(2w + s) / (2s)⌋)` (round to nearest, ties up),
+  - `quantRound_eq`: if `s > 0` and `|w| <= 127 s` the clamp never fires, `quantRound w s = ⌊(2w + s)/(2s)⌋` (this is the case `s = max|w| / 127`);
+  - `quantRound_err` / `quantRound_abs_err`: `-s <= 2 (w - s q) < s`, i.e. `|w - s q| <= s/2` per element;
+  - `dot_quant_err`: for `K = G g`, `g >= 1`, `s_grp > 0` and `|w_k| <= 127 s_{k/g}`, with `y = Σ x_k w_k` and `y_deq = Σ x_k (s_{k/g} q_k)`:
+    `2 |y - y_deq| <= Σ_grp s_grp (Σ_{k in grp} |x_k|)`, i.e. `|y - y_deq| <= Σ_grp (s_grp / 2) Σ_{k in grp} |x_k|` (uses `Int.natAbs` and the triangle inequality `natAbs_sum_le`).
+  The same statements hold over the reals by scaling; the real-number version is not in core Lean and was not proved. Round-half-even instead of
+  ties-up changes nothing (the bound `s/2` holds for every nearest rounding).
+  Prose, NOT machine-checked, from here on:
+  - Extra fp32 error of the dequantised value `fl(s q)`: `|fl(s q) - s q| <= 2^-24 |s q| <= 2^-24 (|w| + s/2)`, about `1.5e-5` times the quantisation bound; negligible.
+    The accumulation rounding of the fp32 fma chain (`gamma_K sum |x| |w_deq|`) is the same for bf16 and int8 weights and is not included in `dot_quant_err`.
+  - bf16 storage (round to nearest even, 8 significant bits counting the implicit one, normal range): `|w - bf16(w)| <= 2^-8 |w|`, so
+    `|y - y_bf16| <= 2^-8 Σ_k |x_k| |w_k|`. The task brief wrote `2^-9`; the right bound is `2^-8` (unit roundoff `2^-p` with `p = 8`; at `w = 1 + 2^-8`
+    the absolute error is `2^-8`, relative `2^-8/(1 + 2^-8)`, so `2^-9` is false), `2^-9 |w|` holds only in the upper part of each binade (the relative half-ulp ranges over `(2^-9, 2^-8]`).
+  - Comparison. Per element the int8 bound is `m_g/254` (`m_g = max |w|` in the group), the bf16 bound is `|w|/256`. Since `|w| <= m_g` the int8 worst-case
+    bound is never smaller: ratio `(256/254) m_g/|w| >= 1.008`, reaching 1.008 only for the group's largest weight, 4 times at `|w| = m_g/4`,
+    10 times at `|w| = m_g/10`. For the dot product the int8 bound is `(1/254) Σ_grp m_g Σ_{k in grp} |x_k|` against `(1/256) Σ_k |x_k||w_k|`:
+    larger whenever the group has any element below its maximum, and the gap grows with the outlier ratio `m_g / mean|w|`.
+  - Typical size (estimate only, not measured): for roughly Gaussian weights in a group of 128, `m_g ~ 2.6 sigma`, int8 rms error `s/sqrt(12) ~ 0.006 sigma` per weight;
+    bf16 relative rms error is about `0.001 to 0.002 |w|`, i.e. about `0.001 to 0.002 sigma`. So int8 is expected to be about 3 to 6 times worse in rms error than bf16 on such
+    groups, and worse on groups with outliers. The only case where int8 loses nothing is a group whose weights all have almost the same magnitude. Zero weights are exact in both.
+
+### 11.4 What is machine-checked and what is prose in this section
+
+Machine-checked (all of 11.1 to 11.3 except the items marked prose): every theorem named above, over the abstract settings stated (ring `α`; uninterpreted `fma`,
+`widen`, `mul`, `ofInt`, `swiglu`, epilogue `e`; `Int` for the quantisation error).
+Prose only: the correspondence between the models and the `.cu` files (checked by review, files were being written); every fp32 or fp16 error claim (delta-rule
+`T` accuracy, `fl(s q)` rounding, accumulation error); the bf16 bound `2^-8`; the comparison and the typical-size estimate in 11.3 (c); the 16 x 16 block inverse of the
+tensor-core kernel is not modelled (any chunk size and any exact inverse are covered).

@@ -1,0 +1,5 @@
+name = "GpuTrack"
+defaultTargets = ["GpuTrack"]
+
+[[lean_lib]]
+name = "GpuTrack"

@@ -1,6 +1,10 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "release",
@@ -10,16 +14,44 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "pascal",
+      "displayName": "Ninja release for Pascal (sm_61) with a CUDA 12 toolkit (Linux; CUDA 13 cannot target Pascal)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/pascal",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "61",
+        "SEPAL_CUDA_ROOT": "$env{CUDA_HOME}",
+        "CMAKE_CUDA_COMPILER": "$env{CUDA_HOME}/bin/nvcc"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "release" }
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "pascal",
+      "configurePreset": "pascal"
+    }
   ],
   "testPresets": [
     {
       "name": "release",
       "configurePreset": "release",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "pascal",
+      "configurePreset": "pascal",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

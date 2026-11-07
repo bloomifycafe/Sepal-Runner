@@ -40,4 +40,29 @@ jobs:
         working-directory: runner
         shell: cmd
 
-  # The CUDA backend (runner/cuda) and the golden-set parity need a GPU box and the model files; they are run by hand (see README.md).
+  # Machine-checked Lean 4 proofs (core Lean only, no Mathlib); the toolchain is fetched by elan from each project's lean-toolchain.
+  lean-proofs:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan (no default toolchain)
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: lake build
+        working-directory: proofs/ExactTrack
+      - run: lake build
+        working-directory: proofs/GpuTrack
+
+  # The CUDA project compiled (not run: no GPU here) with CUDA 12 for Pascal (sm_61, the float32 SIMT profiles only) and Ampere (sm_86, the
+  # tensor-core kernels too), so both code paths of every kernel file are built on every change (runner/cuda/README.md, "Pascal").
+  cuda-compile:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build python3-pip && pip3 install -q cmake
+      - run: cmake -S runner/cuda -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="61;86" -DSEPAL_CUDA_ROOT=/usr/local/cuda -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+      - run: cmake --build build -j 4
+
+  # Running the CUDA tests and the golden-set parity needs a GPU box and the model files; they are run by hand (see runner/cuda/README.md).
