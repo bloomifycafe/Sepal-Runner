@@ -809,21 +809,50 @@ void validate(const DeltaNetGeometry& g, const DeltaNetRows& rows) {
     if (rows.wave_size > 65535u) throw std::invalid_argument("deltanet: a wave of more than 65535 rows");
 }
 
+} // namespace
+
+std::size_t deltanet_scan_shared_bytes(std::uint32_t value_head_dim) {
+    const int dv = static_cast<int>(value_head_dim);
+    return (2u * static_cast<std::size_t>(detail::stage_floats(dv)) + 2u * static_cast<std::size_t>(detail::kChunk) * value_head_dim) * sizeof(float);
+}
+
+bool deltanet_scan_fits_device(const DeltaNetGeometry& geometry) {
+    int device = 0, optin = 48 * 1024;
+    if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        optin = 48 * 1024;
+    }
+    return deltanet_scan_shared_bytes(geometry.value_head_dim) <= static_cast<std::size_t>(std::max(optin, 48 * 1024));
+}
+
+namespace {
+
 template <class OutT, class InT, int TAPS, bool HS>
 void run_scan(const detail::WaveArgs& args, std::uint32_t wave_size, std::uint32_t value_heads, std::uint32_t dv,
               cudaStream_t stream) {
-    const std::size_t smem_bytes =
-        (2u * static_cast<std::size_t>(detail::stage_floats(static_cast<int>(dv))) + 2u * detail::kChunk * dv) * sizeof(float);
-    // More than 48 KB of dynamic shared memory has to be allowed per kernel; allow the largest head dimension once.
-    static const bool configured = [] {
+    const std::size_t smem_bytes = deltanet_scan_shared_bytes(dv);
+    // More than 48 KB of dynamic shared memory has to be allowed per kernel: allow the largest head dimension once, or as much as the
+    // device allows (48 KB on Pascal, where the 4B geometry's 66 KB does not fit: the engine runs the float32 chunked kernels there).
+    static const int allowed = [] {
         constexpr int kMaxDv = static_cast<int>(kDeltaNetMaxHeadDim);
-        constexpr int max_bytes = (2 * detail::stage_floats(kMaxDv) + 2 * detail::kChunk * kMaxDv) * static_cast<int>(sizeof(float));
-        check(cudaFuncSetAttribute(detail::deltanet_scan_kernel<OutT, InT, TAPS, HS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   max_bytes),
-              "cudaFuncSetAttribute");
-        return true;
+        const int max_bytes = static_cast<int>(deltanet_scan_shared_bytes(kMaxDv));
+        int device = 0, optin = 48 * 1024;
+        if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            optin = 48 * 1024;
+        }
+        const int bytes = std::min(max_bytes, std::max(optin, 48 * 1024));
+        if (bytes > 48 * 1024) {
+            check(cudaFuncSetAttribute(detail::deltanet_scan_kernel<OutT, InT, TAPS, HS>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes),
+                  "cudaFuncSetAttribute");
+        }
+        return bytes;
     }();
-    (void)configured;
+    if (smem_bytes > static_cast<std::size_t>(allowed)) {
+        throw std::invalid_argument("deltanet: the scan kernel needs " + std::to_string(smem_bytes) + " bytes of shared memory at value head dim " +
+                                    std::to_string(dv) + "; this device allows " + std::to_string(allowed) +
+                                    " per block (use the float32 chunked kernels, deltanet_scan_fits_device)");
+    }
     // One scan thread per column quad and key lane, rounded up to whole warps.
     const std::uint32_t quads = (dv + detail::kCols - 1) / detail::kCols;
     const std::uint32_t scan_threads = std::max(32u, (quads * detail::kKeyLanes + 31) / 32 * 32);

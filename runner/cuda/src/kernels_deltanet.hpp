@@ -152,6 +152,11 @@ void launch_deltanet_scan(const DeltaNetGeometry& geometry, const DeltaNetWeight
                           OutT* out, std::size_t out_stride, cudaStream_t stream,
                           const DeltaNetOptions& options = {});
 
+/// Dynamic shared memory the scan kernel takes at a value head dimension (66,304 bytes at 128: more than the 48 KB a Pascal block has).
+std::size_t deltanet_scan_shared_bytes(std::uint32_t value_head_dim);
+/// Whether the current device gives a block that much shared memory (compute capability 7.0 and later do; Pascal does not at 128).
+bool deltanet_scan_fits_device(const DeltaNetGeometry& geometry);
+
 /// The rows' new conv tails: the last K-1 conv inputs of (incoming tail, then the row's own inputs). Reads only
 /// `mixed` and the incoming tails, and may overwrite the incoming tail it reads (a row continued in place), so it
 /// must run AFTER launch_deltanet_scan of the same wave, on the same stream.

@@ -283,6 +283,9 @@ __global__ void __launch_bounds__(kPrepThreads, 2) prepare_kernel(const Args arg
             const float a_in = args.a[token * args.a_stride + head];
             const float b_in = args.b[token * args.b_stride + head];
             g = __fmul_rn(-expf(args.a_log[head]), softplus_f(__fadd_rn(a_in, args.dt_bias[head])));
+            // exp(g) is 0 in float32 below about -103.97, so clamping at -110 changes no decay; it keeps G finite, so that G_i - G_j is
+            // never -inf - (-inf) = NaN when exp(A_log) overflows. A NaN g stays NaN (the comparison is false), as in the scan.
+            if (g < -110.0f) g = -110.0f;
             bt = sigmoid_f(b_in);
         }
         sg[tid] = g;

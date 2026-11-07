@@ -895,7 +895,15 @@ CudaEngine::Impl::Impl(const ModelConfig& cfg, const TensorSource& source, const
     attn_shape = AttentionShape{u32(dim(config.attn_heads)), u32(dim(config.attn_kv_heads)), u32(dim(config.attn_head_dim)),
                                 u32(dim(config.attn_rotary_dims())), config.rope_theta, config.rms_norm_eps};
     use_chunked = options.deltanet != DeltaNetMode::Scan && half && options.gemm_rows == 0 && dn_layers != 0 && deltanet_chunked_supported(dn_geometry);
-    if (!half && options.deltanet == DeltaNetMode::Chunked && options.gemm_rows == 0 && dn_layers != 0 && deltanet_chunked_f32_supported(dn_geometry)) {
+    // The float32 path runs the float32 chunked kernels (the WY form of proofs/GpuTrack DeltaRule.lean): when asked (Chunked); by
+    // default for the SIMT profiles (BF16 / Int8Group storage), so every card runs the same DeltaNet arithmetic and the profiles give the
+    // same bits on a Pascal card as on an Ampere one; and wherever the scan cannot run (its shared memory exceeds what a block may have:
+    // 66 KB at value head dim 128 against Pascal's 48 KB). The scan stays the default of the float32-weight path otherwise. Rows are
+    // independent and a row's chunks start at its own first token, so batch invariance and the strict-mode snapshot rule hold.
+    check_cuda(cudaSetDevice(options.device), "cudaSetDevice"); // (the shared-memory query below reads the current device)
+    if (!half && dn_layers != 0 && deltanet_chunked_f32_supported(dn_geometry) &&
+        (options.deltanet == DeltaNetMode::Chunked || (options.weight_storage != WeightStorage::Float32 && options.deltanet == DeltaNetMode::Auto) ||
+         !deltanet_scan_fits_device(dn_geometry))) {
         use_chunked = chunked_f32 = true;
     }
     state_conv_floats = dn_geometry.conv_tail_floats();
@@ -1466,7 +1474,35 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
     std::vector<std::size_t> chunk_prefix_at(waves, 0);
     std::vector<std::uint32_t> chunk_total(waves, 0);
     std::vector<char> wave_chunked(waves, 0);
-    if (use_chunked) {
+    // The float32 chunked kernels take every wave: one that has more chunks than the workspace holds is cut into consecutive groups of
+    // rows that fit (rows of a wave are independent), each with its own chunk plan.
+    struct DnGroup {
+        std::size_t wave = 0, row_begin = 0, row_count = 0, prefix_at = 0;
+        std::uint32_t total = 0;
+    };
+    std::vector<DnGroup> dn_groups;
+    if (chunked_f32) {
+        for (std::size_t w = 0; w < waves; ++w) {
+            const std::size_t count = wave_start[w + 1] - wave_start[w];
+            std::size_t begin = 0;
+            while (begin < count) {
+                std::vector<std::uint32_t> lens;
+                std::size_t chunks = 0, end = begin;
+                while (end < count) {
+                    const std::uint32_t len = u32(plan[wave_rows[wave_start[w] + end]].length);
+                    const std::size_t c = (len + kDeltaNetChunk - 1) / kDeltaNetChunk;
+                    if (!lens.empty() && chunks + c > chunk_cap) break;
+                    lens.push_back(len);
+                    chunks += c;
+                    ++end;
+                }
+                const std::vector<std::uint32_t> pref = deltanet_chunk_prefix(lens);
+                dn_groups.push_back(DnGroup{w, begin, end - begin, chunk_prefix_all.size(), pref.back()});
+                chunk_prefix_all.insert(chunk_prefix_all.end(), pref.begin(), pref.end());
+                begin = end;
+            }
+        }
+    } else if (use_chunked) {
         for (std::size_t w = 0; w < waves; ++w) {
             const std::size_t count = wave_start[w + 1] - wave_start[w];
             std::vector<std::uint32_t> lens(count);
@@ -1784,14 +1820,17 @@ std::vector<EngineRowResult> CudaEngine::Impl::run(std::span<const EngineRow> ro
             }
             {
                 Phase phase(*this, &PhaseTimes::deltanet_ms);
-                for (std::size_t wv = 0; wv < waves; ++wv) {
+                for (const DnGroup& g : dn_groups) { // the float32 chunked kernels, wave by wave (groups are in wave order)
+                    const DeltaNetRows dn_rows{d_spans, d_in, d_out, d_waves + wave_start[g.wave] + g.row_begin, u32(g.row_count)};
+                    const DeltaNetChunkPlan chunk_plan{d_chunks + g.prefix_at, g.total};
+                    launch_deltanet_chunked_f32(dn_geometry, w.deltanet, dn_inputs, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws, dn_ws_bytes,
+                                                cap_rows, reinterpret_cast<float*>(a2), mix_width, stream);
+                }
+                for (std::size_t wv = 0; wv < waves && !chunked_f32; ++wv) {
                     const DeltaNetRows dn_rows{d_spans, d_in, d_out, d_waves + wave_start[wv], u32(wave_start[wv + 1] - wave_start[wv])};
                     if (wave_chunked[wv]) {
                         const DeltaNetChunkPlan chunk_plan{d_chunks + chunk_prefix_at[wv], chunk_total[wv]};
-                        if (chunked_f32) {
-                            launch_deltanet_chunked_f32(dn_geometry, w.deltanet, dn_inputs, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws, dn_ws_bytes,
-                                                        cap_rows, reinterpret_cast<float*>(a2), mix_width, stream);
-                        } else if (dn_in_half) {
+                        if (dn_in_half) {
                             launch_deltanet_chunked<__half>(dn_geometry, w.deltanet, dn_inputs_half, dn_rows, chunk_plan, dn_states[w.kind_index], dn_ws,
                                                             dn_ws_bytes, cap_rows, reinterpret_cast<__half*>(a2), mix_width, stream);
                         } else {

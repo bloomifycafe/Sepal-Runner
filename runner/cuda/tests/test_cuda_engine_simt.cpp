@@ -184,7 +184,9 @@ SEPAL_TEST(engine_simt, chunked_deltanet_against_reference) {
     EngineOptions o = simt_options(WeightStorage::BF16);
     o.deltanet = sepal::cuda::DeltaNetMode::Chunked;
     CudaEngine chunked(cfg, original, o);
-    CudaEngine scan(cfg, original, simt_options(WeightStorage::BF16));
+    EngineOptions s = simt_options(WeightStorage::BF16);
+    s.deltanet = sepal::cuda::DeltaNetMode::Scan; // (Auto is the chunked kernels for this storage)
+    CudaEngine scan(cfg, original, s);
     std::vector<Stored> stored;
     Rng rng(3200);
     double worst = 0.0, worst_scan = 0.0;

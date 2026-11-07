@@ -173,10 +173,11 @@ enum class MultiplyPath {
 /// (src/kernels_deltanet_chunked.cu) cut a row into chunks of 64 tokens and use the tensor cores: a long row gets several times faster on a big
 /// card, but they cost more per token than the scan when the card is already full of rows, and their numbers are not bit-exact (binary16
 /// operands, float32 accumulation; a row continued from a snapshot is not the uncut row bit for bit). Float16 path, natural mode only.
-/// On the float32 path (natural mode) `Chunked` runs the float32 chunked kernels instead (src/kernels_deltanet_chunked_f32.cu: the
-/// same WY form on the ordinary cores, proofs/GpuTrack/GpuTrack/DeltaRule.lean; within 1e-6 of the scan's rms); `Auto` keeps the
-/// scan there, which was quicker on the 28-SM cards measured (RTX 3060: scan 21 ms, chunked 25 ms per layer for one row of 16384
-/// tokens; runner/cuda/README.md, "Pascal").
+/// On the float32 path the float32 chunked kernels (src/kernels_deltanet_chunked_f32.cu: the same WY form on the ordinary cores,
+/// proofs/GpuTrack/GpuTrack/DeltaRule.lean; within 1e-6 of the scan's rms) run when `Chunked` is asked for, by default (`Auto`) for
+/// the BF16 / Int8Group storage (the Pascal profiles: the same DeltaNet arithmetic on every card), and wherever the scan does not fit
+/// a block's shared memory (Pascal at value head dim 128). Otherwise `Auto` keeps the scan, which is quicker on the 28-SM cards
+/// measured (RTX 3060: scan 21 ms, chunked 25 ms per layer for one row of 16384 tokens; runner/cuda/README.md, "Pascal").
 enum class DeltaNetMode {
     Scan,    ///< always the scan kernel
     Auto,    ///< per wave of a call: the chunked kernels when a cost model says they are quicker, else the scan
@@ -238,7 +239,7 @@ struct EngineOptions {
     Fp16Accumulate fp16_accumulate;
     /// Float16 path only: multiplies that run on int8 weights, see Int8Multiply. Default: none.
     Int8Multiply int8_multiply;
-    /// Natural mode (gemm_rows 0) only; strict mode always scans, and the float32 path scans unless this is Chunked. See DeltaNetMode.
+    /// See DeltaNetMode: the float16 path in natural mode only (strict mode scans); the float32 path in either mode.
     DeltaNetMode deltanet = DeltaNetMode::Auto;
     /// Float16 path only: keep the per-channel statistics of the activations of the four multiply groups while calls run
     /// (CudaEngine::activation_stats). Calibration for Int8Smoothing; slows a call down. Off by default.
