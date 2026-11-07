@@ -41,9 +41,11 @@ CALL_TOKENS = (12288, 8192, 4096, 2048, 1024)    # GPU max_call_tokens tried, la
 SIMT_PROFILES = ("gpu-bf16", "gpu-w8g")          # float32 arithmetic on ordinary CUDA cores: any card from compute capability 6.1
 TENSOR_PROFILES = ("gpu-f16", "gpu-q8w")         # binary16 tensor-core kernels: compute capability 8.0 and later
 GPU_PROFILES = TENSOR_PROFILES + SIMT_PROFILES
-SIMT_CALL_TOKENS = (2048, 1024)                  # the float32 path takes about 174 KB of device memory per call token: 2048 unless that does not fit
-SIMT_WEIGHT_RATIO = {"gpu-bf16": 1.0, "gpu-w8g": 0.693}   # device weights / bf16 trunk bytes as stored (4B: 6.65 GiB measured; MLP int8 + scales, the rest bf16: 4.95e9 computed)
-SIMT_CALL_BYTES = 174 * 1024                     # activation buffers per call token at 4B (hidden 2560)
+SIMT_CALL_TOKENS = (2048, 1024)                  # the float32 path takes about 270 KB of device memory per call token: 2048 unless that does not fit
+W8G_WIDE = "gpu-w8g:wide"                        # gpu-w8g with int8 for the attention and DeltaNet input projections too (w8g_int8 below)
+W8G_WIDE_INT8 = "mlp,dn_in,attn_in,attn_out"
+SIMT_WEIGHT_RATIO = {"gpu-bf16": 1.0, "gpu-w8g": 0.693, W8G_WIDE: 0.551}  # wide: 3.93e9 / 7.14e9   # device weights / bf16 trunk bytes as stored (4B: 6.65 GiB measured; MLP int8 + scales, the rest bf16: 4.95e9 computed)
+SIMT_CALL_BYTES = 270 * 1024                     # per call token at 4B (hidden 2560): float32 activation buffers (~180 KB) and the float32 chunked DeltaNet workspace (~93 KB)
 
 
 class Refusal(SystemExit):
@@ -222,7 +224,7 @@ def gpu_need(shape: Shape, profile: str, window: int, call_tokens: int) -> tuple
     gpu-bf16 / gpu-w8g keep the embedding table in host memory, hold keys and values in float32 (twice the binary16 profiles' bytes) and
     their activation buffers are float32; the DeltaNet state slot is float32 in every profile.
     """
-    simt = profile in SIMT_PROFILES
+    simt = profile in SIMT_PROFILES or profile == W8G_WIDE
     ratio = SIMT_WEIGHT_RATIO[profile] if simt else 1.178 if profile == "gpu-f16" else 0.68
     weights = ratio * shape.trunk_bytes
     buffers = call_tokens * (SIMT_CALL_BYTES / MIB if simt else 0.179) * MIB * shape.hidden / 2560
@@ -235,7 +237,7 @@ def gpu_need(shape: Shape, profile: str, window: int, call_tokens: int) -> tuple
 def plan_gpu(shape: Shape, hw: Hardware, profile: str, model_window: int) -> GpuPlan | None:
     avail = hw.vram_free - int(0.3 * GIB)
     for window in [w for w in WINDOWS if w <= model_window] or [model_window]:
-        for calls in (SIMT_CALL_TOKENS if profile in SIMT_PROFILES else CALL_TOKENS):
+        for calls in (SIMT_CALL_TOKENS if profile in SIMT_PROFILES or profile == W8G_WIDE else CALL_TOKENS):
             if calls > 2 * window:
                 continue
             need, outside = gpu_need(shape, profile, window, calls)
@@ -362,9 +364,10 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
     if wants_gpu and choice in ("auto",) + GPU_PROFILES:
         tried = []
         if choice == "auto":
-            candidates = list(SIMT_PROFILES) if pre_ampere else ["gpu-f16"] + (["gpu-q8w"] if args.allow_q8w else [])
+            # On a pre-Ampere card the last resort before the CPU is gpu-w8g with the wider int8 set (an 8 GB card with a display).
+            candidates = list(SIMT_PROFILES) + [W8G_WIDE] if pre_ampere else ["gpu-f16"] + (["gpu-q8w"] if args.allow_q8w else [])
         else:
-            candidates = [choice] + (["gpu-q8w"] if (args.allow_q8w and choice == "gpu-f16") else [])
+            candidates = [choice] + (["gpu-q8w"] if (args.allow_q8w and choice == "gpu-f16") else []) + ([W8G_WIDE] if choice == "gpu-w8g" else [])
         for profile in candidates:
             if profile == "gpu-f16" and hw.vram_total < 11 * GIB:
                 tried.append(f"gpu-f16 is only used on 12 GB cards and up (this one has {hw.vram_total / GIB:.1f} GiB)")
@@ -382,9 +385,15 @@ def make_plan(shape: Shape, hw: Hardware, model_window: int, args) -> Plan:
                              "activations, keys, values and states float32). Against gpu-bf16 it moves answers near 0.5 by up to 0.07 (SEC-dev) and 0.05 "
                              "(LONG-LOG), above the q8 gate's 0.05, with no flip in 712 questions; gpu-bf16 needs about "
                              f"{sum(gpu_need(shape, 'gpu-bf16', 4096, 1024)) / GIB:.1f} GiB of VRAM for this model at a 4096-token window.")
+            if profile == W8G_WIDE:
+                notes.append("gpu-w8g with int8 weights for the MLP and also the attention and DeltaNet input projections (one float32 scale per 128 "
+                             "input values), because the MLP-only set does not fit: on long logs it moves answers near 0.5 by up to 0.14 against the "
+                             "fp32 model, with one flip in 162 questions (MLP only: 0.05, none).")
             if plan.window < model_window:
                 notes.append(f"context limited to {plan.window} tokens by free VRAM (the model's window is {model_window}); longer requests get 422")
             opts = {"max_call_tokens": plan.max_call_tokens, "trunk_budget_mib": plan.budget_mib, "prefix_cache": plan.prefix_cache}
+            if profile == W8G_WIDE:
+                profile, opts = "gpu-w8g", {**opts, "w8g_int8": W8G_WIDE_INT8}
             return Plan(profile, gpu_lib, plan.window, {**opts, "threads": min(4, hw.cores)}, notes,
                         f"about {plan.footprint / GIB:.1f} GiB of VRAM and {(shape.trunk_bytes * 1.7) / GIB:.1f} GiB of RAM at load")
         gpu_fail = "; ".join(tried)

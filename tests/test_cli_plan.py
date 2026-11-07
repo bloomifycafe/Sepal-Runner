@@ -103,6 +103,16 @@ def test_8gb_pascal_cards_get_gpu_w8g_with_a_note_that_it_stores_int8(card):
     assert plan.engine_options["trunk_budget_mib"] < 7500                       # inside the 7.5 GiB the card has free
 
 
+def test_8gb_pascal_int8_set_depends_on_free_vram():
+    # A headless 8 GB card (8.0 GiB free) holds the MLP-only int8 set; with a display (7.5 GiB free) only the wider set fits, which the
+    # plan passes to the engine as w8g_int8 and announces.
+    headless = cli.make_plan(FOUR_B, hw(32, ("GeForce GTX 1080", 8, 8.0), cc=6.1), 24576, args())
+    assert headless.profile == "gpu-w8g" and "w8g_int8" not in headless.engine_options
+    desktop = cli.make_plan(FOUR_B, hw(32, GTX_1080, cc=6.1), 24576, args())
+    assert desktop.profile == "gpu-w8g" and desktop.engine_options["w8g_int8"] == "mlp,dn_in,attn_in,attn_out"
+    assert any("also the attention and DeltaNet input projections" in n for n in desktop.notes)
+
+
 def test_p40_gets_gpu_bf16_with_the_whole_window():
     plan = cli.make_plan(FOUR_B, hw(32, TESLA_P40, cc=6.1), 24576, args())
     assert plan.profile == "gpu-bf16" and plan.window == 24576 and plan.engine_options["max_call_tokens"] == 2048
@@ -176,8 +186,8 @@ def test_existing_profiles_keep_their_device_figures():
 def test_gpu_bf16_and_gpu_w8g_device_figures():
     bf16, outside = cli.gpu_need(FOUR_B, "gpu-bf16", 24576, 2048)
     w8g, _ = cli.gpu_need(FOUR_B, "gpu-w8g", 24576, 2048)
-    # weights 6.65 GiB (bf16) / 4.95e9 bytes (MLP int8 + scales, the rest bf16), buffers 174 KB a call token, float32 K/V 64 KiB a token, 4 slots of 50.3 MiB.
-    extra = 2048 * 174 * 1024 + int(1.15 * 24576 * 65536) + 4 * FOUR_B.slot_bytes + (64 << 20)
+    # weights 6.65 GiB (bf16) / 4.95e9 bytes (MLP int8 + scales, the rest bf16), buffers 270 KB a call token, float32 K/V 64 KiB a token, 4 slots of 50.3 MiB.
+    extra = 2048 * 270 * 1024 + int(1.15 * 24576 * 65536) + 4 * FOUR_B.slot_bytes + (64 << 20)
     assert abs(bf16 - (7.14e9 + extra)) < 1e6 and abs(w8g - (4.95e9 + extra)) < 5e7
     assert outside == cli.gpu_need(FOUR_B, "gpu-f16", 24576, 2048)[1]
     # float32 keys and values cost twice the binary16 bytes per token of context
