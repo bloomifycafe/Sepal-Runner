@@ -227,7 +227,12 @@ SEPAL_TEST(engine_f32, ladder_matches_reference_layer_by_layer) {
         for (std::size_t l = 0; l < ladder.size(); ++l) {
             const double diff = max_abs_diff(got[r].layers.data() + l * rows[r].token_ids.size() * hidden, ladder[l].data(), ladder[l].size());
             worst = std::max(worst, diff);
-            CHECK(diff <= kHiddenTolerance);
+            // Two float32 computations of the residual stream (values up to about 4) in different summation orders: the bound grows with
+            // the layer's largest value (cuBLAS 12 on a GTX 1080 Ti gave 1.29e-4 at a peak of 3.9; the float32 reference itself is
+            // 2e-4 from float64 there, see fuzz_against_reference).
+            float peak = 0.0f;
+            for (std::size_t i = 0; i < ladder[l].size(); ++i) peak = std::max(peak, std::fabs(ladder[l].data()[i]));
+            CHECK(diff <= std::max(kHiddenTolerance, 5e-5 * static_cast<double>(peak)));
         }
     }
     std::cout << "  residual ladder (" << cfg.num_layers << " layers x 3 rows): largest difference from the reference " << std::scientific
