@@ -798,4 +798,32 @@ Exact equalities above do NOT hold in fp32 (`merge` is not associative there). W
 - Only order-determinism (12.2): the fp32 result of a row is a function of (chain, position, `c`, `T`) alone, not of the launch. It says nothing about how far the fp32 result is from the exact value.
 - Not modelled: what `exp`, `fma`, the `-inf` handling and the fp32 `max` really compute; that a masked key adds exactly `+0` in fp32 (true for `exp(-inf) = 0`, not proved); `__syncthreads` and shared-memory placement; the correspondence between the models and the `.cu` file (by review); the vector dimension (applied componentwise).
 
-fp32 error of the fast exp path: TODO(kernel author)
+### 12.4 The kernel (runner/cuda/src/kernels_attention.cu, `attention_f32_split_kernel`, `attention_f32_merge_kernel`)
+Correspondence (by review): chunk size `c` = `kSplitChunk` = 2048 keys counted from the chain's first key; tile size `T` = 8 keys counted from the chunk start
+(2048 is a multiple of 8, so tiles never straddle chunks); the per-chunk state is the online step over the tiles; the merge kernel combines the partials of a
+token by exactly `pairUp`/`treeFold` (built left to right by a binary-counter stack: its node at level `k` covers chunks `[i 2^k, (i+1) 2^k)` cut at `n`; the
+incomplete blocks left at the end merge right to left, which is what the carried odd nodes of `pairUp` do). A token whose keys fit one chunk is finished by the
+chunk block (`treeFold` of one leaf is the leaf: no operation). fp32 `merge(x, y)` and `merge(y, x)` give the same bits (fp32 `max` and `+` commute), so only the
+tree's shape matters, which matches `merge_comm` being a law of the model and not an extra assumption on the evaluator. The query-tile window of a launch (the cap on
+the workspace) changes only where a partial is stored, i.e. the write log of `sched`.
+
+Masked keys and skipped tiles in fp32 (prose; not machine-checked): a masked score is `-inf`, `ex2(-inf - m) = +0` and `l + 0 = l`, `fma(0, v, o) = o` for finite `v` (keys and
+values past the chain's end are stored as zeros, so `v` is finite); a tile in which a row sees nothing has row maximum `-inf`, so `m_new = m_run` and the code sets the
+rescale factor to exactly `1.0` (it does not call `ex2(0)`), and `o * 1 = o`. So a tile a row cannot see leaves its state's bits unchanged, and the bits do not depend
+on how many such tiles the block walks: the fp32 counterpart of `maskedTile_eq` / `chunkMasked_eq`. A row that has seen nothing yet uses `m = 0` for the exponent
+(so `p = ex2(-inf) = 0`, no NaN from `-inf - -inf`).
+
+fp32 error of the fast exp path. The split kernel scales scores into the base-2 domain, `x = fl(s * c2)` with `c2 = fl(scale * log2 e)` (one rounding of the constant,
+relative `2^-24`, and one of the product, relative `2^-24`), subtracts the running maximum `d = fl(x - m)` (exact when `x` and `m` are within a factor of 2 of each
+other by Sterbenz, otherwise relative `2^-24`), and takes `p = ex2.approx.ftz.f32(d)`. PTX ISA documents `ex2.approx.f32` with a maximum relative error of `2^-22`
+over its full range; the `split` test suite (`exp2_fast_path_error`) measures the PC's 3060 against float64 `exp2` at every multiple of `2^-12` in `[-126, 0]` and
+checks `<= 2^-21` (the measured value is in the ctest log, `[measured] ex2.approx...`). Results below `2^-126` flush to zero (ftz); such a probability is below
+`2^-126` of the row's largest one and its contribution to `l >= 1` is below the fp32 unit roundoff. Per probability the relative error is therefore at most about
+`2^-22 + |d| ln 2 (2^-23 + 2^-24)` (the argument roundings move `2^d` by `ln 2 * |d| * rel`), i.e. below `2^-21` for `|d| <= 1` and below about `30 * 2^-24` at `|d| = 16`,
+where the probability itself is `2^-16`; weighted by `p`, the error of `l` and of `acc` stays within a few units of `2^-22` relative. The accurate `expf` of the first
+kernel is within 2 ulp. The rescale factors `2^(m_old - m_new)` carry the same relative error and multiply the whole accumulated state, so at most one such error per
+tile in which the maximum moves (the maximum moves O(log n) times on random-order scores, at most once per tile). The merge kernel's factors `2^(m_i - M)` add one more
+such error per tree level (`ceil(log2 n_chunks)` levels: 3 at 16k keys). `acc / l` divides out any common relative error of the factors that multiply both `acc` and `l`;
+what remains is the per-probability error, which enters `acc / l` as a convex reweighting of the values: relative weight changes of at most a few `2^-22`, so
+`|o - o_exact| <= few * 2^-22 * max |v|`, comparable to the fp32 accumulation error of a 2048-term dot product (`gamma_n ~ n 2^-24` worst case, `sqrt(n) 2^-24` typical).
+The ctest suites check the kernel against the float32 reference at the existing tolerance (scaled difference `<= 1e-5`); the measured values are in the ctest log.

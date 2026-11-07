@@ -3,7 +3,7 @@
 //
 //   sepal_cuda_kernel_attention_tests              every suite
 //   sepal_cuda_kernel_attention_tests <suite>      one of: stages, geometry, continuation, shared_context,
-//                                                  causality, invariance, positions, rope_exact, tables
+//                                                  causality, invariance, positions, rope_exact, tables, split
 //
 // Four variants of the device path are tested everywhere: F32 keys and values with the plain kernel, F16 with the
 // plain kernel, F16 with the tiled tensor-core kernel, and F32 with the tiled float32 kernel of the Pascal profiles. Lines starting with "  [measured]" are the record the
@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -149,14 +150,17 @@ struct Variant {
     AttnElem kv;
     AttentionPath path;
     const char* name;
+    int f32 = -1; // TiledF32: the float32 kernel (F32Kernel) forced for the launch; -1 = the environment's choice
 };
-// On a card without tensor cores (Pascal) the f16/tiled variant is left out: the other three run everywhere.
+// On a card without tensor cores (Pascal) the f16/tiled variant is left out: the others run everywhere. f32/tiled is the first float32
+// kernel, f32/split the second (at head_dim 256; other head sizes run the first under either name).
 const std::vector<Variant>& variants() {
     static const std::vector<Variant> v = [] {
         std::vector<Variant> all = {{AttnElem::F32, AttentionPath::Reference, "f32/plain"},
                                     {AttnElem::F16, AttentionPath::Reference, "f16/plain"},
                                     {AttnElem::F16, AttentionPath::Tiled, "f16/tiled"},
-                                    {AttnElem::F32, AttentionPath::TiledF32, "f32/tiled"}};
+                                    {AttnElem::F32, AttentionPath::TiledF32, "f32/tiled", 0},
+                                    {AttnElem::F32, AttentionPath::TiledF32, "f32/split", 1}};
         if (!sepal::cuda::device_has_tensor_cores()) all.erase(all.begin() + 2);
         return all;
     }();
@@ -280,6 +284,7 @@ struct PassOptions {
     AttnElem out_type_override = AttnElem::F32;
     bool use_out_override = false;
     bool indexed = false; // the segments carry `before` and the kernels find a key by binary search
+    bool give_max_keys = true; // fill AttentionRows::max_row_keys (false: the launch reads it back from the device)
 };
 
 std::vector<unsigned char> to_bytes(const std::vector<float>& values, AttnElem type) {
@@ -390,6 +395,14 @@ PassResult run_device(const Geometry& g, const Pool& pool, const NormWeights& we
     DeviceBuffer<std::uint32_t> d_run(run);
     AttentionRows table{d_spans.data(), d_descs.data(), d_segments.data(), run.empty() ? nullptr : d_run.data(),
                         run.empty() ? static_cast<std::uint32_t>(nrows) : static_cast<std::uint32_t>(run.size()), max_len};
+    if (options.give_max_keys) {
+        std::uint32_t max_keys = 0;
+        for (std::size_t r = 0; r < nrows; ++r) {
+            if (!run.empty() && std::find(run.begin(), run.end(), static_cast<std::uint32_t>(r)) == run.end()) continue;
+            max_keys = std::max(max_keys, chain_tokens(rows[r].parent) + rows[r].length());
+        }
+        table.max_row_keys = max_keys;
+    }
 
     const std::size_t q_stride = g.q_width + 16;
     const std::size_t out_stride = g.q_width + 8;
@@ -409,8 +422,10 @@ PassResult run_device(const Geometry& g, const Pool& pool, const NormWeights& we
     sepal::cuda::launch_attention_prepare(g.shape, table, kv, q_gate, k_band, v_band, d_qn.data(), d_kn.data(),
                                           {d_q.data(), q_stride}, stream);
     PassResult result;
+    if (variant.f32 >= 0) sepal::cuda::set_f32_kernel(static_cast<sepal::cuda::F32Kernel>(variant.f32));
     result.used = sepal::cuda::launch_attention(g.shape, table, kv, variant.path, {d_q.data(), q_stride}, q_gate,
                                                 {d_out.data(), out_stride}, out_type, stream);
+    if (variant.f32 >= 0) sepal::cuda::reset_f32_kernel();
     sepal::cuda::check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
     const std::vector<unsigned char> q_bytes = d_q.download();
@@ -1183,6 +1198,152 @@ SEPAL_TEST(rope_exact, every_position) {
                 kRows * kRowLen - 1, compared, mismatched, mismatched_half);
     CHECK_EQ(mismatched, 0u);
     CHECK_EQ(mismatched_half, 0u);
+}
+
+// ---- suite: split ----
+// The second float32 kernel (F32Kernel::Split) with chunks small enough that a row of a few hundred keys spans several of them: against
+// the float32 reference; bit for bit the same whatever the workspace cap (windows of query tiles), whether the host gives
+// max_row_keys, and wherever the row sits among other rows; and its fast exp2 against float64.
+
+const Variant& split_variant() {
+    static const Variant v{AttnElem::F32, AttentionPath::TiledF32, "f32/split", 1};
+    return v;
+}
+
+struct SplitLimits {
+    SplitLimits(std::uint32_t chunk, std::size_t cap) { sepal::cuda::set_f32_split_limits(chunk, cap); }
+    ~SplitLimits() { sepal::cuda::set_f32_split_limits(0, 0); }
+};
+
+SEPAL_TEST(split, chunks_against_reference) {
+    const Geometry& g = preset("4b");
+    for (const std::uint32_t chunk : {8u, 64u, 200u}) {
+        const SplitLimits limits(chunk, 0);
+        for (const auto& [context, length] : {std::pair<std::uint32_t, std::uint32_t>{0, 70}, {300, 27}, {130, 1}, {1000, 40}}) {
+            const Pool pool(g, length + 8, 401 + context + length);
+            const NormWeights weights = make_weights(g, 402);
+            NodePtr ctx = context != 0 ? external_node(g, context, 403 + context, nullptr) : nullptr;
+            std::vector<RowPlan> rows;
+            rows.push_back(make_row(iota_ids(0, length), context, ctx));
+            char label[96];
+            std::snprintf(label, sizeof label, "4b chunk %u ctx %u len %u", chunk, context, length);
+            RefPass<float> ref32(g, pool, weights, rows);
+            const PassResult result = run_device(g, pool, weights, rows, split_variant());
+            check_against_reference(label, split_variant(), result.rows[0], ref32.row(0), nullptr, false, false);
+        }
+    }
+}
+
+SEPAL_TEST(split, windows_and_max_keys_bit_identical) {
+    const Geometry& g = preset("4b");
+    const Pool pool(g, 700, 411);
+    const NormWeights weights = make_weights(g, 412);
+    NodePtr ctx = external_node(g, 333, 413, nullptr);
+    std::vector<RowPlan> rows;
+    rows.push_back(make_row(iota_ids(0, 300), 333, ctx));
+    rows.push_back(make_row(iota_ids(300, 1), 333, ctx));
+    rows.push_back(make_row(iota_ids(301, 45), 0, nullptr));
+    rows.push_back(make_row(iota_ids(346, 133), 0, nullptr));
+    PassResult base;
+    {
+        const SplitLimits limits(64, 0); // every window at once
+        base = run_device(g, pool, weights, rows, split_variant());
+    }
+    for (const std::size_t cap : {std::size_t{1}, std::size_t{300000}, std::size_t{3000000}}) {
+        for (const bool give : {true, false}) {
+            const SplitLimits limits(64, cap);
+            PassOptions options;
+            options.give_max_keys = give;
+            const PassResult other = run_device(g, pool, weights, rows, split_variant(), options);
+            for (std::size_t r = 0; r < rows.size(); ++r) {
+                char what[96];
+                std::snprintf(what, sizeof what, "4b row %zu cap %zu max_keys %s", r, cap, give ? "given" : "read back");
+                CHECK(identical_rows(other.rows[r], base.rows[r], what, "f32/split"));
+            }
+        }
+    }
+}
+
+SEPAL_TEST(split, invariance_small_chunks) {
+    const SplitLimits limits(64, 200000);
+    const Geometry& g = preset("4b");
+    const Pool pool(g, 5000, 421);
+    const NormWeights weights = make_weights(g, 422);
+    Rng rng(423);
+    const NodePtr target_ctx = external_node(g, 250, 424, nullptr);
+    const RowPlan target = make_row(iota_ids(0, 90), 77, target_ctx);
+    std::vector<RowPlan> alone = {target};
+    const PassResult base = run_device(g, pool, weights, alone, split_variant());
+    for (int trial = 0; trial < 4; ++trial) {
+        std::uint32_t next_id = 90;
+        std::vector<RowPlan> others;
+        const std::uint32_t count = 2 + rng.below(4);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::uint32_t length = 1 + rng.below(150);
+            NodePtr parent = rng.below(2) ? external_node(g, 1 + rng.below(400), 430 + i + 10 * static_cast<std::uint64_t>(trial), nullptr) : nullptr;
+            others.push_back(make_row(iota_ids(next_id, length), rng.below(70000), parent));
+            next_id += length;
+        }
+        const std::size_t place = rng.below(static_cast<std::uint32_t>(others.size() + 1));
+        std::vector<RowPlan> list = others;
+        list.insert(list.begin() + static_cast<std::ptrdiff_t>(place), target);
+        const PassResult among = run_device(g, pool, weights, list, split_variant());
+        char what[96];
+        std::snprintf(what, sizeof what, "4b trial %d among %zu rows at %zu", trial, list.size(), place);
+        CHECK(identical_rows(among.rows[place], base.rows[0], what, "f32/split"));
+    }
+}
+
+SEPAL_TEST(split, exp2_fast_path_error) {
+    // Arguments in [-126, 0] (the softmax takes x - max <= 0; below -126 the result flushes to zero), every 2^-12 and the
+    // endpoints: the largest relative error against exp2 in float64.
+    std::vector<float> in;
+    for (std::int64_t k = -126 * 4096; k <= 0; ++k) in.push_back(static_cast<float>(static_cast<double>(k) / 4096.0));
+    for (const float x : {0.0f, -0.0f, -1e-30f, -1e-7f, -0.5f, -125.9999f}) in.push_back(x);
+    in.push_back(-std::numeric_limits<float>::infinity());
+    DeviceBuffer<float> d_in(in);
+    DeviceBuffer<float> d_out(in.size());
+    sepal::cuda::attention_ex2_probe(d_in.data(), d_out.data(), static_cast<std::uint32_t>(in.size()), nullptr);
+    sepal::cuda::check(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
+    const std::vector<float> out = d_out.download();
+    double worst = 0;
+    float worst_x = 0;
+    for (std::size_t i = 0; i + 1 < in.size(); ++i) {
+        const double exact = std::exp2(static_cast<double>(in[i]));
+        const double rel = std::fabs(static_cast<double>(out[i]) - exact) / exact;
+        if (rel > worst) {
+            worst = rel;
+            worst_x = in[i];
+        }
+    }
+    std::printf("  [measured] ex2.approx.ftz.f32 over [-126, 0]: max relative error %.3e (2^%.2f) at x = %.6g\n", worst,
+                std::log2(worst), static_cast<double>(worst_x));
+    CHECK(worst <= std::ldexp(1.0, -21));
+    CHECK(out[in.size() - 1] == 0.0f);            // 2^-inf
+    CHECK(out[static_cast<std::size_t>(126 * 4096)] == 1.0f); // 2^0
+}
+
+SEPAL_TEST(split, kernels_agree_long) {
+    // The default chunk (2,048 keys) over a 4,800-key context: the two float32 kernels against each other and the plain kernel.
+    const Geometry& g = preset("4b");
+    const Pool pool(g, 700, 441);
+    const NormWeights weights = make_weights(g, 442);
+    NodePtr ctx = external_node(g, 4800, 443, nullptr);
+    std::vector<RowPlan> rows;
+    rows.push_back(make_row(iota_ids(0, 640), 4800, ctx));
+    rows.push_back(make_row(iota_ids(640, 1), 4800, ctx));
+    const PassResult plain = run_device(g, pool, weights, rows, variants()[0]);
+    const PassResult first = run_device(g, pool, weights, rows, {AttnElem::F32, AttentionPath::TiledF32, "f32/tiled", 0});
+    const PassResult split = run_device(g, pool, weights, rows, split_variant());
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const Diff a = compare(split.rows[r].out, plain.rows[r].out);
+        const Diff b = compare(split.rows[r].out, first.rows[r].out);
+        std::printf("  [measured] 4b ctx 4800 row %zu f32/split vs f32/plain scaled %.3e, vs f32/tiled scaled %.3e\n", r, a.scaled(),
+                    b.scaled());
+        CHECK(a.scaled() <= 1e-5);
+        CHECK(b.scaled() <= 1e-5);
+        CHECK(all_finite(split.rows[r].out));
+    }
 }
 
 // ---- suite: tables ----
