@@ -32,6 +32,9 @@
 namespace {
 
 using sepal::ModelConfig;
+using sepal::cuda::TiledKernel;
+using sepal::cuda::reset_tiled_kernel;
+using sepal::cuda::set_tiled_kernel;
 using sepal::cuda::AttentionPath;
 using sepal::cuda::AttentionRowDesc;
 using sepal::cuda::AttentionRows;
@@ -1241,6 +1244,37 @@ SEPAL_TEST(chains, indexed_segments_give_the_bits_of_scanned_segments) {
                     CHECK(identical_rows(binary.rows[r], scanned.rows[r], what, variant.name));
                 }
             }
+        }
+    }
+}
+
+SEPAL_TEST(chains, second_tiled_kernel_gives_the_bits_of_the_first) {
+    // v2 (8 warps, 128 query rows, separate key and value buffers) keeps v1's tiles and order of additions: the same bits.
+    const Variant tiled{AttnElem::F16, AttentionPath::Tiled, "f16/tiled"};
+    for (const Geometry* g : {&preset("0.8b"), &preset("4b")}) {
+        const Pool pool(*g, 400, 191);
+        const NormWeights weights = make_weights(*g, 192);
+        NodePtr chain;
+        std::uint32_t context = 0;
+        for (std::uint32_t i = 0; i < 5; ++i) {
+            const std::uint32_t tokens = 1 + (i * 37) % 70;
+            chain = external_node(*g, tokens, 193 + i, chain);
+            context += tokens;
+        }
+        std::vector<RowPlan> rows;
+        rows.push_back(make_row(iota_ids(0, 300), context, chain));
+        rows.push_back(make_row(iota_ids(300, 1), context, chain));
+        rows.push_back(make_row(iota_ids(301, 45), 0, nullptr));
+        rows.push_back(make_row(iota_ids(346, 33), 0, nullptr));
+        set_tiled_kernel(TiledKernel::First);
+        const PassResult first = run_device(*g, pool, weights, rows, tiled);
+        set_tiled_kernel(TiledKernel::Second);
+        const PassResult second = run_device(*g, pool, weights, rows, tiled);
+        reset_tiled_kernel();
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            char what[96];
+            std::snprintf(what, sizeof what, "%s row %zu", g->name.c_str(), r);
+            CHECK(identical_rows(second.rows[r], first.rows[r], what, "v2 vs v1"));
         }
     }
 }

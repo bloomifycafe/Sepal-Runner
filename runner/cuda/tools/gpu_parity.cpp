@@ -108,13 +108,13 @@ int main(int argc, char** argv) {
         else { std::cerr << "unknown option " << a << "\n"; return 2; }
     }
     const auto from_env = [](const char* name) {
-#if defined(_MSC_VER)
-        char* buffer = nullptr;
-        std::size_t length = 0;
-        if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr) return std::string();
-        const std::string value(buffer);
-        std::free(buffer);
-        return value;
+#ifdef _MSC_VER // std::getenv is deprecated under /W4 /WX
+        char* v = nullptr;
+        std::size_t n = 0;
+        if (_dupenv_s(&v, &n, name) != 0 || v == nullptr) return std::string();
+        std::string s(v);
+        std::free(v);
+        return s;
 #else
         const char* v = std::getenv(name);
         return v != nullptr ? std::string(v) : std::string();

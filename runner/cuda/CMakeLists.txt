@@ -252,7 +252,7 @@ add_library(sepal_cuda_engine STATIC src/cuda_engine.cpp src/snapshot_file.cpp s
 target_include_directories(sepal_cuda_engine PUBLIC include PRIVATE src)
 target_include_directories(sepal_cuda_engine SYSTEM PRIVATE "${SEPAL_CUDA_INCLUDE}")
 target_link_libraries(sepal_cuda_engine PUBLIC sepal_cuda sepal_core
-  PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cuda_flags)
+  PRIVATE sepal_cuda_deltanet_kernels sepal_cuda_attention sepal_cuda_elementwise sepal_cublas sepal_cublaslt sepal_cuda_flags)
 
 add_library(sepal_cuda_gpu_decision STATIC src/gpu_decision_engine.cpp)
 target_include_directories(sepal_cuda_gpu_decision PUBLIC include PRIVATE src)
