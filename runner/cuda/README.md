@@ -1815,3 +1815,75 @@ float32 ulp level: largest |dlogit| 9.5e-7 on TOOL n60 and LONG-LOG n12 for both
 order of operations per output; the difference comes from what the two builds do not share (CUDA 12.6 against 13.1 device libraries for
 `expf` / `log1pf`, cuBLAS 12 against 13 in the Clef head), not isolated further. At five orders of magnitude below the gates, the PC's
 SEC-dev parity holds for the Pascal card.
+
+
+### The float32 split attention kernel (branch pascal-attn-tune, 2026-11-07)
+
+The first float32 attention kernel (`attention_f32_tiled_kernel`, now `SEPAL_ATTENTION_F32_KERNEL=v1`) ran at about 1.6 TFLOP/s on the
+1080 Ti. It gives each key or value it reads from shared memory to two query rows only, so the shared-memory pipe (32 words per clock per
+SM against 128 multiply-adds) caps it at a quarter of the cores' rate. It also all-reduces every score over eight lanes and runs the
+softmax eight times over, and on sm_61 it spills at 255 registers. The second kernel (`attention_f32_split_kernel`, the default at head_dim
+256; other head sizes keep the first) works like this:
+
+- **Tiling.** A block is 64 query rows (one KV group of 16 tokens) and 8 warps. A half-warp owns four rows, and lane s holds their queries
+  and outputs over dimensions 4s + 64i + c. Each float4 read from shared memory feeds 16 multiply-adds, and a quarter-warp's reads fall in
+  32 different banks.
+- **Scores and softmax.** Keys go 8 at a time. Scores are reduce-scattered over the half-warp (30 shuffles, not 128). Each lane then runs
+  the softmax for its two scores with `ex2.approx` (PTX: relative error at most 2^-22; measured 2^-22.86 against float64, ctest
+  `split.exp2_fast_path_error`). The probabilities go back to the 16 lanes by shuffles, key by key, for P V.
+- **Shared memory.** Two shared buffers of 8 keys and 8 values (32 KB). One tile is stored from registers while the current one is
+  multiplied and the next is fetched with float4 loads; there is one barrier per tile. The kernel uses 223 registers on sm_61 with no spills.
+- **Split K/V.** A row's keys are cut into chunks of 2048 counted from the chain's first key, and each (query tile, chunk) is one block.
+  A token that fits one chunk is finished by its block. Otherwise the partial states (m, l, acc) go to a workspace, and
+  `attention_f32_merge_kernel` combines them by a fixed pairwise tree. The workspace is allocated on first use, capped at 32 MiB, and
+  launches whose partials do not fit run in windows of query tiles. `AttentionRows::max_row_keys`, which the engine fills, sizes the grid.
+  This also makes the last layer's one-token read-out rows over a long log 11 times faster.
+- **Determinism.** Every order depends only on a key's index in its chain, and tiles a row cannot see leave its bits unchanged
+  (rescale exactly 1, probability exactly 0). A token's bits therefore depend on its own chain only. The ctest suite `split` checks this
+  bit for bit across workspace windows, with max_row_keys given or read back, and with the row at any place among other rows.
+- **Proofs.** `proofs/GpuTrack/GpuTrack/AttnSplit.lean` proves the following, with fp32 notes in `proofs/LEAN-NOTES.md` section 12:
+  - the merge is a commutative monoid;
+  - the chunked tree equals softmax attention for any chunking and tile size;
+  - skipped tiles and chunks drop only zero-weight terms;
+  - a token's operation tree does not depend on the launch.
+
+GTX 1080 Ti (vast.ai 59552984, CUDA 12.6, sm_61), `sepal-cuda-attention-bench --f32` (4B geometry; one layer; v1 and v2 interleaved over
+5 rounds, minimum):
+
+| Shape | v1 ms (TFLOP/s) | v2 ms (TFLOP/s) |
+|---|---|---|
+| 1 x 1024, no context (t1k) | 5.37 (1.60) | 2.03 (4.23) |
+| 1 x 2048 over 2048 | 61.0 (1.69) | 25.2 (4.09) |
+| 1 x 2048 over 14336 (last call of a 16k log) | 305.7 (1.69) | 128.0 (4.03) |
+| 1 x 200 over 16000 | 34.6 (1.53) | 13.6 (3.89) |
+| 1 x 1 over 16383 (read-out) | 17.7 | 1.58 |
+| 4 x 512 over 4096 | 87.4 (1.67) | 36.0 (4.06) |
+
+End to end on the 1080 Ti (bench.py, trunk budget 9.2 GB, calls of 2048; t1k and t16k are the mean of two interleaved rounds, TOOL and
+LONG-LOG one run each with every request timed), tokens/s, v1 -> v2:
+
+| Profile | t1k | t16k | TOOL n60 | LONG-LOG n12 |
+|---|---|---|---|---|
+| gpu-bf16 | 906 -> 920 (+1.5%) | 580 -> 737 (+27%) | 673 -> 798 (+19%) | 582 -> 734 (+26%) |
+| gpu-w8g | 969 -> 995 (+2.7%) | 608 -> 789 (+30%) | 714 -> 862 (+21%) | 610 -> 788 (+29%) |
+
+VRAM in use is 32 MiB higher (the workspace). On the RTX 3060 the same kernels give t1k 889 -> 939 and t16k 750 -> 776 for gpu-bf16, and
+the attention bench gives 3.6 -> 4.9 TFLOP/s.
+
+Parity on the 3060 (gpu-bf16, v2; PR #7's first kernel in brackets), max |dp| against the PyTorch rows: SEC-dev n300 0.0228 (0.0228),
+TOOL n60 0.0096 (0.0096), LONG-LOG n12 0.0488 (0.0488), the same accuracy. Against PR #7's gpu-bf16 itself: 5.3e-5 (LONG-LOG) and 8.3e-6
+(TOOL); gpu-w8g against PR #7's gpu-w8g: 3.5e-5 and 7.4e-6. Against cpu-f32 on LONG-LOG: gpu-bf16 0.032 / p99 0.011 / 0 flips (PR #7:
+0.032 / 0.011 / 0), gpu-w8g 0.048 / 0 flips (PR #7: 0.048 / 0).
+
+Bit identity (`harness/compare_bits.py`, `compare_bits_dp.py` on the TOOL n60 and LONG-LOG n12 dumps):
+- v1 on the 1080 Ti is bit-identical to PR #7's dumps on the same card for both profiles, so the first kernel is unchanged.
+- v2 on the 1080 Ti against v2 on the RTX 3060 differs at the float32 ulp level, the same as PR #7 found between the cards: largest
+  |dlogit| 9.5e-7, largest |dp| 6.3e-8 (TOOL) and 1.1e-7 (LONG-LOG) for gpu-bf16, 4.9e-8 and 1.0e-7 for gpu-w8g, no flips.
+- The box's CUDA ctest: 36 passed and 13 skipped of 49 (PR #7: 35 and 13); the new `split` suite passes on sm_61.
+
+What did not work or was not done:
+- The first version spilled 216 bytes on sm_75 because it held all 32 probabilities and the four rows' indices across the tile. Gathering
+  the probabilities per key inside P V and recomputing the row indices in the epilogue removed the spill.
+- At 4 TFLOP/s the kernel is still at about 36% of the card's float32 peak. The shared-memory pipe and the shuffles are the likely limit
+  (no profiler was available on the box). Larger tiles need more than Pascal's 48 KB of shared memory per block, or more registers.
+- The key/value cache is float32 for these profiles, so there is no bf16 widening path to add.
