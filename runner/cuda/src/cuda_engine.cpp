@@ -718,7 +718,9 @@ std::size_t CudaEngine::Impl::call_buffer_bytes_needed(bool place) {
         used += align_up(bytes);
     };
     if (use_chunked) {
-        chunk_cap = cap_rows / kDeltaNetChunk + 64;
+        // The float32 kernels cut a wave that does not fit into groups of rows, so their workspace needs little slack (80 KB per chunk and
+        // value head at 4B); the tensor-core kernels fall back to the scan for such a wave.
+        chunk_cap = cap_rows / kDeltaNetChunk + (chunked_f32 ? 16 : 64);
         dn_ws_bytes = chunked_f32 ? deltanet_chunked_f32_workspace_bytes(dn_geometry, chunk_cap, cap_rows)
                                   : deltanet_chunked_workspace_bytes(dn_geometry, chunk_cap, cap_rows);
         take(dn_ws_bytes, dn_ws);
